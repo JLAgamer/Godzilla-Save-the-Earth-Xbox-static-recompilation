@@ -1,3 +1,37 @@
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index a6a3657..f38fd4a 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -1501,6 +1501,29 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
+ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)
+ {
+     if (!d) return;
++    {
++        /* RECOMP_APU_RACE_LOG=1: DirectSound writes a voice's parameters as a
++         * sequence - select the voice (0x202F8), lock (0x202FC = 1), values,
++         * unlock - at raised IRQL, where nothing else runs on the console.
++         * Count sequences another thread writes into: its select replaces
++         * this one's, and the values land on the wrong voice. */
++        static int on = -1;
++        static volatile LONG owner, races, seqs;
++        if (on < 0) on = getenv("RECOMP_APU_RACE_LOG") != NULL;
++        if (on && addr >= 0x202F8 && addr < 0x20400) {
++            LONG me = (LONG)GetCurrentThreadId(), o = owner;
++            if (o && o != me) {
++                LONG n = InterlockedIncrement(&races);
++                if (n <= 5 || n % 200 == 0)
++                    fprintf(stderr, "[APU-RACE] thread %ld wrote 0x%05X = %08X inside thread %ld's locked sequence (%ld so far, %ld sequences)\n",
++                            (long)me, (unsigned)addr, (unsigned)val, (long)o, (long)n, (long)seqs);
++            }
++            if (addr == 0x202FC) {
++                if (val & 1) { owner = me; InterlockedIncrement(&seqs); }
++                else if (owner == me) owner = 0;
++            }
++        }
++    }
+     mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
+ }
+ 
 diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
 index bd36f2a..9e944cd 100644
 --- a/src/apu/apu_dsp.c

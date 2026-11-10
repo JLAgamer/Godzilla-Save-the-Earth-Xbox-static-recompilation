@@ -17,6 +17,9 @@ rem Reuse memory the game frees (without it, menus then a big stage such as
 rem the Mothership ran the 64 MB out and crashed).
 set RECOMP_HEAP_RECLAIM=1
 set RECOMP_PB_INVENTORY=0
+rem Sound and other device code that the game runs "at raised interrupt level" is not interleaved with
+rem other threads, as on the console (without it, music sometimes played at full volume on every channel).
+set RECOMP_DISPATCH_GATE=1
 set RECOMP_KERNEL_LOG_BUDGET=200
 rem Audio: 4 x 1024-sample buffers (~85 ms) instead of 4 x 512 (~43 ms),
 rem which underran thousands of times per session (stutter). AUDIO_HOST logs

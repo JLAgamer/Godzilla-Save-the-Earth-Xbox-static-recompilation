@@ -289,6 +289,60 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 
 /* ── WinMain ───────────────────────────────────────────────── */
 
+/* The game copies files from the disc to its hard-disk cache (Z:, here
+ * <save>\Cache\cache_N.bin) and afterwards reads the copy: coming back from a
+ * match, the menus are loaded from it. The cache outlives a run, so a copy made
+ * before a menu mod existed (or with another mod folder) brought the original
+ * menus back: no Options entries, no Biollante cell. The cache is emptied
+ * whenever the mod folder in use, or its ControlRoom.bdl, is not the one the
+ * cache was filled under (a stamp file records it). GZ_KEEP_CACHE=1: never. */
+static void gz_refresh_disk_cache(const char *save_dir)
+{
+    char dir[MAX_PATH], path[MAX_PATH], want[MAX_PATH + 64], have[MAX_PATH + 64] = "";
+    const char *ov = getenv("RECOMP_OVERLAY_DIR"), *keep = getenv("GZ_KEEP_CACHE");
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    FILE *f;
+    unsigned n = 0;
+
+    if (keep && *keep == '1') return;
+    if (save_dir && *save_dir) snprintf(dir, sizeof dir, "%s\\Cache", save_dir);
+    else {
+        const char *la = getenv("LOCALAPPDATA");
+        if (!la || !*la) return;
+        snprintf(dir, sizeof dir, "%s\\xboxrecomp\\Cache", la);
+    }
+    memset(&fa, 0, sizeof fa);
+    if (ov && *ov) {
+        snprintf(path, sizeof path, "%s\\ShellData\\ControlRoom.bdl", ov);
+        GetFileAttributesExA(path, GetFileExInfoStandard, &fa);
+    }
+    snprintf(want, sizeof want, "%s|%08lX%08lX|%lu", (ov && *ov) ? ov : "", (unsigned long)fa.ftLastWriteTime.dwHighDateTime,
+             (unsigned long)fa.ftLastWriteTime.dwLowDateTime, (unsigned long)fa.nFileSizeLow);
+    snprintf(path, sizeof path, "%s\\gz_cache_stamp.txt", dir);
+    if ((f = fopen(path, "rb")) != NULL) {
+        size_t got = fread(have, 1, sizeof have - 1, f);
+        have[got] = 0;
+        fclose(f);
+    }
+    if (!strcmp(have, want)) return;
+    {
+        char pat[MAX_PATH];
+        snprintf(pat, sizeof pat, "%s\\cache_*.bin", dir);
+        if ((h = FindFirstFileA(pat, &fd)) != INVALID_HANDLE_VALUE) {
+            do {
+                char one[MAX_PATH];
+                snprintf(one, sizeof one, "%s\\%s", dir, fd.cFileName);
+                if (DeleteFileA(one)) n++;
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+    }
+    if ((f = fopen(path, "wb")) != NULL) { fwrite(want, 1, strlen(want), f); fclose(f); }
+    fprintf(stderr, "[CACHE] menu mod changed: %u cached file(s) removed from %s\n", n, dir);
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
 {
@@ -386,6 +440,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
          * crashes at boot. Unset = the default (%LOCALAPPDATA%/xboxrecomp). */
         const char *gz_save = getenv("GZ_SAVE_DIR");
         xbox_path_init(YOUR_GAME_DIR, (gz_save && *gz_save) ? gz_save : NULL);
+        gz_refresh_disk_cache((gz_save && *gz_save) ? gz_save : NULL);
     }
 
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */

@@ -214,6 +214,7 @@ static const char s_hlsl[] =
 "  uint4 stage[8];       /* color_icw, alpha_icw, color_ocw, alpha_ocw */\n"
 "  float4 factor0[8]; float4 factor1[8];\n"
 "  float4 wide;         /* 2D in widescreen: x squeeze (0 = off) about x = y; height scale z about y = w */\n"
+"  float4 dbg;          /* x: GZ_DEBUG_ZOOM, scale of 3D geometry about the screen centre (1 = off) */\n"
 "};\n"
 "/* SPEC: a pixel shader compiled for one combiner setup. Everything that\n"
 " * steers control flow is a constant, so the interpreter below folds into\n"
@@ -251,6 +252,7 @@ static const char s_hlsl[] =
 "  if (wide.x > 0.0 && abs(w - 1.0) < 1e-3) py = wide.w + (py - wide.w) * wide.z;\n"
 "  float y = 1.0 - py * inv_size.y * 2.0;\n"
 "  float z = saturate(i.p.z * zscale);\n"
+"  if (abs(w - 1.0) >= 1e-3) { x *= dbg.x; y *= dbg.x; }\n"
 "  o.p = float4(x * w, y * w, z * w, w); o.c = i.c; o.uv = i.uv * tex0_inv; o.zr = float2(i.p.z * w, w);\n"
 "  o.spec = i.spec; o.fog = i.fog; o.tc0 = i.tc0; o.tc1 = i.tc1; o.tc2 = i.tc2; o.tc3 = i.tc3;\n"
 "  return o;\n"
@@ -540,6 +542,7 @@ static const char s_hlsl[] =
 "   * vertex just in front of the camera made the near water fail the depth\n"
 "   * test and the riverbed show through, as a green flash). With depth clip\n"
 "   * off, the rasterizer clamps each pixel's depth to [0, 1] instead. */\n"
+"  if (abs(pw - 1.0) >= 1e-3) { x *= dbg.x; y *= dbg.x; }\n"
 "  o.p = float4(x * pw, y * pw, pos.z * zscale * pw, pw);\n"
 "  o.zr = float2(pos.z * pw, pw);\n"
 "  o.cd = float2(pw - vparam.z, vinfo.y ? (pos.z - cst[59].z) * pw : 1.0);\n"
@@ -580,6 +583,7 @@ typedef struct {
     uint32_t stage[8][4];       /* color_icw, alpha_icw, color_ocw, alpha_ocw */
     float    factor0[8][4], factor1[8][4];
     float    wide[4];           /* 2D in widescreen: x squeeze (0 = off) about x = [1]; height x [2] about y = [3] */
+    float    dbg[4];            /* [0]: GZ_DEBUG_ZOOM */
 } Consts;
 
 /* ---- Pixel shader variants ------------------------------------------------
@@ -1172,6 +1176,24 @@ static Ds *ds_get(uint32_t va, uint32_t w, uint32_t h)
     return d;
 }
 
+/* What the device context holds from the last program draw. A frame is one
+ * to two thousand program draws in a row, most of them with the same shaders,
+ * textures and states as the one before: with ok set, a state is sent only
+ * when it differs. Anything else that draws (be_draw, be_clear, be_flip)
+ * clears ok, and the next program draw sends everything again.
+ * GZ_STATE_CACHE=0: always send. */
+static struct {
+    int ok;
+    ID3D11ShaderResourceView *srvs[8];
+    ID3D11SamplerState *smps[4];
+    ID3D11PixelShader *ps;
+    ID3D11BlendState *blend; float bf[4];
+    ID3D11DepthStencilState *depth; UINT ref;
+    ID3D11InputLayout *layout;
+    ID3D11Buffer *ib;
+} s_sc;
+static int s_sc_on = -1;
+
 static void bind_targets(Rt *r, Ds *d)
 {
     D3D11_VIEWPORT vp;
@@ -1179,6 +1201,7 @@ static void bind_targets(Rt *r, Ds *d)
 
     if (r == s_bound_rt && d == s_bound_ds) return;
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &null_srv);  /* RT may have been sampled */
+    s_sc.ok = 0;
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &r->rtv, d ? d->dsv : NULL);
     vp.TopLeftX = 0; vp.TopLeftY = 0;
     vp.Width = (FLOAT)PX_W(r->w, r->h); vp.Height = (FLOAT)(r->h * (UINT)s_scale);
@@ -1683,6 +1706,14 @@ static void set_consts(const Nv2aSurface *s, const Nv2aBatch *b, int tex0_on,
     memset(&c, 0, sizeof c);
     c.wide[0] = s_draw_squeeze; c.wide[1] = s_draw_anchor; c.wide[2] = s_draw_yscale; c.wide[3] = 0.0f;
     {
+        /* GZ_DEBUG_ZOOM=0.6: draw the 3D scene at 60% size, so what lies just
+         * outside the normal picture shows - where the game stops drawing
+         * (its culling) becomes visible as the edge of the scenery. */
+        static float zoom = -1.0f;
+        if (zoom < 0.0f) { const char *e = getenv("GZ_DEBUG_ZOOM"); zoom = (e && atof(e) > 0.05) ? (float)atof(e) : 1.0f; }
+        c.dbg[0] = zoom;
+    }
+    {
         static int wl = -1; static unsigned nsq, nanc, ntot, last;
         if (wl < 0) wl = getenv("GZ_WIDE_LOG") != NULL;
         if (wl) {
@@ -2026,22 +2057,46 @@ static void draw_state(const Nv2aSurface *s, const Nv2aBatch *b, Rt *r, Ds *d)
             }
         }
         set_consts(s, b, srv != NULL, bound);
-        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 8, srvs);
-        ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smps);
+        if (!s_sc.ok || memcmp(s_sc.srvs, srvs, sizeof srvs)) {
+            ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 8, srvs);
+            memcpy(s_sc.srvs, srvs, sizeof srvs);
+        }
+        if (!s_sc.ok || memcmp(s_sc.smps, smps, sizeof smps)) {
+            ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smps);
+            memcpy(s_sc.smps, smps, sizeof smps);
+        }
     }
 
-    ID3D11DeviceContext_PSSetShader(s_ctx, ps_variant(), NULL, 0);
-    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
-    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    {
+        ID3D11PixelShader *ps = ps_variant();
+        if (!s_sc.ok || s_sc.ps != ps) {
+            ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
+            s_sc.ps = ps;
+        }
+    }
+    if (!s_sc.ok) {
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+        ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    }
     bc = b->state->blend_color;
     bf[0] = (float)((bc >> 16) & 0xFF) / 255.0f; bf[1] = (float)((bc >> 8) & 0xFF) / 255.0f;
     bf[2] = (float)(bc & 0xFF) / 255.0f;         bf[3] = (float)(bc >> 24) / 255.0f;
     if (b->state->blend_src == 0x8003 || b->state->blend_src == 0x8004
         || b->state->blend_dst == 0x8003 || b->state->blend_dst == 0x8004)
         bf[0] = bf[1] = bf[2] = bf[3];        /* constant alpha */
-    ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_state(b->state), bf, 0xFFFFFFFFu);
-    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, depth_state(b->state, d != NULL),
-                                               b->state->stencil_ref & 0xFF);
+    {
+        ID3D11BlendState *bs = blend_state(b->state);
+        ID3D11DepthStencilState *dss = depth_state(b->state, d != NULL);
+        UINT ref = b->state->stencil_ref & 0xFF;
+        if (!s_sc.ok || s_sc.blend != bs || memcmp(s_sc.bf, bf, sizeof bf)) {
+            ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
+            s_sc.blend = bs; memcpy(s_sc.bf, bf, sizeof bf);
+        }
+        if (!s_sc.ok || s_sc.depth != dss || s_sc.ref != ref) {
+            ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss, ref);
+            s_sc.depth = dss; s_sc.ref = ref;
+        }
+    }
 }
 
 /* One [PROBE] line: grid (or GZ_GPU_PROBE) pixels of target r after the
@@ -2364,6 +2419,7 @@ static void burst_copy(int k, const char *path)
 static void be_flip(void)
 {
     s_h_flip_t0 = stat_qpc_us();
+    s_sc.ok = 0;
     MSG msg;
     D3D11_VIEWPORT vp;
     ID3D11ShaderResourceView *null_srv = NULL;
@@ -2798,16 +2854,27 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
         }
     }
     draw_state(s, b, r, d);
-    ID3D11DeviceContext_IASetInputLayout(s_ctx, layout);
-    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if (!s_sc.ok || s_sc.layout != layout) {
+        ID3D11DeviceContext_IASetInputLayout(s_ctx, layout);
+        s_sc.layout = layout;
+    }
+    if (!s_sc.ok)
+        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     vbs[0] = s_vb2; vbs[1] = s_vb2;
     strides[0] = nact ? nact * 16u : 16u; strides[1] = 256u;
     offsets[0] = vat + 256u; offsets[1] = vat;
     ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 2, vbs, strides, offsets);
-    ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib, DXGI_FORMAT_R32_UINT, 0);
-    ID3D11DeviceContext_VSSetShader(s_ctx, s_vs_prog, NULL, 0);
-    cbs[0] = s_cb; cbs[1] = s_cb_prog; cbs[2] = s_cb_const; cbs[3] = s_cb_draw;
-    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 4, cbs);
+    if (!s_sc.ok || s_sc.ib != s_ib) {
+        ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib, DXGI_FORMAT_R32_UINT, 0);
+        s_sc.ib = s_ib;
+    }
+    if (!s_sc.ok) {
+        ID3D11DeviceContext_VSSetShader(s_ctx, s_vs_prog, NULL, 0);
+        cbs[0] = s_cb; cbs[1] = s_cb_prog; cbs[2] = s_cb_const; cbs[3] = s_cb_draw;
+        ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 4, cbs);
+    }
+    if (s_sc_on < 0) s_sc_on = env_int("GZ_STATE_CACHE", 1, 0, 1);
+    s_sc.ok = s_sc_on;          /* everything above is now what the context holds */
     ID3D11DeviceContext_DrawIndexedInstanced(s_ctx, p->nindices, 1, iat / 4u, 0, 0);
     if (s_water_pending) {
         /* + the CPU interpreter's outputs for the first vertex: colours, fog, texcoords */
@@ -2894,9 +2961,9 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
 /* Timed entry points (for the GZ_PACE_LOG hitch line): how long this thread
  * spent inside the back end, and in how many calls, since the last flip. */
 static void be_clear_t(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t flags, uint32_t argb, uint32_t zs)
-{ LONGLONG t = stat_qpc_us(); be_clear(s, rs, flags, argb, zs); s_h_be[0] += stat_qpc_us() - t; s_h_ben[0]++; }
+{ LONGLONG t = stat_qpc_us(); s_sc.ok = 0; be_clear(s, rs, flags, argb, zs); s_sc.ok = 0; s_h_be[0] += stat_qpc_us() - t; s_h_ben[0]++; }
 static void be_draw_t(const Nv2aSurface *s, const Nv2aBatch *b)
-{ LONGLONG t = stat_qpc_us(); be_draw(s, b); s_h_be[1] += stat_qpc_us() - t; s_h_ben[1]++; }
+{ LONGLONG t = stat_qpc_us(); s_sc.ok = 0; be_draw(s, b); s_sc.ok = 0; s_h_be[1] += stat_qpc_us() - t; s_h_ben[1]++; }
 static int be_draw_program_t(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aProgramDraw *p)
 { LONGLONG t = stat_qpc_us(); int r = be_draw_program(s, b, p); s_h_be[2] += stat_qpc_us() - t; s_h_ben[2]++; return r; }
 static const Nv2aBackend s_backend = { be_clear_t, be_draw_t, be_flip, be_draw_program_t };

@@ -1310,25 +1310,36 @@ static void gz_camera_tick(void)
     }
 }
 
-/* -- Widescreen: a 16:9 camera ---------------------------------------------
+/* -- Widescreen ------------------------------------------------------------
+ *
+ * The game's cameras are left exactly as the game sets them (4:3), so
+ * everything the game works out from a camera - where a 3D point lands on
+ * the HUD, how to frame both monsters - stays consistent. The picture is
+ * widened at two points only:
+ *
+ *  - sub_000A6820(this = renderer 0x004322D0, type, matrix), the renderer's
+ *    set-transform (type 2 = projection): a perspective projection at 4:3
+ *    gets its x scale x 3/4, in a copy below the stack. A third more is
+ *    drawn on each side into the 640x480 frame the back end shows at 16:9
+ *    (and the back end squeezes 2D by the same 3/4, so it keeps its shape
+ *    and its place over the 3D scene).
+ *
+ *  - sub_00030840(this = frustum, camera, ...) (ret 12) and sub_00031470(this
+ *    = frustum, camera) (ret 4) build the planes objects are culled against
+ *    from the camera: position, axes and the projection scales +0x130
+ *    (across) and +0x134 (up; across = up x aspect, aspect +0x148 = 3/4).
+ *    While they run, a 4:3 camera's across scale is x 3/4 as well, so the
+ *    frustum matches what is drawn.
  *
  * sub_0001F740(this = camera, fov, a2, a3, aspect) is the camera's
- * set-perspective (ret 16). fov is vertical; aspect 0 means "from the
- * viewport": (+0x160 / +0x164, 640 / 480) x the float at 0x0043239C. The
- * fight camera passes an explicit aspect (1); the HUD and menu cameras pass
- * 0 and are not widened (the game places the HUD through them). From
- * those it stores the half-extents of the view at +0x130 (across) and +0x134
- * (up), the projection at +0x60, and hands the projection to the renderer.
- * With widescreen on the camera is given a 4/3 wider aspect here, so the
- * view, the matrix AND the game's culling (which reads the camera, not the
- * renderer) all widen together: the same view up and down, a third more to
- * the sides, drawn into the 640x480 frame the back end shows at 16:9.
- *
- * sub_000A6820(this = renderer 0x004322D0, type, matrix) is the renderer's
- * set-transform (type 2 = projection, kept at renderer + 0x1160). A
- * projection that still arrives at 4:3 (one not built by the camera above:
- * menus, cut scenes) gets its x scale x 3/4 there instead, in a copy below
- * the stack. */
+ * set-perspective (ret 16; aspect is height / width, 0 = "from the
+ * viewport"). An earlier version widened the camera there instead. The game
+ * hands a camera's stored aspect back to it, that code took the widened value
+ * for a fresh one and undid it, and fights ended up with a 4:3 camera - 4:3
+ * culling - under a 16:9 picture: scenery vanished in the outer sixths of the
+ * screen. Menu cameras were never widened, which is how the main menu's
+ * Godzilla head disappeared as the camera swung to the monster select.
+ * GZ_WIDE_CULL=0: no frustum change (to compare). */
 extern void sub_0001F740_gen(void);
 
 /* A fight is on screen when a match (heap) camera was set up more recently
@@ -1346,64 +1357,56 @@ void sub_0001F740(void)
     if (g_ecx >= 0x01000000u) gz_fight_cam_seq = ++gz_cam_seq;
     else gz_shell_cam_seq = ++gz_cam_seq;
     if (gz_opt_wide()) {
-        uint32_t ab = GZ_MEM32(g_esp + 16), pb = GZ_MEM32(0x0043239Cu);
-        float aspect, pix;
         static int nlog;
-        memcpy(&aspect, &ab, 4);
-        memcpy(&pix, &pb, 4);
         if (getenv("GZ_WIDE_LOG") && nlog++ < 40) {
-            uint32_t fb = GZ_MEM32(g_esp + 4); float fov; memcpy(&fov, &fb, 4);
-            fprintf(stderr, "[WIDE] camera %08X fov %.4g aspect arg %.4g pix %.4g viewport %ux%u\n", g_ecx, fov, aspect, pix,
+            uint32_t fb = GZ_MEM32(g_esp + 4), ab = GZ_MEM32(g_esp + 16);
+            float fov, aspect;
+            memcpy(&fov, &fb, 4); memcpy(&aspect, &ab, 4);
+            fprintf(stderr, "[WIDE] camera %08X fov %.4g aspect arg %.4g viewport %ux%u\n", g_ecx, fov, aspect,
                     GZ_MEM32(g_ecx + 0x160), GZ_MEM32(g_ecx + 0x164));
         }
-        if (aspect != 0.0f && g_ecx >= 0x01000000u) {
-            /* The shell's cameras are static objects (0x0042xxxx) and lay out
-             * menus and 2D; the fight camera is created with the match, on
-             * the heap. Its aspect varies (1, 0.75 seen), so it is widened
-             * whatever it is - once: see the table below. */
-            /* Some cameras are handed back the aspect they were last given;
-             * widening that again would compound frame after frame. So each
-             * camera's last widened value is remembered and passed through. */
-            static uint32_t cams[32], outs[32];
-            int k, slot = -1;
-            for (k = 0; k < 32; k++) if (cams[k] == g_ecx) { slot = k; break; }
-            if (slot < 0) for (k = 0; k < 32; k++) if (!cams[k]) { slot = k; cams[k] = g_ecx; outs[k] = 0; break; }
-            if (slot < 0) { slot = (int)(g_ecx >> 4) & 31; cams[slot] = g_ecx; outs[slot] = 0; }
-            if (ab != outs[slot]) {
-                aspect *= 4.0f / 3.0f;
-                memcpy(&outs[slot], &aspect, 4);
-            }
-            memcpy(&ab, &aspect, 4);
-            GZ_MEM32(g_esp + 16) = ab;
-            sub_0001F740_gen();
-        } else if (aspect == 0.0f && g_ecx >= 0x01000000u && pix > 0.1f && pix < 10.0f) {
-            /* aspect 0 = "from the screen". The HUD's and menus' cameras all
-             * use a field of view of 0.7181 and are left alone (the game lays
-             * the HUD out through them; the back end keeps 2D in shape). A
-             * 3D game camera can also ask for aspect 0 - the attract-mode
-             * demo's (fov 0.7854) - and must be widened, or the game culls
-             * at 4:3: the screen multiplier at 0x0043239C is scaled for this
-             * one call. */
-            uint32_t fb = GZ_MEM32(g_esp + 4);
-            float fov;
-            memcpy(&fov, &fb, 4);
-            if (fov < 0.71f || fov > 0.725f) {
-                /* this multiplier divides the width: 3/4 of it is a 4/3 wider view */
-                float wide = pix * 0.75f;
-                uint32_t wb;
-                memcpy(&wb, &wide, 4);
-                GZ_MEM32(0x0043239Cu) = wb;
-                sub_0001F740_gen();
-                GZ_MEM32(0x0043239Cu) = pb;
-            } else
-                sub_0001F740_gen();
-        } else {
-            sub_0001F740_gen();
-        }
-        return;
     }
     sub_0001F740_gen();
 }
+
+extern void sub_00030840_gen(void);
+extern void sub_00031470_gen(void);
+static void gz_frustum_build(void (*gen)(void))
+{
+    static int on = -1, nlog;
+    uint32_t cam = GZ_MEM32(g_esp + 4), old = 0;
+    int widen = 0;
+    if (on < 0) { const char *e = getenv("GZ_WIDE_CULL"); on = !(e && *e == '0'); }
+    if (on && cam >= 0x00010000u && gz_opt_wide()) {
+        uint32_t vb = GZ_MEM32(cam + 0x134u);
+        float h, v, r;
+        old = GZ_MEM32(cam + 0x130u);
+        memcpy(&h, &old, 4); memcpy(&v, &vb, 4);
+        r = v != 0.0f ? h / v : 0.0f;
+        /* the cameras whose projection sub_000A6820 widens: 4:3 ones */
+        widen = r > 0.743f && r < 0.758f;
+        if (nlog < 16 && getenv("GZ_WIDE_LOG")) {
+            static uint32_t seen[16];
+            int q, known = 0;
+            for (q = 0; q < nlog; q++) if (seen[q] == (cam ^ (uint32_t)widen)) known = 1;
+            if (!known) {
+                seen[nlog++] = cam ^ (uint32_t)widen;
+                fprintf(stderr, "[WIDE] frustum from camera %08X: across %.4g up %.4g (aspect %.4f) -> %s\n",
+                        cam, h, v, r, widen ? "built 4/3 wider" : "as it is");
+            }
+        }
+        if (widen) {
+            uint32_t hb;
+            h *= 0.75f;
+            memcpy(&hb, &h, 4);
+            GZ_MEM32(cam + 0x130u) = hb;
+        }
+    }
+    gen();
+    if (widen) GZ_MEM32(cam + 0x130u) = old;
+}
+void sub_00030840(void) { gz_frustum_build(sub_00030840_gen); }
+void sub_00031470(void) { gz_frustum_build(sub_00031470_gen); }
 
 extern void sub_000A6820_gen(void);
 

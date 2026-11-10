@@ -148,37 +148,25 @@ extern void sub_002237F0_gen(void);
 #define GZ_NV2A_USER_PUT 0xFD800040u
 #define GZ_NV2A_USER_GET 0xFD800044u
 
-/* -- 3D sound parameters: sub_0025658E(this voice, a, b), ret 8 --
+/* -- Sound-chip register access without the trap --
  *
- * DSOUND writes a voice's HRTF filter (about 20 sound-chip registers, each a
- * trapped access here) every time the game moves a 3D voice or the listener,
- * i.e. for every 3D voice every frame: a fifth of the game thread at 240 fps.
- * Each voice is rewritten at most GZ_SND3D_HZ times a second (default 60, as
- * on the console; 0 = every call). Both callers pass (0, 0) and ignore the
- * result. */
-extern GZ_TLS uint32_t g_ecx;
-extern void sub_0025658E_gen(void);
-void sub_0025658E(void)
+ * DSOUND commits a 3D voice's HRTF filter and volumes (about 20 and 7
+ * register accesses per voice) every time the game moves a voice or the
+ * listener: every 3D voice, every frame. Each access faulted into the APU
+ * model; at 240 fps that was a tenth to a fifth of the game thread.
+ * recomp_config/tools/fast_mmio.py rewrites those two lifted functions to call
+ * these for addresses in the APU window: the same model calls the fault
+ * handler ends in, without the exception. */
+extern void *g_apu_state;
+extern uint64_t mcpx_apu_mmio_read(void *d, uint64_t addr, unsigned int size);
+extern void mcpx_apu_mmio_write(void *d, uint64_t addr, uint64_t val, unsigned int size);
+void gz_apu_w32(uint32_t addr, uint32_t value)
 {
-    static int hz = -1;
-    static struct { uint32_t obj; LONGLONG t; } tab[256];
-    static LARGE_INTEGER freq;
-    if (hz < 0) {
-        const char *e = getenv("GZ_SND3D_HZ");
-        hz = (e && *e) ? atoi(e) : 60;
-        QueryPerformanceFrequency(&freq);
-    }
-    if (hz > 0 && GZ_MEM32(g_esp + 4) == 0 && GZ_MEM32(g_esp + 8) == 0) {
-        LARGE_INTEGER now;
-        uint32_t obj = g_ecx, k = (obj >> 4) & 255u;
-        QueryPerformanceCounter(&now);
-        if (tab[k].obj == obj && now.QuadPart - tab[k].t < freq.QuadPart / hz) {
-            g_esp += 12;                    /* return address + two arguments */
-            return;
-        }
-        tab[k].obj = obj; tab[k].t = now.QuadPart;
-    }
-    sub_0025658E_gen();
+    mcpx_apu_mmio_write(g_apu_state, addr - 0xFE800000u, value, 4);
+}
+uint32_t gz_apu_r32(uint32_t addr)
+{
+    return (uint32_t)mcpx_apu_mmio_read(g_apu_state, addr - 0xFE800000u, 4);
 }
 
 /* The renderer's begin-frame (sub_000A8510) inserts a fence and blocks on it
@@ -1456,6 +1444,49 @@ void sub_000B2A00(void)
  * a request under 10 us), so frames run as fast as they render. */
 extern void sub_00012240_gen(void);
 extern GZ_TLS double g_fp_stack[8];
+
+/* GZ_PACE_LOG: a watchdog thread that, when a frame has run 7 ms past its
+ * start, logs the guest return addresses on the game thread's stack: what
+ * the game was doing in a slow frame. */
+static volatile LONGLONG gz_slow_frame_start;      /* QPC ticks; 0 = not armed */
+static uint32_t *volatile gz_slow_esp;
+static DWORD WINAPI gz_slow_thread(LPVOID arg)
+{
+    LARGE_INTEGER f, q;
+    LONGLONG reported = 0;
+    int shown = 0;
+    (void)arg;
+    QueryPerformanceFrequency(&f);
+    for (;;) {
+        LONGLONG st = gz_slow_frame_start;
+        Sleep(1);
+        if (!st || st == reported || !gz_slow_esp || shown > 400) continue;
+        QueryPerformanceCounter(&q);
+        if ((q.QuadPart - st) * 1000 / f.QuadPart >= 7 && st == gz_slow_frame_start) {
+            uint32_t esp = *gz_slow_esp, k, n = 0;
+            reported = st; shown++;
+            fprintf(stderr, "[SLOW] +%lld ms esp %08X:", (long long)((q.QuadPart - st) * 1000 / f.QuadPart), esp);
+            for (k = 0; k < 400 && n < 14; k++) {
+                uint32_t v = GZ_MEM32(esp + k * 4);
+                if (v >= 0x00011000u && v < 0x002E0000u) { fprintf(stderr, " %08X", v); n++; }
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+}
+static void gz_slow_watch(double now)
+{
+    static int started;
+    LARGE_INTEGER q;
+    (void)now;
+    if (!started) {
+        started = 1;
+        gz_slow_esp = &g_esp;
+        CreateThread(NULL, 0, gz_slow_thread, NULL, 0, NULL);
+    }
+    QueryPerformanceCounter(&q);
+    gz_slow_frame_start = q.QuadPart;
+}
 extern GZ_TLS int g_fp_top;
 
 void sub_00012240(void)
@@ -1572,11 +1603,14 @@ void sub_00012240(void)
                         static double t0, worst;
                         static unsigned frames, late, waited;
                         if (plog < 0) plog = getenv("GZ_PACE_LOG") != NULL;
+                        if (plog) gz_slow_watch(now);
                         if (plog) {
                             extern volatile LONG gz_stat_decode_us, gz_stat_decode_n, gz_stat_decode_px;
                             LONG du = InterlockedExchange(&gz_stat_decode_us, 0), dn = InterlockedExchange(&gz_stat_decode_n, 0);
                             LONG dp = InterlockedExchange(&gz_stat_decode_px, 0);
                             double fw = gz_fence_wait_s; gz_fence_wait_s = 0.0;
+                            static double fw_sec, slept_sec;
+                            fw_sec += fw; slept_sec += now - start;
                             if (step > 0.010)
                                 fprintf(stderr, "[HITCH] %.1f ms: fence waits %.1f ms (longest %.1f from %08X %08X %08X %08X), texture decodes %ld (%ld px) %.1f ms\n",
                                         step * 1000.0, fw * 1000.0, gz_fence_wait_max * 1000.0, gz_fence_wait_ra[0], gz_fence_wait_ra[1],
@@ -1586,7 +1620,8 @@ void sub_00012240(void)
                             if (now - start > 0.00005) waited++; else late++;
                             if (step > worst) worst = step;
                             if (now - t0 >= 1.0) {
-                                fprintf(stderr, "[PACE] %u frames, %u waited, %u late, longest %.2f ms\n", frames, waited, late, worst * 1000.0);
+                                fprintf(stderr, "[PACE] %u frames, %u waited, %u late, longest %.2f ms, waiting on GPU thread %.0f ms, idle in limiter %.0f ms\n", frames, waited, late, worst * 1000.0, fw_sec * 1000.0, slept_sec * 1000.0);
+                                fw_sec = slept_sec = 0.0;
                                 t0 = now; frames = late = waited = 0; worst = 0.0;
                             }
                         }

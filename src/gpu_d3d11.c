@@ -53,7 +53,8 @@ static int s_rcdbg;
 static int s_scale = 1, s_win_scale = 2, s_vsync, s_cull, s_trace, s_readback;
 /* GZ_PACE_LOG: where a slow frame's time went on this thread (microseconds). */
 static LONGLONG stat_qpc_us(void);
-static LONGLONG s_h_map, s_h_map_max, s_h_present, s_h_last_flip, s_h_tex;
+static LONGLONG s_h_map, s_h_map_max, s_h_present, s_h_last_flip, s_h_tex, s_h_flip_t0;
+static LONGLONG s_h_be[3]; static UINT s_h_ben[3];
 static UINT     s_h_discards;
 static int s_aniso = 16;   /* GZ_ANISO: >1 = mip chain + anisotropic filtering on linear textures */
 #define GZ_SWAP_ALLOW_TEARING    2048u   /* DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING */
@@ -625,14 +626,7 @@ static void ps_compile(PsVar *v)
     int i, n = 0;
 
     snprintf(path, sizeof path, "shader_cache/%016llX.cso", (unsigned long long)v->hash);
-    if ((f = fopen(path, "rb")) != NULL) {
-        fseek(f, 0, SEEK_END); size = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
-        if (size > 0 && size < (1u << 20) && (code = malloc(size)) != NULL && fread(code, 1, size, f) != size) {
-            free(code); code = NULL;
-        }
-        fclose(f);
-    }
-    if (!code) {
+    {
         snprintf(fin, sizeof fin, "%uu,%uu,%uu,%uu", k->fin[0], k->fin[1], k->fin[2], k->fin[3]);
         snprintf(misc, sizeof misc, "%uu,%uu,%uu,%uu", k->misc[0], k->misc[1], k->misc[2], k->misc[3]);
         for (i = 0; i < 8; i++)
@@ -664,17 +658,70 @@ static void ps_compile(PsVar *v)
         if (err) ID3D10Blob_Release(err);
         CreateDirectoryA("shader_cache", NULL);
         if ((f = fopen(path, "wb")) != NULL) {
+            /* header: magic, shader source hash, key; then the bytecode (ps_preload) */
+            fwrite("GZPS", 1, 4, f);
+            fwrite(&s_ps_src_hash, 1, sizeof s_ps_src_hash, f);
+            fwrite(k, 1, sizeof *k, f);
             fwrite(ID3D10Blob_GetBufferPointer(blob), 1, ID3D10Blob_GetBufferSize(blob), f);
             fclose(f);
         }
     }
-    if (SUCCEEDED(ID3D11Device_CreatePixelShader(s_dev, code ? code : ID3D10Blob_GetBufferPointer(blob),
-                                                 code ? size : ID3D10Blob_GetBufferSize(blob), NULL, &v->ps)))
+    (void)code; (void)size;
+    if (SUCCEEDED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(blob),
+                                                 ID3D10Blob_GetBufferSize(blob), NULL, &v->ps)))
         InterlockedExchange(&v->state, 2);
     else
         InterlockedExchange(&v->state, 3);
     if (blob) ID3D10Blob_Release(blob);
-    free(code);
+}
+
+/* Create every variant an earlier run compiled (shader_cache/), before the
+ * worker thread exists: the driver then has them ready long before a fight
+ * needs them, instead of stalling the first frame that uses each. */
+static void ps_preload(void)
+{
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA("shader_cache/*.cso", &fd);
+    unsigned loaded = 0, stale = 0;
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        char path[MAX_PATH], magic[4];
+        uint64_t src;
+        PsKey key;
+        uint8_t *code;
+        long size;
+        uint32_t i, at;
+        uint64_t hh;
+        FILE *f;
+        snprintf(path, sizeof path, "shader_cache/%s", fd.cFileName);
+        if (!(f = fopen(path, "rb"))) continue;
+        fseek(f, 0, SEEK_END); size = ftell(f) - (long)(4 + sizeof src + sizeof key); fseek(f, 0, SEEK_SET);
+        if (size <= 0 || size > (1 << 20) || fread(magic, 1, 4, f) != 4 || memcmp(magic, "GZPS", 4)
+                || fread(&src, 1, sizeof src, f) != sizeof src || src != s_ps_src_hash
+                || fread(&key, 1, sizeof key, f) != sizeof key || !(code = (uint8_t *)malloc((size_t)size))) {
+            fclose(f);
+            stale++;
+            DeleteFileA(path);                  /* an older shader source: never used again */
+            continue;
+        }
+        if (fread(code, 1, (size_t)size, f) == (size_t)size) {
+            hh = fnv64(&key, sizeof key, s_ps_src_hash);
+            at = (uint32_t)(hh ^ (hh >> 32)) % PS_VARS;
+            for (i = 0; i < 16; i++, at = (at + 1) % PS_VARS) {
+                PsVar *v = &s_psv[at];
+                if (v->state) continue;
+                if (SUCCEEDED(ID3D11Device_CreatePixelShader(s_dev, code, (SIZE_T)size, NULL, &v->ps))) {
+                    v->key = key; v->hash = hh; v->state = 2;
+                    loaded++;
+                }
+                break;
+            }
+        }
+        free(code);
+        fclose(f);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    fprintf(stderr, "[GPU-D3D11] %u pixel shader variant(s) loaded from shader_cache, %u stale removed\n", loaded, stale);
 }
 
 static DWORD WINAPI ps_worker(LPVOID arg)
@@ -700,6 +747,7 @@ static ID3D11PixelShader *ps_variant(void)
         s_ps_spec = env_int("GZ_PS_SPEC", 1, 0, 1);
         if (s_ps_spec) {
             s_ps_src_hash = fnv64(s_hlsl, sizeof s_hlsl - 1, 14695981039346656037ull);
+            ps_preload();
             s_ps_event = CreateEventA(NULL, FALSE, FALSE, NULL);
             if (!s_ps_event || !CreateThread(NULL, 0, ps_worker, NULL, 0, NULL)) s_ps_spec = 0;
         }
@@ -2290,6 +2338,7 @@ static void burst_copy(int k, const char *path)
 
 static void be_flip(void)
 {
+    s_h_flip_t0 = stat_qpc_us();
     MSG msg;
     D3D11_VIEWPORT vp;
     ID3D11ShaderResourceView *null_srv = NULL;
@@ -2410,10 +2459,13 @@ static void be_flip(void)
             s_h_present = p1 - p0;
             if (hlog < 0) hlog = getenv("GZ_PACE_LOG") != NULL;
             if (hlog && s_h_last_flip && p1 - s_h_last_flip > 10000)
-                fprintf(stderr, "[GPUHITCH] flip to flip %.1f ms: present %.1f, buffer maps %.1f (longest %.1f, %u discards), texture decodes %.1f\n",
+                fprintf(stderr, "[GPUHITCH] flip to flip %.1f ms: present %.1f, buffer maps %.1f (longest %.1f, %u discards), texture decodes %.1f"
+                        " | back end: clears %.1f (%u), draws %.1f (%u), program draws %.1f (%u), rest of flip %.1f\n",
                         (p1 - s_h_last_flip) / 1000.0, s_h_present / 1000.0, s_h_map / 1000.0, s_h_map_max / 1000.0,
-                        s_h_discards, s_h_tex / 1000.0);
+                        s_h_discards, s_h_tex / 1000.0, s_h_be[0] / 1000.0, s_h_ben[0], s_h_be[1] / 1000.0, s_h_ben[1],
+                        s_h_be[2] / 1000.0, s_h_ben[2], (p0 - s_h_flip_t0) / 1000.0);
             s_h_last_flip = p1; s_h_map = s_h_map_max = 0; s_h_discards = 0; s_h_tex = 0;
+            s_h_be[0] = s_h_be[1] = s_h_be[2] = 0; s_h_ben[0] = s_h_ben[1] = s_h_ben[2] = 0;
         }
         s_st_presents++;
         s_bound_rt = NULL; s_bound_ds = NULL;       /* rebind on the next draw */
@@ -2790,7 +2842,15 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     return 1;
 }
 
-static const Nv2aBackend s_backend = { be_clear, be_draw, be_flip, be_draw_program };
+/* Timed entry points (for the GZ_PACE_LOG hitch line): how long this thread
+ * spent inside the back end, and in how many calls, since the last flip. */
+static void be_clear_t(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t flags, uint32_t argb, uint32_t zs)
+{ LONGLONG t = stat_qpc_us(); be_clear(s, rs, flags, argb, zs); s_h_be[0] += stat_qpc_us() - t; s_h_ben[0]++; }
+static void be_draw_t(const Nv2aSurface *s, const Nv2aBatch *b)
+{ LONGLONG t = stat_qpc_us(); be_draw(s, b); s_h_be[1] += stat_qpc_us() - t; s_h_ben[1]++; }
+static int be_draw_program_t(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aProgramDraw *p)
+{ LONGLONG t = stat_qpc_us(); int r = be_draw_program(s, b, p); s_h_be[2] += stat_qpc_us() - t; s_h_ben[2]++; return r; }
+static const Nv2aBackend s_backend = { be_clear_t, be_draw_t, be_flip, be_draw_program_t };
 
 /* Called from main() before the title starts. GZ_GPU=0 keeps the CPU
  * rasteriser. Needs RECOMP_PB_EXEC (the executor is what calls us). */

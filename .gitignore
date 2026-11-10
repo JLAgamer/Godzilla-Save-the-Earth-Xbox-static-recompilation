@@ -35,3 +35,4 @@ xbox_kernel.log
 Thumbs.db
 .DS_Store
 __pycache__/
+/shader_cache/

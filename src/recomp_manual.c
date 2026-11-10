@@ -148,11 +148,73 @@ extern void sub_002237F0_gen(void);
 #define GZ_NV2A_USER_PUT 0xFD800040u
 #define GZ_NV2A_USER_GET 0xFD800044u
 
+/* -- 3D sound parameters: sub_0025658E(this voice, a, b), ret 8 --
+ *
+ * DSOUND writes a voice's HRTF filter (about 20 sound-chip registers, each a
+ * trapped access here) every time the game moves a 3D voice or the listener,
+ * i.e. for every 3D voice every frame: a fifth of the game thread at 240 fps.
+ * Each voice is rewritten at most GZ_SND3D_HZ times a second (default 60, as
+ * on the console; 0 = every call). Both callers pass (0, 0) and ignore the
+ * result. */
+extern GZ_TLS uint32_t g_ecx;
+extern void sub_0025658E_gen(void);
+void sub_0025658E(void)
+{
+    static int hz = -1;
+    static struct { uint32_t obj; LONGLONG t; } tab[256];
+    static LARGE_INTEGER freq;
+    if (hz < 0) {
+        const char *e = getenv("GZ_SND3D_HZ");
+        hz = (e && *e) ? atoi(e) : 60;
+        QueryPerformanceFrequency(&freq);
+    }
+    if (hz > 0 && GZ_MEM32(g_esp + 4) == 0 && GZ_MEM32(g_esp + 8) == 0) {
+        LARGE_INTEGER now;
+        uint32_t obj = g_ecx, k = (obj >> 4) & 255u;
+        QueryPerformanceCounter(&now);
+        if (tab[k].obj == obj && now.QuadPart - tab[k].t < freq.QuadPart / hz) {
+            g_esp += 12;                    /* return address + two arguments */
+            return;
+        }
+        tab[k].obj = obj; tab[k].t = now.QuadPart;
+    }
+    sub_0025658E_gen();
+}
+
+/* The renderer's begin-frame (sub_000A8510) inserts a fence and blocks on it
+ * at once: the game waits until the GPU has finished the whole previous
+ * frame before it starts the next, so the game thread and the pushbuffer
+ * executor take turns instead of overlapping. Here that wait is for the
+ * fence of the begin-frame before: the executor may run up to one frame
+ * behind, and both threads work at the same time. D3D still blocks on its
+ * own fences wherever it locks a resource the GPU has yet to use, so buffers
+ * are not rewritten early. GZ_GPU_LAG=0 restores the original wait. */
+static double gz_fence_wait_s;      /* time blocked on the GPU, for the hitch log */
+static double gz_fence_wait_max;
+static uint32_t gz_fence_wait_ra[4];
+static uint32_t gz_lag_fence(uint32_t fence)
+{
+    static int on = -1;
+    static uint32_t prev, have;
+    uint32_t use = fence;
+    if (on < 0) { const char *e = getenv("GZ_GPU_LAG"); on = !(e && *e == '0'); }
+    if (!on) return fence;
+    if (have) use = prev;
+    prev = fence; have = 1;
+    return use;
+}
+
 void sub_002237F0(void)
 {
     uint32_t fence = GZ_MEM32(g_esp + 4);
     uint32_t dev = GZ_MEM32(GZ_D3D_DEVICE_PTR);
     uint32_t sem_va = dev ? GZ_MEM32(dev + 0x30) : 0;
+
+    /* Called as BlockOnFence (return 0x0021ED7C) from begin-frame (0x000A853B). */
+    if (GZ_MEM32(g_esp) == 0x0021ED7Cu && GZ_MEM32(g_esp + 12) == 0x000A853Bu) {
+        fence = gz_lag_fence(fence);
+        GZ_MEM32(g_esp + 4) = fence;
+    }
 
     if (sem_va) {
         gz_register_semaphore();
@@ -177,6 +239,8 @@ void sub_002237F0(void)
                 DWORD t0 = GetTickCount();
                 uint32_t get0 = GZ_MEM32(GZ_NV2A_USER_GET);
                 int drained = 0;
+                LARGE_INTEGER qa, qb, qf2;
+                QueryPerformanceCounter(&qa);
                 while (!GZ_FENCE_DONE()) {
                     uint32_t get = GZ_MEM32(GZ_NV2A_USER_GET);
                     DWORD dt;
@@ -185,6 +249,16 @@ void sub_002237F0(void)
                     drained = GZ_MEM32(GZ_NV2A_USER_PUT) == get;
                     if ((drained && dt >= GZ_FENCE_WAIT_MS) || dt >= 30000u) break;
                     Sleep(0);
+                }
+                QueryPerformanceCounter(&qb); QueryPerformanceFrequency(&qf2);
+                {
+                    double w = (double)(qb.QuadPart - qa.QuadPart) / (double)qf2.QuadPart;
+                    gz_fence_wait_s += w;
+                    if (w > gz_fence_wait_max) {
+                        gz_fence_wait_max = w;
+                        gz_fence_wait_ra[0] = GZ_MEM32(g_esp); gz_fence_wait_ra[1] = GZ_MEM32(g_esp + 12);
+                        gz_fence_wait_ra[2] = GZ_MEM32(g_esp + 16); gz_fence_wait_ra[3] = GZ_MEM32(g_esp + 20);
+                    }
                 }
                 if (!GZ_FENCE_DONE()) {
                     static int s_forced;
@@ -1492,6 +1566,31 @@ void sub_00012240(void)
                     float f;
                     uint32_t fb;
                     prev_wake = now;
+                    {
+                        /* GZ_PACE_LOG=1: once a second, how the pacing went. */
+                        static int plog = -1;
+                        static double t0, worst;
+                        static unsigned frames, late, waited;
+                        if (plog < 0) plog = getenv("GZ_PACE_LOG") != NULL;
+                        if (plog) {
+                            extern volatile LONG gz_stat_decode_us, gz_stat_decode_n, gz_stat_decode_px;
+                            LONG du = InterlockedExchange(&gz_stat_decode_us, 0), dn = InterlockedExchange(&gz_stat_decode_n, 0);
+                            LONG dp = InterlockedExchange(&gz_stat_decode_px, 0);
+                            double fw = gz_fence_wait_s; gz_fence_wait_s = 0.0;
+                            if (step > 0.010)
+                                fprintf(stderr, "[HITCH] %.1f ms: fence waits %.1f ms (longest %.1f from %08X %08X %08X %08X), texture decodes %ld (%ld px) %.1f ms\n",
+                                        step * 1000.0, fw * 1000.0, gz_fence_wait_max * 1000.0, gz_fence_wait_ra[0], gz_fence_wait_ra[1],
+                                        gz_fence_wait_ra[2], gz_fence_wait_ra[3], (long)dn, (long)dp, du / 1000.0);
+                            gz_fence_wait_max = 0.0;
+                            frames++;
+                            if (now - start > 0.00005) waited++; else late++;
+                            if (step > worst) worst = step;
+                            if (now - t0 >= 1.0) {
+                                fprintf(stderr, "[PACE] %u frames, %u waited, %u late, longest %.2f ms\n", frames, waited, late, worst * 1000.0);
+                                t0 = now; frames = late = waited = 0; worst = 0.0;
+                            }
+                        }
+                    }
                     if (step < (double)period) step = (double)period;
                     if (step > 0.05) step = 0.05;           /* a hitch: at most 1/20 s at once */
                     f = (float)step;

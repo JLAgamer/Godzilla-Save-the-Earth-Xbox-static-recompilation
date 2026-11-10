@@ -199,7 +199,7 @@ index 3c719cf..af0d405 100644
           * the join above leaves a trailing separator -- which CreateFileW
           * rejects even with FILE_FLAG_BACKUP_SEMANTICS, turning an existing
 diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
-index 87788ed..cad3b9a 100644
+index 87788ed..624b417 100644
 --- a/src/kernel/nv2a_backend.h
 +++ b/src/kernel/nv2a_backend.h
 @@ -29,6 +29,8 @@
@@ -254,7 +254,7 @@ index 87788ed..cad3b9a 100644
  } Nv2aRenderState;
  
  typedef struct {
-@@ -87,8 +110,64 @@ typedef struct {
+@@ -87,8 +110,69 @@ typedef struct {
      uint32_t           count;
      const Nv2aTexture *texture;     /* NULL: untextured */
      const Nv2aRenderState *state;
@@ -314,12 +314,17 @@ index 87788ed..cad3b9a 100644
 +    uint32_t        near_z;
 +    uint32_t        fog_enable, fog_mode;
 +    float           fog_param[2];
++    /* The vertex inputs, packed (attrs is NULL then): 64 floats holding all
++     * 16 inputs as per-draw values, then for each vertex only the inputs named
++     * in packed_mask (bit n = input n, lowest first), 4 floats each. */
++    const float    *packed;
++    uint32_t        packed_mask;
 +} Nv2aProgramDraw;
 +
  typedef struct {
      /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
       * zstencil: SET_ZSTENCIL_CLEAR_VALUE (depth in the top 24 bits for Z24S8). */
-@@ -96,6 +175,12 @@ typedef struct {
+@@ -96,6 +180,12 @@ typedef struct {
                    uint32_t flags, uint32_t argb, uint32_t zstencil);
      void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
      void (*flip)(void);
@@ -332,7 +337,7 @@ index 87788ed..cad3b9a 100644
  } Nv2aBackend;
  
  /* Register (or, with NULL, remove) the back end. Call before the title starts
-@@ -117,6 +202,11 @@ void nv2a_backend_register_with_present_sync(const Nv2aBackend *backend,
+@@ -117,6 +207,11 @@ void nv2a_backend_register_with_present_sync(const Nv2aBackend *backend,
   * Returns 0 if the format is not supported. */
  int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
  
@@ -345,7 +350,7 @@ index 87788ed..cad3b9a 100644
   * of the semaphore the title reads GPU progress from (for XDK D3D, the
   * pointer at device+0x30). The executor writes each release there once it
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a5ea9cc..33f5827 100644
+index a5ea9cc..0f64d5d 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -448,6 +448,13 @@ static void dump_texture_bmp(uint32_t seq);
@@ -534,7 +539,7 @@ index a5ea9cc..33f5827 100644
          }
          s_bcount += 3;
          return;
-@@ -3321,15 +3387,207 @@ static void xf_set_viewport(void)
+@@ -3321,15 +3387,269 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -548,8 +553,10 @@ index a5ea9cc..33f5827 100644
 +static int gpu_program_draw(void)
 +{
 +    static int off = -1, near_z = -1;
-+    static float (*attrs)[16][4];
-+    static uint32_t *slot_of, *tris, *vc_idx, *vc_gen, *vc_slot, gen;
++    static float *packed;
++    uint32_t packed_mask = 0;
++    static uint32_t *slot_of, *tris, *vc_idx, *vc_gen, *vc_slot, *uniq, gen;
++    uint32_t idx_min = 0xFFFFFFFFu, idx_max = 0, a;
 +    static uint32_t prog[NV2A_VSH_SLOTS][8];
 +    Nv2aProgramDraw p;
 +    Nv2aSurface surf;
@@ -570,14 +577,15 @@ index a5ea9cc..33f5827 100644
 +    memset(&p, 0, sizeof p);
 +    if (!nv2a_vsh_export_program(prog, &p.ninstr, &p.program_rev))
 +        return 0;
-+    if (!attrs) {
-+        attrs   = (float (*)[16][4])malloc((size_t)NV_MAX_INDICES * sizeof *attrs);
++    if (!packed) {
++        packed  = (float *)malloc(((size_t)NV_MAX_INDICES + 1) * 16 * 4 * sizeof *packed);
 +        slot_of = (uint32_t *)malloc((size_t)NV_MAX_INDICES * sizeof *slot_of);
 +        tris    = (uint32_t *)malloc((size_t)NV_MAX_INDICES * 6 * sizeof *tris);
 +        vc_idx  = (uint32_t *)calloc(65536, sizeof *vc_idx);
 +        vc_gen  = (uint32_t *)calloc(65536, sizeof *vc_gen);
 +        vc_slot = (uint32_t *)calloc(65536, sizeof *vc_slot);
-+        if (!attrs || !slot_of || !tris || !vc_idx || !vc_gen || !vc_slot) {
++        uniq    = (uint32_t *)malloc((size_t)NV_MAX_INDICES * sizeof *uniq);
++        if (!packed || !slot_of || !tris || !vc_idx || !vc_gen || !vc_slot || !uniq) {
 +            off = 1;
 +            return 0;
 +        }
@@ -588,22 +596,19 @@ index a5ea9cc..33f5827 100644
 +    }
 +    /* Unique vertices, in first-use order, and each batch position's slot. */
 +    for (i = 0; i < n; i++) {
-+        uint32_t idx = s_gpu.idx[i], h = idx & 0xFFFFu, a;
-+        s_vc_total++;
++        uint32_t idx = s_gpu.idx[i], h = idx & 0xFFFFu;
 +        if (vc_gen[h] == gen && vc_idx[h] == idx) {
 +            slot_of[i] = vc_slot[h];
-+            s_vc_hits++;
 +            continue;
 +        }
-+        for (a = 0; a < NV2A_VSH_INPUTS; a++) {
-+            if (!s_gpu.attr[a].size && a < NV_VERTEX_ATTRS)
-+                memcpy(attrs[nv][a], s_gpu.imm_attr[a], sizeof attrs[nv][a]);
-+            else
-+                fetch_attr(&s_gpu.attr[a], idx, attrs[nv][a]);
-+        }
++        if (idx < idx_min) idx_min = idx;
++        if (idx > idx_max) idx_max = idx;
++        uniq[nv] = idx;
 +        vc_gen[h] = gen; vc_idx[h] = idx; vc_slot[h] = nv;
 +        slot_of[i] = nv++;
 +    }
++    s_vc_total += n;
++    s_vc_hits += n - nv;
 +#define TRI(x, y, z) (tris[nt++] = slot_of[x], tris[nt++] = slot_of[y], tris[nt++] = slot_of[z])
 +    switch (s_gpu.prim) {
 +    case NV_PRIM_TRIANGLES:
@@ -647,6 +652,66 @@ index a5ea9cc..33f5827 100644
 +        if (!s_gpu.depth_test && (int)nv < cpu_max)
 +            return 0;
 +    }
++    /* Inputs of the unique vertices, packed: first all 16 inputs as per-draw
++     * values (immediate values, defaults), then per vertex only the inputs
++     * that come from arrays. The common layouts (floats and D3DCOLOR in guest
++     * memory, the whole index range checked once) are copied directly;
++     * anything else goes through fetch_attr. Expanding every vertex to all
++     * 16 inputs (256 bytes) was the executor's largest cost. */
++    {
++        struct { const uint8_t *base; uint32_t stride, type, cnt, slow; } src[NV2A_VSH_INPUTS];
++        uint32_t nsrc = 0, v, k;
++        float (*tmpl)[4] = (float (*)[4])packed, *o = packed + 64;
++        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
++
++        for (a = 0; a < NV2A_VSH_INPUTS; a++) {
++            const VertexAttr *at = &s_gpu.attr[a];
++            tmpl[a][0] = tmpl[a][1] = tmpl[a][2] = 0.0f; tmpl[a][3] = 1.0f;
++            if (!at->size && a < NV_VERTEX_ATTRS) {
++                memcpy(tmpl[a], s_gpu.imm_attr[a], sizeof tmpl[a]);
++                continue;
++            }
++            if (!at->size || !at->stride)
++                continue;                       /* fetch_attr: 0,0,0,1 */
++            packed_mask |= 1u << a;
++            src[nsrc].slow = a + 1;
++            if (!s_gpu.inline_active && at->offset && (at->type == 2 || at->type == 0)
++                && guest_span_ok((uint64_t)at->offset + (uint64_t)idx_min * at->stride, attr_elem_bytes(at))
++                && guest_span_ok((uint64_t)at->offset + (uint64_t)idx_max * at->stride, attr_elem_bytes(at))) {
++                src[nsrc].slow = 0;
++                src[nsrc].base = mem + at->offset;
++                src[nsrc].stride = at->stride;
++                src[nsrc].type = at->type;
++                src[nsrc].cnt = at->size < 4 ? at->size : 4;
++            }
++            nsrc++;
++        }
++        for (v = 0; v < nv; v++) {
++            uint32_t idx = uniq[v];
++            for (k = 0; k < nsrc; k++, o += 4) {
++                const uint8_t *q;
++                if (src[k].slow) {
++                    fetch_attr(&s_gpu.attr[src[k].slow - 1], idx, o);
++                    continue;
++                }
++                q = src[k].base + (size_t)idx * src[k].stride;
++                if (src[k].type == 2) {
++                    const float *f = (const float *)q;
++                    switch (src[k].cnt) {
++                    case 4:  o[0] = f[0]; o[1] = f[1]; o[2] = f[2]; o[3] = f[3]; break;
++                    case 3:  o[0] = f[0]; o[1] = f[1]; o[2] = f[2]; o[3] = 1.0f; break;
++                    case 2:  o[0] = f[0]; o[1] = f[1]; o[2] = 0.0f; o[3] = 1.0f; break;
++                    default: o[0] = f[0]; o[1] = 0.0f; o[2] = 0.0f; o[3] = 1.0f; break;
++                    }
++                } else {
++                    o[0] = (float)q[2] * (1.0f / 255.0f);
++                    o[1] = (float)q[1] * (1.0f / 255.0f);
++                    o[2] = (float)q[0] * (1.0f / 255.0f);
++                    o[3] = (float)q[3] * (1.0f / 255.0f);
++                }
++            }
++        }
++    }
 +    s_gpu.batches_program++;
 +    s_gpu.verts_program += n;
 +    if (!nt)
@@ -654,7 +719,9 @@ index a5ea9cc..33f5827 100644
 +    if (s_bcount)
 +        backend_flush(1);
 +
-+    p.attrs = (const float (*)[16][4])attrs;
++    p.attrs = NULL;
++    p.packed = packed;
++    p.packed_mask = packed_mask;
 +    p.nverts = nv;
 +    p.indices = tris;
 +    p.nindices = nt;
@@ -745,7 +812,16 @@ index a5ea9cc..33f5827 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -3687,7 +3945,8 @@ static void draw_primitive(void)
+@@ -3615,8 +3935,6 @@ static void draw_primitive(void)
+     if (!s_gpu.prim || !s_gpu.idx_count)
+         return;
+     s_gpu.draws++;
+-    if ((s_gpu.draws % 200) == 0)
+-        fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
+     s_gpu.verts += s_gpu.idx_count;
+ 
+     /* How many batches carry coordinates at all, and what range they span.
+@@ -3687,7 +4005,8 @@ static void draw_primitive(void)
          }
      }
  
@@ -755,7 +831,37 @@ index a5ea9cc..33f5827 100644
          static int shown;
          if (shown++ < 6) {
              fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
-@@ -4346,7 +4605,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4173,6 +4492,29 @@ int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
+     return 1;
+ }
+ 
++/* ARRAY_ELEMENT16/32 (index data), the other bulk of a frame's words, also
++ * without the general dispatch. Returns 0 for anything else. */
++int nv2a_pb_exec_index_word(uint32_t method, uint32_t param)
++{
++    if (!s_exec_inited || s_ftrace == 2)
++        return 0;
++    if (method == NV097_ARRAY_ELEMENT16) {
++        s_reg[0x1800 / 4] = param;
++        if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
++            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
++            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
++        }
++        return 1;
++    }
++    if (method == 0x1808) {
++        s_reg[0x1808 / 4] = param;
++        if (s_gpu.prim && s_gpu.idx_count < NV_MAX_INDICES)
++            s_gpu.idx[s_gpu.idx_count++] = param;
++        return 1;
++    }
++    return 0;
++}
++
+ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+ {
+     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
+@@ -4346,7 +4688,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x033C: s_gpu.alpha_func = param; break;
      case 0x0340: s_gpu.alpha_ref = param; break;
      case 0x02A4: s_gpu.fog_enable = param; break;
@@ -769,7 +875,7 @@ index a5ea9cc..33f5827 100644
      case 0x029C: s_gpu.fog_mode = param; break;
      case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
      case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
-@@ -4792,7 +5056,7 @@ static void find_nan_matrices(void)
+@@ -4792,7 +5139,7 @@ static void find_nan_matrices(void)
   * pointer or a number", and guessing wrong costs a run. */
  static void peek_addresses(void)
  {
@@ -778,7 +884,7 @@ index a5ea9cc..33f5827 100644
      const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
      char buf[256];
      char *tok, *ctx = NULL;
-@@ -4823,7 +5087,7 @@ static void peek_addresses(void)
+@@ -4823,7 +5170,7 @@ static void peek_addresses(void)
   */
  static void peek_chain(void)
  {
@@ -787,7 +893,7 @@ index a5ea9cc..33f5827 100644
      const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
      char buf[256], *tok, *ctx = NULL;
      uint32_t cur = 0;
-@@ -4861,13 +5125,15 @@ void nv2a_pb_exec_report(void)
+@@ -4861,13 +5208,15 @@ void nv2a_pb_exec_report(void)
  {
      peek_addresses();
      peek_chain();
@@ -805,7 +911,7 @@ index a5ea9cc..33f5827 100644
          static int done;
          if (!done) { done = 1; find_quad_vertices(); }
      }
-@@ -4885,6 +5151,12 @@ void nv2a_pb_exec_report(void)
+@@ -4885,6 +5234,12 @@ void nv2a_pb_exec_report(void)
          last_flips = s_gpu.flips;
          last_ms = now;
      }
@@ -818,6 +924,28 @@ index a5ea9cc..33f5827 100644
      flip_hold_report();
      fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
                      " clears %u | %u unhandled methods (%d distinct)\n",
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index 5fab4c3..a628a9e 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -44,6 +44,7 @@ static uint32_t s_tot_calls;
+  * the executor writes to guest memory. */
+ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+ extern int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param);
++extern int nv2a_pb_exec_index_word(uint32_t method, uint32_t param);
+ extern void nv2a_pb_exec_report(void);
+ 
+ /* One word to the executor. SET_TRANSFORM_CONSTANT words, the bulk of a
+@@ -54,6 +55,9 @@ static void exec_word(uint32_t subch, uint32_t method, uint32_t param)
+     if (subch == 0 && method >= 0x0B80u && method < 0x0C00u
+             && nv2a_pb_exec_constant_word(method, param))
+         return;
++    if (subch == 0 && (method == 0x1800u || method == 0x1808u)
++            && nv2a_pb_exec_index_word(method, param))
++        return;
+     nv2a_pb_exec_method(subch, method, param);
+ }
+ static int s_exec_enabled = -1;
 diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
 index c7fd25d..63673f2 100644
 --- a/src/kernel/nv2a_vsh_interp.c

@@ -1,0 +1,7 @@
+[
+  {"start": "0x002D7C84", "note": "XPP (controller/USB lib): entered only by an indirect call; prologue 55 8B EC 83 EC 0C hidden behind a data table"},
+  {"start": "0x001F82E0", "note": "Particle-system widget (vtable 0x00342634) method [2], reached only via the vtable. Missing it left the widget unconfigured and corrupted the heap after the intro"},
+  {"start": "0x00040850", "note": "Data/vtable pointer scan: CC-padded, 16-aligned, not detected"},
+  {"start": "0x001A7570", "note": "CRT x87 helper entry (fstp; fstp; fldz; ret) shared tail with 0x001A7572; called via a math dispatch table. Missing it froze the first versus fight"},
+  {"start": "0x001A77C9", "note": "Second CRT x87 helper entry in the same block (follows a ret), referenced from the same dispatch table"}
+]

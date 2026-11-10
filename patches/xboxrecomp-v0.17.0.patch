@@ -1,0 +1,956 @@
+diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
+index bd36f2a..9e944cd 100644
+--- a/src/apu/apu_dsp.c
++++ b/src/apu/apu_dsp.c
+@@ -25,6 +25,7 @@
+ #include "apu_state.h"
+ #include "fpconv.h"
+ 
++#include <math.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -278,7 +279,55 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+              * counts. This is not what a real EP does; it is the cheapest
+              * mixdown that stops discarding audio. */
+             float left, right;
+-            if (mcpx_apu_mixdown_all()) {
++            /* RECOMP_APU_MIXDOWN=pairs: the even-left / odd-right sum above.
++             * Default: a speaker downmix of the XDK DirectSound bins --
++             * 0 FL, 1 FR, 2 C, 3 LFE, 4 BL, 5 BR, then the 3D (XTLK) set
++             * 6 FL, 7 FR, 8 BL, 9 BR, 10 C, 11 LFE -- with centre and LFE to
++             * both ears. Under even/odd, centre landed in the left ear only
++             * and LFE in the right, so music routed to the centre played
++             * from one side (Godzilla). Bins 12+ (I3DL2 reverb and FX sends)
++             * feed the GP's effects, which nothing runs; they still carry
++             * sound some titles only route there, so they go to both ears
++             * at reduced level instead of being dropped. */
++            static int pairs = -1;
++            if (pairs < 0) {
++                const char *e = getenv("RECOMP_APU_MIXDOWN");
++                pairs = e && strcmp(e, "pairs") == 0;
++            }
++            if (mcpx_apu_mixdown_all() && !pairs) {
++                const float c = 0.7071f, rear = 0.7071f, fx = 0.5f;
++                /* The 3D (XTLK) bins carry each positional voice spread over
++                 * up to six speakers; on hardware the DSP's crosstalk stage
++                 * folds them to about front level. Summed raw they peaked at
++                 * 1.2-1.4x full scale in Godzilla's fights (crunch), and even
++                 * at 0.5 they buried the music, so the group is weighted
++                 * 0.35. RECOMP_APU_3D_GAIN overrides.
++                 *
++                 * LFE: a stereo downmix drops it (ITU: L = FL + .707 C +
++                 * .707 BL). Godzilla sends its music to all six speaker bins
++                 * at equal level; with LFE folded in at 0.5 the music came
++                 * out muddy and unbalanced. RECOMP_APU_LFE_GAIN overrides 0. */
++                static float g3 = -1.0f, lfe = -1.0f;
++                float send = 0.0f;
++                if (g3 < 0.0f) {
++                    const char *e = getenv("RECOMP_APU_3D_GAIN");
++                    g3 = e ? (float)atof(e) : 0.35f;
++                    e = getenv("RECOMP_APU_LFE_GAIN");
++                    lfe = e ? (float)atof(e) : 0.0f;
++                }
++                left  = mixbins[0][i] + c * mixbins[2][i] + lfe * mixbins[3][i]
++                      + rear * mixbins[4][i]
++                      + g3 * (mixbins[6][i] + rear * mixbins[8][i]
++                              + c * mixbins[10][i] + lfe * mixbins[11][i]);
++                right = mixbins[1][i] + c * mixbins[2][i] + lfe * mixbins[3][i]
++                      + rear * mixbins[5][i]
++                      + g3 * (mixbins[7][i] + rear * mixbins[9][i]
++                              + c * mixbins[10][i] + lfe * mixbins[11][i]);
++                for (int b = 12; b < NUM_MIXBINS; ++b)
++                    send += mixbins[b][i];
++                left  += fx * send;
++                right += fx * send;
++            } else if (mcpx_apu_mixdown_all()) {
+                 left = 0.0f;
+                 right = 0.0f;
+                 for (int b = 0; b < NUM_MIXBINS; ++b) {
+@@ -289,6 +338,60 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+                 left = mixbins[0][i];
+                 right = mixbins[1][i];
+             }
++            /* Summing every bin overshoots full scale whenever several loud
++             * voices play at once (Godzilla's roars and explosions), and the
++             * hard clamp below is then audible as crunchy distortion. A peak
++             * limiter first: the envelope jumps to any new peak at once and
++             * decays over ~120 ms (48 kHz), and the pair is scaled so the
++             * envelope never exceeds 0.9. Quiet passages pass untouched.
++             * RECOMP_APU_LIMITER=0 leaves the clamp alone. */
++            {
++                static int lim = -1, lv = -1;
++                static float env;
++                /* RECOMP_APU_LEVELS=1: once a second, the peak of each bin
++                 * group, the mixed peak before limiting, and how many samples
++                 * the limiter turned down -- which says whether distortion
++                 * is overload or already in one group's source audio. */
++                static float g_pk[7], mix_pk;
++                static uint32_t n_smp, n_lim;
++                if (lim < 0) {
++                    const char *e = getenv("RECOMP_APU_LIMITER");
++                    lim = !(e && e[0] == '0');
++                    lv = getenv("RECOMP_APU_LEVELS") != NULL;
++                }
++                if (lv) {
++                    static const int grp[NUM_MIXBINS] = {
++                        0, 0, 1, 2, 3, 3, 4, 4, 4, 4, 4, 4 };  /* 12+ -> 5 */
++                    float m = fabsf(left) > fabsf(right) ? fabsf(left) : fabsf(right);
++                    for (int b = 0; b < NUM_MIXBINS; ++b) {
++                        int gi = b < 12 ? grp[b] : 5;
++                        float a = fabsf(mixbins[b][i]);
++                        if (a > g_pk[gi]) g_pk[gi] = a;
++                    }
++                    if (m > mix_pk) mix_pk = m;
++                    n_smp++;
++                    if (lim && (env * 0.999826f > 0.9f || m > 0.9f)) n_lim++;
++                    if (n_smp >= 48000) {
++                        fprintf(stderr, "[APU-LEVEL] peaks front %.2f centre %.2f lfe %.2f rear %.2f 3d %.2f fx %.2f"
++                                " | mix %.2f limited %.0f%%\n",
++                                g_pk[0], g_pk[1], g_pk[2], g_pk[3], g_pk[4], g_pk[5],
++                                mix_pk, n_lim * 100.0 / n_smp);
++                        memset(g_pk, 0, sizeof g_pk);
++                        mix_pk = 0.0f;
++                        n_smp = n_lim = 0;
++                    }
++                }
++                if (lim) {
++                    float pk = fabsf(left) > fabsf(right) ? fabsf(left) : fabsf(right);
++                    env *= 0.999826f;                   /* e^(-1/5760) */
++                    if (pk > env) env = pk;
++                    if (env > 0.9f) {
++                        float g = 0.9f / env;
++                        left *= g;
++                        right *= g;
++                    }
++                }
++            }
+             /* Clamp to [-1, 1] range */
+             if (left > 1.0f) left = 1.0f;
+             if (left < -1.0f) left = -1.0f;
+diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
+index 2991d89..bffc8d7 100644
+--- a/src/kernel/kernel_file.c
++++ b/src/kernel/kernel_file.c
+@@ -877,7 +877,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+         WCHAR* clean_path = dir_path;
+         if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
+             clean_path += 4;
+-        if (FileName && FileName->Buffer) {
++        /* An empty mask (Length 0, Buffer set) means "everything", as no mask
++         * does. Appending it left "dir\" with a trailing backslash, which
++         * FindFirstFileW rejects (ERROR_FILE_NOT_FOUND): every directory read
++         * as empty. Godzilla: Save the Earth lists its disc folders this way. */
++        if (FileName && FileName->Buffer && FileName->Length) {
+             WCHAR pattern_wide[MAX_PATH];
+             MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
+                                 pattern_wide, MAX_PATH);
+@@ -888,6 +892,9 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+         }
+         ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
+         if (ctx->find_handle == INVALID_HANDLE_VALUE) {
++            fprintf(stderr, "[DIR] FindFirstFileW(\"%ls\") failed, err=%lu (pattern len %u)\n",
++                    search_path, GetLastError(),
++                    (FileName && FileName->Buffer) ? FileName->Length : 0);
+             ctx->find_handle = NULL;
+             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+             return STATUS_NO_MORE_FILES;
+diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
+index 3c719cf..af0d405 100644
+--- a/src/kernel/kernel_path.c
++++ b/src/kernel/kernel_path.c
+@@ -645,6 +645,38 @@ translate:
+             swprintf_s(host_path_buf, buf_size, L"%s\\%s", base_dir, remainder_wide);
+         }
+ 
++        /* RECOMP_OVERLAY_DIR=<dir>: a mod folder laid out like the game
++         * directory. A game file that also exists there is opened from there
++         * instead, so a patched data file can be tried (or shipped as a mod)
++         * without touching the extracted disc. Game tree only. */
++        if (base_dir == s_game_dir && remainder_wide[0]) {
++            static WCHAR s_overlay[MAX_PATH];
++            static int   s_overlay_init;
++            if (!s_overlay_init) {
++                const char *ov = getenv("RECOMP_OVERLAY_DIR");
++                s_overlay_init = 1;
++                if (ov && ov[0])
++                    MultiByteToWideChar(CP_UTF8, 0, ov, -1, s_overlay, MAX_PATH);
++            }
++            if (s_overlay[0]) {
++                WCHAR cand[MAX_PATH];
++                if (sub_dir) {
++                    WCHAR sub_wide2[MAX_PATH];
++                    MultiByteToWideChar(CP_ACP, 0, sub_dir, -1, sub_wide2, MAX_PATH);
++                    swprintf_s(cand, MAX_PATH, L"%s%s\\%s", s_overlay, sub_wide2, remainder_wide);
++                } else {
++                    swprintf_s(cand, MAX_PATH, L"%s\\%s", s_overlay, remainder_wide);
++                }
++                {
++                    DWORD attr = GetFileAttributesW(cand);
++                    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
++                        wcsncpy_s(host_path_buf, buf_size, cand, _TRUNCATE);
++                        fprintf(stderr, "  [PATH] overlay: %ls\n", cand);
++                    }
++                }
++            }
++        }
++
+         /* An empty remainder means the title opened the device itself, so
+          * the join above leaves a trailing separator -- which CreateFileW
+          * rejects even with FILE_FLAG_BACKUP_SEMANTICS, turning an existing
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index 87788ed..cad3b9a 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -29,6 +29,8 @@
+ 
+ #include <stdint.h>
+ 
++#include "nv2a_combiner.h"
++
+ /* The colour surface being drawn into, in real (anti-aliased) pixels.
+  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
+  * size the title thinks it renders at (e.g. 640x480). */
+@@ -51,13 +53,29 @@ typedef struct {
+      * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits
+      * 16-23). A back end that ignores them samples level 0. */
+     uint32_t levels, filter;
++    /* Appended for combiner back ends. normalized: 1 when the format's
++     * coordinates are 0..1 (swizzled, DXT), 0 when they are texels (linear
++     * "rect" formats) -- the raw coordinates in Nv2aVertex.tc follow the
++     * format. cube: a cube map (6 faces). */
++    uint32_t normalized, cube;
++    /* Guest address of the palette (SZ_I8_A8R8G8B8, 256 ARGB entries); 0 if
++     * none. nv2a_backend_decode_texture uses it. A back end caching decoded
++     * textures should include it in the key, since a title can swap palettes. */
++    uint32_t palette;
+ } Nv2aTexture;
+ 
+ typedef struct {
+     float    x, y, z;           /* surface pixels; z as the title produced it */
+     float    rhw;               /* 1/w, 1 for pre-transformed batches */
+     uint32_t diffuse;           /* 0xAARRGGBB */
+-    float    u, v;              /* texels */
++    float    u, v;              /* stage 0, texels */
++    /* Appended for combiner back ends: the specular colour (combiner v1),
++     * the fog factor (1 = no fog), and every stage's texture coordinates as
++     * the program or fixed-function path produced them (s, t, r, q; units
++     * per Nv2aTexture.normalized). Divide by q in PROJECT2D/3D stages. */
++    uint32_t specular;          /* 0xAARRGGBB */
++    float    fog;
++    float    tc[4][4];
+ } Nv2aVertex;
+ 
+ /* Render state as the title set it, in NV2A's own (OpenGL) enum values:
+@@ -80,6 +98,11 @@ typedef struct {
+      * that ignores these draws that pass over the whole surface. */
+     uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
+     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
++    /* Depth surface format from SET_SURFACE_FORMAT: 16 (Z16) or 24 (Z24S8).
++     * Vertex z arrives in depth-buffer units, so a back end divides by
++     * 0xFFFF or 0xFFFFFF to get 0..1. Appended last so older layouts keep
++     * their offsets. */
++    uint32_t zeta_bits;
+ } Nv2aRenderState;
+ 
+ typedef struct {
+@@ -87,8 +110,64 @@ typedef struct {
+     uint32_t           count;
+     const Nv2aTexture *texture;     /* NULL: untextured */
+     const Nv2aRenderState *state;
++    /* Appended for combiner back ends. combiner: NULL until the title has
++     * programmed the register combiners (then texture x diffuse is right);
++     * otherwise every pixel is nv2a_rc_eval over v0 = diffuse, v1 = specular,
++     * fog = (fog_color.rgb, vertex fog), t0..t3 from textures[] fetched per
++     * combiner->stage_program (5 bits per stage: 0 none, 1/2 project 2D/3D,
++     * 3 cube, 4 pass-through, 5 clip plane per clip_plane_mode). */
++    const Nv2aCombiner *combiner;
++    const Nv2aTexture  *textures[4];    /* per stage; NULL: stage off or no texture */
++    uint32_t           fog_color;       /* 0xAARRGGBB */
++    uint32_t           clip_plane_mode; /* SET_SHADER_CLIP_PLANE_MODE */
++    /* Appended for the dot-product stage modes (9-14, 17, 18):
++     * SET_DOT_RGBMAPPING (4 bits per stage: stage 1 bits 0-3, 2 bits 4-7,
++     * 3 bits 8-11; 0 zero-to-one, 1 minus1-to-1 D3D, ...) and
++     * SET_SHADER_OTHER_STAGE_INPUT (stage 2's source in bits 16-19, stage
++     * 3's in bits 20-23; stage 1 always reads stage 0). */
++    uint32_t           dot_mapping, other_stage_input;
+ } Nv2aBatch;
+ 
++/* A vertex-program batch for a back end that runs the program itself (on
++ * the GPU), instead of the executor interpreting it on the CPU.
++ *
++ * attrs: nverts unique vertices, each the 16 program inputs v0..v15 as
++ * floats (exactly what nv2a_vsh_run would have been given). indices: a
++ * triangle list (primitive assembly done) into attrs.
++ *
++ * program: ninstr decoded instructions from the start slot, 8 words each:
++ *   w0 = mac | ilu<<4 | mac_mask<<8 | ilu_mask<<12 | mac_dst<<16 | ilu_dst<<24
++ *        (dst 0..11 temps, 12 oPos, 0xFF none)
++ *   w1 = omask | oaddr<<4 | to_o<<12 | from_ilu<<13 | final<<14
++ *   w2..w4 = sources A, B, C: mux | idx<<2 | neg<<6 | rel<<7 | swizzle<<8 | c<<16
++ *        (mux 1 temp/oPos idx 0..12, 2 input idx, 3 constant c[+a0];
++ *         swizzle 2 bits per lane, x lane in bits 6-7)
++ *   w5..w7 = 0
++ * Semantics are nv2a_vsh_interp.c's (run_mac / run_ilu / vsh_finish).
++ * Outputs follow Nv2aVshOutput: oPos is screen space with clip-space w;
++ * multiply x, y by aa_sx/aa_sy; w == +0 means 1. Clip where w < clip_w
++ * and, if near_z, where z < c[59].z (screen z, i.e. z*w < c[59].z*w in
++ * clip space). Colours clamp to 0..1. Fog: fog_factor() of oFog.x with the
++ * given mode/params (fog_enable 0: factor 1).
++ *
++ * program_rev / constants_rev change whenever the contents do, so a back
++ * end can skip re-uploading them. */
++typedef struct {
++    const float    (*attrs)[16][4];
++    uint32_t        nverts;
++    const uint32_t *indices;
++    uint32_t        nindices;
++    const uint32_t (*program)[8];
++    uint32_t        ninstr, program_rev;
++    const float    (*constants)[4];     /* 192 */
++    uint32_t        constants_rev;
++    float           aa_sx, aa_sy;
++    float           clip_w;
++    uint32_t        near_z;
++    uint32_t        fog_enable, fog_mode;
++    float           fog_param[2];
++} Nv2aProgramDraw;
++
+ typedef struct {
+     /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
+      * zstencil: SET_ZSTENCIL_CLEAR_VALUE (depth in the top 24 bits for Z24S8). */
+@@ -96,6 +175,12 @@ typedef struct {
+                   uint32_t flags, uint32_t argb, uint32_t zstencil);
+     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
+     void (*flip)(void);
++    /* Optional, appended: run a vertex-program batch on the back end.
++     * b carries state, combiner and textures as for draw(), with no
++     * vertices. Return 0 to have the executor transform it on the CPU
++     * instead. RECOMP_GPU_VSH=0 never calls it. */
++    int  (*draw_program)(const Nv2aSurface *s, const Nv2aBatch *b,
++                         const Nv2aProgramDraw *p);
+ } Nv2aBackend;
+ 
+ /* Register (or, with NULL, remove) the back end. Call before the title starts
+@@ -117,6 +202,11 @@ void nv2a_backend_register_with_present_sync(const Nv2aBackend *backend,
+  * Returns 0 if the format is not supported. */
+ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+ 
++/* Bytes between a cube map's faces (face N starts at offset + N * stride):
++ * every mip level of one face, rounded up to 128. Decode face N by passing a
++ * copy of the texture with offset moved and cube cleared. */
++uint32_t nv2a_backend_texture_face_stride(const Nv2aTexture *tex);
++
+ /* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
+  * of the semaphore the title reads GPU progress from (for XDK D3D, the
+  * pointer at device+0x30). The executor writes each release there once it
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index a5ea9cc..33f5827 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -448,6 +448,13 @@ static void dump_texture_bmp(uint32_t seq);
+ #define TEX_DUMP_SEQ_BASE 1000u
+ #define TEX_DUMP_SEQ_MAX  40u
+ 
++/* getenv() walks the whole environment under a lock: far too slow for a
++ * per-draw or per-flip test. ENV_CACHED(var, "NAME") declares a static that
++ * holds the answer after the first use. */
++#define ENV_CACHED(var, name) \
++    static const char *var = (const char *)-1; \
++    if (var == (const char *)-1) var = getenv(name)
++
+ static void note_texture_use(void)
+ {
+     int i;
+@@ -677,7 +684,7 @@ static int s_flip_dumping;
+ 
+ static void dump_surface_bmp(void)
+ {
+-    const char *prefix = getenv("RECOMP_FB_DUMP");
++    ENV_CACHED(prefix, "RECOMP_FB_DUMP");
+     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+     int drawn = s_gpu.drawn_offset != 0;
+     uint32_t offset = drawn ? s_gpu.drawn_offset : s_gpu.color_offset;
+@@ -839,6 +846,7 @@ static void current_render_state(Nv2aRenderState *r)
+     r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
+     r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
+     r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
++    r->zeta_bits         = ((s_gpu.format >> 4) & 0xF) == 1 ? 16 : 24;  /* SURFACE_FORMAT bits 4-7 */
+ }
+ 
+ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
+@@ -856,7 +864,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+     s_gpu.texs[0].color  = tex->color;
+     s_gpu.texs[0].addr_u = 3;
+     s_gpu.texs[0].addr_v = 3;
+-    s_gpu.texs[0].palette = 0;          /* ponytail: no palettised formats */
++    s_gpu.texs[0].palette = tex->palette;   /* SZ_I8 formats: the CLUT the title set */
+     s_gpu.texs[0].levels = 1;
+     s_gpu.texs[0].filter = 0;
+     s_gpu.texs[0].cube   = 0;
+@@ -871,6 +879,16 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+     return ok;
+ }
+ 
++static uint32_t tex_face_stride(const Texture *t);
++uint32_t nv2a_backend_texture_face_stride(const Nv2aTexture *tex)
++{
++    Texture t;
++    memset(&t, 0, sizeof t);
++    t.width = tex->width; t.height = tex->height; t.pitch = tex->pitch;
++    t.color = tex->color; t.levels = tex->levels ? tex->levels : 1;
++    return tex_face_stride(&t);
++}
++
+ /* Swizzled colour surfaces (SURFACE_FORMAT type 2, log2 width/height in bits
+  * 16-19/24-27): render-to-texture. The pixel at (x, y) lives at the same
+  * Morton offset a swizzled texture of that size uses, so the texture sampler
+@@ -1238,6 +1256,14 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+         *argb = ((const uint32_t *)(mem + t->palette))[p[u]];
+         return 1;
+ 
++    /* 8-bit, the value in every channel including alpha (xemu: SZ_AY8).
++     * Godzilla: Save the Earth's boot logos use it. */
++    case 0x01: {                                    /* SZ_AY8 */
++        uint32_t y = p[u];
++        *argb = (y << 24) | (y << 16) | (y << 8) | y;
++        return 1;
++    }
++
+     /* 32-bit, other channel orders. The name gives the byte order from the
+      * top of the dword down, so each is a permutation of the same four. */
+     case 0x3F: {                                    /* LIN_A8B8G8R8 */
+@@ -1359,7 +1385,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+  */
+ static void dump_texture_bmp(uint32_t seq)
+ {
+-    const char *prefix = getenv("RECOMP_TEX_DUMP");
++    ENV_CACHED(prefix, "RECOMP_TEX_DUMP");
+     uint32_t w = s_gpu.texs[0].width, h = s_gpu.texs[0].height, x, y;
+     uint32_t row_bytes, pad, filesz;
+     uint8_t hdr[54];
+@@ -2168,9 +2194,12 @@ static Nv2aVertex *backend_slot(void)
+     return &s_bverts[s_bcount];
+ }
+ 
++static float fog_factor(float d);
++
+ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+ {
+     float su = 1.0f, sv = 1.0f;
++    int st, j;
+ 
+     if (tex_size_from_format(s_gpu.texs[0].color)) {
+         su = (float)s_gpu.texs[0].width;
+@@ -2183,37 +2212,67 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+     o->diffuse = pack_color(v->d0);
+     o->u = v->tex[0][0] * su;
+     o->v = v->tex[0][1] * sv;
++    /* Combiner inputs (nv2a_backend.h): specular, fog factor, all stages. */
++    o->specular = pack_color(v->d1);
++    o->fog = fog_factor(v->fog[0]);
++    for (st = 0; st < 4; st++)
++        for (j = 0; j < 4; j++)
++            o->tc[st][j] = v->tex[st][j];
+ }
+ 
+ /* `textured`: the batch carried texture coordinates, so the bound texture is
+  * part of it. */
++static void backend_texture(int st, Nv2aTexture *tex)
++{
++    const Texture *t = &s_gpu.texs[st];
++    tex->offset = t->offset;
++    tex->width  = t->width;
++    tex->height = t->height;
++    tex->pitch  = t->pitch;
++    tex->color  = t->color;
++    tex->addr_u = t->addr_u;
++    tex->addr_v = t->addr_v;
++    tex->levels = t->pitch ? 1 : t->levels;
++    tex->filter = t->filter;
++    tex->normalized = tex_size_from_format(t->color) ? 1u : 0u;
++    tex->cube   = t->cube ? 1u : 0u;
++    tex->palette = t->palette;
++}
++
+ static void backend_flush(int textured)
+ {
+     Nv2aSurface surf;
+     Nv2aRenderState rs;
+-    Nv2aTexture tex;
++    Nv2aTexture tex, stex[4];
+     Nv2aBatch batch;
++    int st;
+ 
+     if (!s_bcount)
+         return;
+     current_surface(&surf);
+     current_render_state(&rs);
++    memset(&batch, 0, sizeof batch);
+     batch.vertices = s_bverts;
+     batch.count = s_bcount;
+     batch.texture = NULL;
+     batch.state = &rs;
+     if (textured && s_gpu.texs[0].valid) {
+-        tex.offset = s_gpu.texs[0].offset;
+-        tex.width  = s_gpu.texs[0].width;
+-        tex.height = s_gpu.texs[0].height;
+-        tex.pitch  = s_gpu.texs[0].pitch;
+-        tex.color  = s_gpu.texs[0].color;
+-        tex.addr_u = s_gpu.texs[0].addr_u;
+-        tex.addr_v = s_gpu.texs[0].addr_v;
+-        tex.levels = s_gpu.texs[0].pitch ? 1 : s_gpu.texs[0].levels;
+-        tex.filter = s_gpu.texs[0].filter;
++        backend_texture(0, &tex);
+         batch.texture = &tex;
+     }
++    /* Combiner back ends: every stage the shader program enables. */
++    batch.combiner = s_gpu.rc_seen ? &s_gpu.rc : NULL;
++    for (st = 0; st < 4; st++) {
++        uint32_t mode = (s_gpu.rc.stage_program >> (st * 5)) & 0x1F;
++        if (batch.combiner && mode != 0 && mode != 4 && mode != 5 && s_gpu.texs[st].valid) {
++            backend_texture(st, &stex[st]);
++            batch.textures[st] = &stex[st];
++        }
++    }
++    batch.fog_color = s_gpu.fog_color;
++    batch.clip_plane_mode = s_gpu.clip_plane_mode;
++    batch.dot_mapping = s_reg[0x1E74 / 4];
++    batch.other_stage_input = s_reg[0x1E7C / 4];
+     s_backend->draw(&surf, &batch);
+     s_gpu.tris_drawn += s_bcount / 3;
+     s_bcount = 0;
+@@ -2258,6 +2317,13 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+             o[k].diffuse = vertex_color(ix[k]);
+             o[k].u = textured ? uv[k][0] : 0.0f;
+             o[k].v = textured ? uv[k][1] : 0.0f;
++            /* Pre-transformed: no specular or fog; stage 0 is the fetched uv. */
++            o[k].specular = 0;
++            o[k].fog = 1.0f;
++            memset(o[k].tc, 0, sizeof o[k].tc);
++            o[k].tc[0][0] = o[k].u;
++            o[k].tc[0][1] = o[k].v;
++            o[k].tc[0][3] = 1.0f;
+         }
+         s_bcount += 3;
+         return;
+@@ -3321,15 +3387,207 @@ static void xf_set_viewport(void)
+     s_xf_o[2] = of[2];
+ }
+ 
++static uint64_t s_vc_hits, s_vc_total;      /* vertex cache, per report */
++
++/* GPU vertex programs: hand a program batch to a back end that runs the
++ * program itself (Nv2aBackend.draw_program), instead of interpreting every
++ * vertex here. The executor still fetches each unique vertex's inputs and
++ * assembles the primitives; the back end transforms, clips (w and near z,
++ * as raster_xf_clipped does) and draws. RECOMP_GPU_VSH=0: always the CPU. */
++static int gpu_program_draw(void)
++{
++    static int off = -1, near_z = -1;
++    static float (*attrs)[16][4];
++    static uint32_t *slot_of, *tris, *vc_idx, *vc_gen, *vc_slot, gen;
++    static uint32_t prog[NV2A_VSH_SLOTS][8];
++    Nv2aProgramDraw p;
++    Nv2aSurface surf;
++    Nv2aRenderState rs;
++    Nv2aTexture tex, stex[4];
++    Nv2aBatch batch;
++    uint32_t n = s_gpu.idx_count, i, nv = 0, nt = 0;
++    int st;
++
++    if (off < 0) {
++        const char *e = getenv("RECOMP_GPU_VSH");
++        off = e && e[0] == '0';
++        e = getenv("RECOMP_CLIP_NEAR_Z");
++        near_z = !(e && e[0] == '0');
++    }
++    if (off || !s_backend || !s_backend->draw_program || !batch_uses_program())
++        return 0;
++    memset(&p, 0, sizeof p);
++    if (!nv2a_vsh_export_program(prog, &p.ninstr, &p.program_rev))
++        return 0;
++    if (!attrs) {
++        attrs   = (float (*)[16][4])malloc((size_t)NV_MAX_INDICES * sizeof *attrs);
++        slot_of = (uint32_t *)malloc((size_t)NV_MAX_INDICES * sizeof *slot_of);
++        tris    = (uint32_t *)malloc((size_t)NV_MAX_INDICES * 6 * sizeof *tris);
++        vc_idx  = (uint32_t *)calloc(65536, sizeof *vc_idx);
++        vc_gen  = (uint32_t *)calloc(65536, sizeof *vc_gen);
++        vc_slot = (uint32_t *)calloc(65536, sizeof *vc_slot);
++        if (!attrs || !slot_of || !tris || !vc_idx || !vc_gen || !vc_slot) {
++            off = 1;
++            return 0;
++        }
++    }
++    if (++gen == 0) {
++        memset(vc_gen, 0, 65536 * sizeof *vc_gen);
++        gen = 1;
++    }
++    /* Unique vertices, in first-use order, and each batch position's slot. */
++    for (i = 0; i < n; i++) {
++        uint32_t idx = s_gpu.idx[i], h = idx & 0xFFFFu, a;
++        s_vc_total++;
++        if (vc_gen[h] == gen && vc_idx[h] == idx) {
++            slot_of[i] = vc_slot[h];
++            s_vc_hits++;
++            continue;
++        }
++        for (a = 0; a < NV2A_VSH_INPUTS; a++) {
++            if (!s_gpu.attr[a].size && a < NV_VERTEX_ATTRS)
++                memcpy(attrs[nv][a], s_gpu.imm_attr[a], sizeof attrs[nv][a]);
++            else
++                fetch_attr(&s_gpu.attr[a], idx, attrs[nv][a]);
++        }
++        vc_gen[h] = gen; vc_idx[h] = idx; vc_slot[h] = nv;
++        slot_of[i] = nv++;
++    }
++#define TRI(x, y, z) (tris[nt++] = slot_of[x], tris[nt++] = slot_of[y], tris[nt++] = slot_of[z])
++    switch (s_gpu.prim) {
++    case NV_PRIM_TRIANGLES:
++        for (i = 0; i + 2 < n; i += 3) TRI(i, i + 1, i + 2);
++        break;
++    case NV_PRIM_TRIANGLE_STRIP:
++        for (i = 0; i + 2 < n; i++) {
++            if ((i & 1) && strip_alt_winding()) TRI(i + 1, i, i + 2);
++            else TRI(i, i + 1, i + 2);
++        }
++        break;
++    case NV_PRIM_TRIANGLE_FAN:
++    case NV_PRIM_POLYGON:
++        for (i = 1; i + 1 < n; i++) TRI(0, i, i + 1);
++        break;
++    case NV_PRIM_QUADS:
++        for (i = 0; i + 3 < n; i += 4) { TRI(i, i + 1, i + 2); TRI(i, i + 2, i + 3); }
++        break;
++    case NV_PRIM_QUAD_STRIP:
++        for (i = 0; i + 3 < n; i += 2) { TRI(i, i + 1, i + 3); TRI(i, i + 3, i + 2); }
++        break;
++    default:
++        return 0;           /* points / lines: the CPU path's business */
++    }
++#undef TRI
++    {
++        /* Small batches drawn without a depth test -- Godzilla's sky box
++         * (4-24 vertex batches straddling the camera plane, black slabs
++         * through the GPU path) and screen overlays -- stay on the CPU path,
++         * which draws them right and costs little for them. Depth-tested
++         * geometry never splits between the paths: the paths' depth differs
++         * in the last bits, and the water's later passes (depth EQUAL)
++         * flickered when one pass went each way under a plain size cutoff.
++         * RECOMP_GPU_VSH_CPU_MAX (default 256 unique vertices, 0 = all on
++         * the GPU) bounds the size of such a batch. */
++        static int cpu_max = -1;
++        if (cpu_max < 0) {
++            const char *e = getenv("RECOMP_GPU_VSH_CPU_MAX");
++            cpu_max = e ? atoi(e) : 256;
++        }
++        if (!s_gpu.depth_test && (int)nv < cpu_max)
++            return 0;
++    }
++    s_gpu.batches_program++;
++    s_gpu.verts_program += n;
++    if (!nt)
++        return 1;
++    if (s_bcount)
++        backend_flush(1);
++
++    p.attrs = (const float (*)[16][4])attrs;
++    p.nverts = nv;
++    p.indices = tris;
++    p.nindices = nt;
++    p.program = (const uint32_t (*)[8])prog;
++    p.constants = nv2a_vsh_export_constants(&p.constants_rev);
++    p.aa_sx = s_gpu.aa_sx;
++    p.aa_sy = s_gpu.aa_sy;
++    p.clip_w = NV_CLIP_W;
++    p.near_z = (uint32_t)near_z;
++    p.fog_enable = s_gpu.fog_enable;
++    p.fog_mode = s_gpu.fog_mode;
++    p.fog_param[0] = s_gpu.fog_param[0];
++    p.fog_param[1] = s_gpu.fog_param[1];
++
++    current_surface(&surf);
++    current_render_state(&rs);
++    memset(&batch, 0, sizeof batch);
++    batch.state = &rs;
++    if (s_gpu.texs[0].valid) {
++        backend_texture(0, &tex);
++        batch.texture = &tex;
++    }
++    batch.combiner = s_gpu.rc_seen ? &s_gpu.rc : NULL;
++    for (st = 0; st < 4; st++) {
++        uint32_t mode = (s_gpu.rc.stage_program >> (st * 5)) & 0x1F;
++        if (batch.combiner && mode != 0 && mode != 4 && mode != 5 && s_gpu.texs[st].valid) {
++            backend_texture(st, &stex[st]);
++            batch.textures[st] = &stex[st];
++        }
++    }
++    batch.fog_color = s_gpu.fog_color;
++    batch.clip_plane_mode = s_gpu.clip_plane_mode;
++    batch.dot_mapping = s_reg[0x1E74 / 4];
++    batch.other_stage_input = s_reg[0x1E7C / 4];
++    if (!s_backend->draw_program(&surf, &batch, &p))
++        return 0;
++    s_gpu.tris_drawn += nt / 3;
++    note_drawn();
++    return 1;
++}
++
++
+ static void raster_batch_program(void)
+ {
+     uint32_t i, n = s_gpu.idx_count;
+ 
++    if (gpu_program_draw())
++        return;
+     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
+         return;
+-    for (i = 0; i < n; i++)
+-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+-            return;                                    /* no program loaded */
++    {
++        /* Post-transform vertex cache, as the hardware has: within one
++         * batch the program, its constants and the vertex arrays are fixed,
++         * so an index seen before transforms to the same output. Indexed
++         * meshes name each vertex ~6 times -- Godzilla's fighters are 4,386
++         * triangles -- and the interpreter was most of the executor's time.
++         * Direct-mapped on the low 16 bits with the full index checked; a
++         * generation stamp empties it per batch. RECOMP_NO_VCACHE=1: off. */
++        static uint32_t *vc_idx, *vc_gen, *vc_slot, gen;
++        static int off = -1;
++        if (off < 0) off = getenv("RECOMP_NO_VCACHE") != NULL;
++        if (!off && !vc_idx) {
++            vc_idx  = (uint32_t *)calloc(65536, sizeof *vc_idx);
++            vc_gen  = (uint32_t *)calloc(65536, sizeof *vc_gen);
++            vc_slot = (uint32_t *)calloc(65536, sizeof *vc_slot);
++            if (!vc_idx || !vc_gen || !vc_slot) off = 1;
++        }
++        if (!off && ++gen == 0) {                 /* wrapped: stamps are stale */
++            memset(vc_gen, 0, 65536 * sizeof *vc_gen);
++            gen = 1;
++        }
++        for (i = 0; i < n; i++) {
++            uint32_t idx = s_gpu.idx[i], h = idx & 0xFFFFu;
++            s_vc_total++;
++            if (!off && vc_gen[h] == gen && vc_idx[h] == idx) {
++                s_xf[i] = s_xf[vc_slot[h]];
++                s_vc_hits++;
++                continue;
++            }
++            if (!transform_vertex(idx, &s_xf[i]))
++                return;                                /* no program loaded */
++            if (!off) { vc_gen[h] = gen; vc_idx[h] = idx; vc_slot[h] = i; }
++        }
++    }
+     xf_set_viewport();
+     {
+         const VertexAttr *tc = texcoord_attr();
+@@ -3687,7 +3945,8 @@ static void draw_primitive(void)
+         }
+     }
+ 
+-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
++    ENV_CACHED(pb_verbose, "RECOMP_PB_EXEC_VERBOSE");
++    if (pb_verbose) {
+         static int shown;
+         if (shown++ < 6) {
+             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
+@@ -4346,7 +4605,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+     case 0x033C: s_gpu.alpha_func = param; break;
+     case 0x0340: s_gpu.alpha_ref = param; break;
+     case 0x02A4: s_gpu.fog_enable = param; break;
+-    case 0x02A8: s_gpu.fog_color = param; break;  /* R in bits 0-7 */
++    case 0x02A8:                                  /* SET_FOG_COLOR: ABGR (R in bits 0-7) */
++        /* Stored as ARGB like every other colour, which is how both the
++         * CPU combiner (nv2a_rc_unpack) and Nv2aBatch.fog_color read it.
++         * Kept raw, Godzilla's blue-grey haze A0CDC6 came out tan C6CDA0. */
++        s_gpu.fog_color = (param & 0xFF00FF00u) | ((param >> 16) & 0xFFu) | ((param & 0xFFu) << 16);
++        break;
+     case 0x029C: s_gpu.fog_mode = param; break;
+     case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
+     case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
+@@ -4792,7 +5056,7 @@ static void find_nan_matrices(void)
+  * pointer or a number", and guessing wrong costs a run. */
+ static void peek_addresses(void)
+ {
+-    const char *spec = getenv("RECOMP_PEEK");
++    ENV_CACHED(spec, "RECOMP_PEEK");
+     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+     char buf[256];
+     char *tok, *ctx = NULL;
+@@ -4823,7 +5087,7 @@ static void peek_addresses(void)
+  */
+ static void peek_chain(void)
+ {
+-    const char *spec = getenv("RECOMP_PEEK_CHAIN");
++    ENV_CACHED(spec, "RECOMP_PEEK_CHAIN");
+     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+     char buf[256], *tok, *ctx = NULL;
+     uint32_t cur = 0;
+@@ -4861,13 +5125,15 @@ void nv2a_pb_exec_report(void)
+ {
+     peek_addresses();
+     peek_chain();
+-    if (getenv("RECOMP_FIND_NAN")) {
++    ENV_CACHED(find_nan, "RECOMP_FIND_NAN");
++    ENV_CACHED(find_quad, "RECOMP_FIND_QUAD");
++    if (find_nan) {
+         /* Every report, not once: the matrix is fine early on and only turns
+          * to NaN later, so a single scan at startup finds nothing and says
+          * nothing. */
+         find_nan_matrices();
+     }
+-    if (getenv("RECOMP_FIND_QUAD")) {
++    if (find_quad) {
+         static int done;
+         if (!done) { done = 1; find_quad_vertices(); }
+     }
+@@ -4885,6 +5151,12 @@ void nv2a_pb_exec_report(void)
+         last_flips = s_gpu.flips;
+         last_ms = now;
+     }
++    if (s_vc_total) {
++        fprintf(stderr, "[GPU] vertex cache: %llu of %llu program/FFP vertices reused (%.0f%%)\n",
++                (unsigned long long)s_vc_hits, (unsigned long long)s_vc_total,
++                s_vc_hits * 100.0 / s_vc_total);
++        s_vc_hits = s_vc_total = 0;
++    }
+     flip_hold_report();
+     fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
+                     " clears %u | %u unhandled methods (%d distinct)\n",
+diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
+index c7fd25d..63673f2 100644
+--- a/src/kernel/nv2a_vsh_interp.c
++++ b/src/kernel/nv2a_vsh_interp.c
+@@ -43,6 +43,8 @@ static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
+ /* Changes whenever the program memory or the start slot does, so the decoded
+  * copy below knows when to decode again. */
+ static uint32_t s_program_revision;
++/* Changes whenever any constant does (nv2a_vsh_export_constants). */
++static uint32_t s_const_revision;
+ 
+ static int vsh_dump_enabled(void)
+ {
+@@ -95,8 +97,10 @@ void nv2a_vsh_set_constant_load(uint32_t index)
+ 
+ void nv2a_vsh_constant_word(uint32_t word)
+ {
+-    if (s_const_load < NV2A_VSH_CONSTANTS)
++    if (s_const_load < NV2A_VSH_CONSTANTS) {
+         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
++        s_const_revision++;
++    }
+     else if (vsh_dump_enabled()) {
+         static int warned;
+         if (warned++ < 8)
+@@ -119,8 +123,10 @@ void nv2a_vsh_constant_word(uint32_t word)
+ 
+ void nv2a_vsh_set_constant(uint32_t index, const float v[4])
+ {
+-    if (index < NV2A_VSH_CONSTANTS)
++    if (index < NV2A_VSH_CONSTANTS) {
+         memcpy(s_const[index], v, sizeof s_const[index]);
++        s_const_revision++;
++    }
+ }
+ 
+ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
+@@ -203,8 +209,10 @@ const float *nv2a_vsh_constant(uint32_t index)
+ 
+ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
+ {
+-    if (index < NV2A_VSH_CONSTANTS && comp < 4)
++    if (index < NV2A_VSH_CONSTANTS && comp < 4) {
+         memcpy(&s_const[index][comp], &word, 4);
++        s_const_revision++;
++    }
+ }
+ 
+ /* ---- execution ----------------------------------------------------------- */
+@@ -569,8 +577,10 @@ static int vsh_run_decoded(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *ou
+         if (d->omask) {
+             const vec4 *src = d->from_ilu ? &ires : &mres;
+             if (!d->to_o) {                               /* to c[] */
+-                if (s_cxt_write && d->oaddr < NV2A_VSH_CONSTANTS)
++                if (s_cxt_write && d->oaddr < NV2A_VSH_CONSTANTS) {
+                     write_masked(s_const[d->oaddr], src, d->omask);
++                    s_const_revision++;
++                }
+             } else if (d->oaddr == 0) {
+                 write_masked(regs[12].v, src, d->omask);
+             } else if (d->oaddr < 13) {
+@@ -707,3 +717,58 @@ static int vsh_run_fields(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out
+     }
+     return 0;
+ }
++
++/* ---- export for a back end that runs programs itself (nv2a_backend.h) ---- */
++
++static uint32_t pack_src(const DecSrc *d)
++{
++    uint32_t sw = (uint32_t)d->sw[0] << 6 | (uint32_t)d->sw[1] << 4
++                | (uint32_t)d->sw[2] << 2 | d->sw[3];
++    return (uint32_t)(d->mux & 3) | (uint32_t)(d->idx & 15) << 2
++         | (uint32_t)(d->neg & 1) << 6 | (uint32_t)(d->rel & 1) << 7
++         | sw << 8 | (uint32_t)d->c << 16;
++}
++
++int nv2a_vsh_export_program(uint32_t out[][8], uint32_t *ninstr, uint32_t *rev)
++{
++    static uint32_t packed[NV2A_VSH_SLOTS][8];
++    static uint32_t packed_rev = 0xFFFFFFFFu;
++    static int packed_ok;
++    uint32_t i;
++
++    if (!s_dec_valid || s_dec_rev != s_program_revision)
++        dec_program();
++    if (packed_rev != s_program_revision) {
++        packed_ok = s_dec_count > 0 && s_dec[s_dec_count - 1].final;
++        for (i = 0; i < s_dec_count && packed_ok; i++) {
++            const DecIns *d = &s_dec[i];
++            /* A program writing c[] per vertex cannot run on a GPU. */
++            if (d->omask && !d->to_o && s_cxt_write)
++                packed_ok = 0;
++            memset(packed[i], 0, sizeof packed[i]);
++            packed[i][0] = (uint32_t)d->mac | (uint32_t)d->ilu << 4
++                         | (uint32_t)d->mac_mask << 8 | (uint32_t)d->ilu_mask << 12
++                         | (uint32_t)d->mac_dst << 16 | (uint32_t)d->ilu_dst << 24;
++            packed[i][1] = (uint32_t)d->omask | (uint32_t)d->oaddr << 4
++                         | (uint32_t)d->to_o << 12 | (uint32_t)d->from_ilu << 13
++                         | (uint32_t)d->final << 14;
++            packed[i][2] = (d->reads & 1) ? pack_src(&d->src[0]) : 0;
++            packed[i][3] = (d->reads & 2) ? pack_src(&d->src[1]) : 0;
++            packed[i][4] = (d->reads & 4) ? pack_src(&d->src[2]) : 0;
++        }
++        packed_rev = s_program_revision;
++    }
++    if (!packed_ok)
++        return 0;
++    if (out)
++        memcpy(out, packed, s_dec_count * sizeof packed[0]);
++    *ninstr = s_dec_count;
++    *rev = s_program_revision;
++    return 1;
++}
++
++const float (*nv2a_vsh_export_constants(uint32_t *rev))[4]
++{
++    *rev = s_const_revision;
++    return (const float (*)[4])s_const;
++}
+diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
+index 8acb0af..2ac7552 100644
+--- a/src/kernel/nv2a_vsh_interp.h
++++ b/src/kernel/nv2a_vsh_interp.h
+@@ -58,4 +58,11 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
+ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
+ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
+ 
++/* For a back end that runs programs on the GPU (nv2a_backend.h,
++ * Nv2aProgramDraw): the decoded program in that packed layout, and the
++ * constants with a revision counter. export_program returns 0 when the
++ * program cannot run there (none loaded, or it writes c[] per vertex). */
++int nv2a_vsh_export_program(uint32_t out[][8], uint32_t *ninstr, uint32_t *rev);
++const float (*nv2a_vsh_export_constants(uint32_t *rev))[4];
++
+ #endif

@@ -1,8 +1,8 @@
 # Godzilla: Save the Earth — Xbox static recompilation
 
-![Overall progress](https://img.shields.io/badge/overall-76%25-green)
-![Boot and menus](https://img.shields.io/badge/Boot_and_menus-95%25-brightgreen) ![Versus fights](https://img.shields.io/badge/Versus_fights-90%25-brightgreen) ![Other modes](https://img.shields.io/badge/Other_modes-20%25-red) ![Stages](https://img.shields.io/badge/Stages-40%25-orange) ![Graphics](https://img.shields.io/badge/Graphics-90%25-brightgreen)
-![Audio](https://img.shields.io/badge/Audio-85%25-green) ![Movies](https://img.shields.io/badge/Movies-100%25-brightgreen) ![Widescreen](https://img.shields.io/badge/Widescreen-90%25-brightgreen) ![High frame rate](https://img.shields.io/badge/High_frame_rate-90%25-brightgreen) ![Online (System Link)](https://img.shields.io/badge/Online_%28System_Link%29-60%25-yellow)
+![Overall progress](https://img.shields.io/badge/overall-80%25-green)
+![Boot and menus](https://img.shields.io/badge/Boot_and_menus-95%25-brightgreen) ![Versus fights](https://img.shields.io/badge/Versus_fights-90%25-brightgreen) ![Other modes](https://img.shields.io/badge/Other_modes-20%25-red) ![Stages](https://img.shields.io/badge/Stages-70%25-yellow) ![Graphics](https://img.shields.io/badge/Graphics-90%25-brightgreen)
+![Audio](https://img.shields.io/badge/Audio-85%25-green) ![Movies](https://img.shields.io/badge/Movies-100%25-brightgreen) ![Widescreen](https://img.shields.io/badge/Widescreen-90%25-brightgreen) ![High frame rate](https://img.shields.io/badge/High_frame_rate-95%25-brightgreen) ![Online (System Link)](https://img.shields.io/badge/Online_%28System_Link%29-60%25-yellow)
 
 A native Windows port of the Xbox version of *Godzilla: Save the Earth* (2004), made by statically
 recompiling the game's `default.xbe` into C with the [xboxrecomp](https://github.com/sp00nznet/xboxrecomp)
@@ -33,12 +33,12 @@ Estimates from what has been checked in game so far. Overall is the average of t
 | Boot and menus | 95% | Every menu works, including the new Options entries and the Biollante cell |
 | Versus fights | 90% | Played many times (mostly Tokyo): HUD, beams, destruction, win/lose |
 | Other modes | 20% | Action, Melee, Survival and Challenges have not been played through yet |
-| Stages | 40% | Tokyo fully checked; others load (Mothership seen in play) but are not checked one by one |
+| Stages | 70% | The ten city and arena stages are checked in fights (picture and frame pacing); the Mothership and the challenge stages are not |
 | Graphics | 90% | Combiners, cube maps, water reflections, fog; rare effects may still be wrong |
 | Audio | 85% | Music and effects play; menu crackle reported once, not reproduced |
 | Movies | 100% | Intro, story and credits play through ffmpeg |
 | Widescreen | 90% | Wider camera with matching culling, HUD in the corners; not checked on every stage |
-| High frame rate | 90% | 60–240 fps with correct game speed; the attract demo can slow down |
+| High frame rate | 95% | 240 fps holds on the ten checked stages; the heaviest moments can dip briefly; the attract demo is not re-checked |
 | Online (System Link) | 60% | Works between two copies on one PC; not yet tested PC to PC over the internet |
 
 ## Requirements
@@ -87,8 +87,10 @@ Logs go to `play.log` next to the launcher; include it when reporting a problem.
 ## Known issues
 
 - Not every stage and mode has been played through; the recompilation can still hit untranslated paths.
-- At high frame rates the game renders as fast as the PC allows (about 140–180 fps at 240 on a mid-range
-  PC); game speed stays correct.
+- 240 fps holds on the ten city and arena stages on a fast PC (tested: RTX 3080, Ryzen 7 7800X3D, 2x
+  internal resolution). The heaviest moments (many buildings collapsing at once) can dip to about 200 for
+  a second or two; game speed stays correct. The first run compiles shaders into `shader_cache\` and is
+  less smooth than later ones.
 - Online play has been tested between two copies on one PC (including simulated lag and loss), not yet
   between two PCs over the internet.
 

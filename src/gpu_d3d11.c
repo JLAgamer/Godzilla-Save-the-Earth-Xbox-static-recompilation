@@ -753,7 +753,23 @@ static ID3D11PixelShader *ps_variant(void)
         }
     }
     if (!s_ps_spec) return s_ps;
-    h = fnv64(&s_ps_key, sizeof s_ps_key, s_ps_src_hash);
+    {
+        static PsKey last_key;
+        static PsVar *last;
+        if (last && last->state == 2 && !memcmp(&last_key, &s_ps_key, sizeof s_ps_key)) return last->ps;
+        last = NULL;
+        h = fnv64(&s_ps_key, sizeof s_ps_key, s_ps_src_hash);
+        at = (uint32_t)(h ^ (h >> 32)) % PS_VARS;
+        for (i = 0; i < 16; i++, at = (at + 1) % PS_VARS) {
+            PsVar *v = &s_psv[at];
+            if (v->state == 0) break;
+            if (v->hash == h && !memcmp(&v->key, &s_ps_key, sizeof s_ps_key)) {
+                if (v->state != 2) return s_ps;
+                last = v; last_key = s_ps_key;
+                return v->ps;
+            }
+        }
+    }
     at = (uint32_t)(h ^ (h >> 32)) % PS_VARS;
     for (i = 0; i < 16; i++, at = (at + 1) % PS_VARS) {
         PsVar *v = &s_psv[at];
@@ -1734,9 +1750,18 @@ static void set_consts(const Nv2aSurface *s, const Nv2aBatch *b, int tex0_on,
             k->tex0_on = tex0_on ? 1u : 0u;
         }
     }
-    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-        memcpy(m.pData, &c, sizeof c);
-        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb, 0);
+    {
+        /* Consecutive draws very often share every constant: write the
+         * buffer only when something changed. */
+        static Consts held;
+        static int held_ok;
+        if (held_ok && !memcmp(&held, &c, sizeof c)) return;
+        held_ok = 0;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            memcpy(m.pData, &c, sizeof c);
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb, 0);
+            held = c; held_ok = 1;
+        }
     }
 }
 
@@ -2464,6 +2489,22 @@ static void be_flip(void)
                         (p1 - s_h_last_flip) / 1000.0, s_h_present / 1000.0, s_h_map / 1000.0, s_h_map_max / 1000.0,
                         s_h_discards, s_h_tex / 1000.0, s_h_be[0] / 1000.0, s_h_ben[0], s_h_be[1] / 1000.0, s_h_ben[1],
                         s_h_be[2] / 1000.0, s_h_ben[2], (p0 - s_h_flip_t0) / 1000.0);
+            if (hlog) {
+                static LONGLONG sec_t0, sec_be[3], sec_present, sec_tex, sec_flip;
+                static UINT sec_n[3], sec_flips;
+                int k;
+                for (k = 0; k < 3; k++) { sec_be[k] += s_h_be[k]; sec_n[k] += s_h_ben[k]; }
+                sec_present += s_h_present; sec_tex += s_h_tex; sec_flip += p0 - s_h_flip_t0; sec_flips++;
+                if (!sec_t0) sec_t0 = p1;
+                if (p1 - sec_t0 >= 1000000) {
+                    fprintf(stderr, "[GPUSEC] %u flips: back end %.0f ms (clears %.0f/%u, draws %.0f/%u, program draws %.0f/%u, of which texture decodes %.0f),"
+                            " present %.0f, rest of flip %.0f\n", sec_flips,
+                            (sec_be[0] + sec_be[1] + sec_be[2]) / 1000.0, sec_be[0] / 1000.0, sec_n[0], sec_be[1] / 1000.0, sec_n[1],
+                            sec_be[2] / 1000.0, sec_n[2], sec_tex / 1000.0, sec_present / 1000.0, sec_flip / 1000.0);
+                    sec_t0 = p1; sec_flips = 0; sec_present = sec_tex = sec_flip = 0;
+                    for (k = 0; k < 3; k++) { sec_be[k] = 0; sec_n[k] = 0; }
+                }
+            }
             s_h_last_flip = p1; s_h_map = s_h_map_max = 0; s_h_discards = 0; s_h_tex = 0;
             s_h_be[0] = s_h_be[1] = s_h_be[2] = 0; s_h_ben[0] = s_h_ben[1] = s_h_ben[2] = 0;
         }
@@ -2717,7 +2758,15 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     dc.param[0] = p->aa_sx; dc.param[1] = p->aa_sy; dc.param[2] = p->clip_w;
     dc.param[3] = (b->texture && b->texture->normalized) ? 1.0f : 0.0f;
     dc.fog[0] = p->fog_param[0]; dc.fog[1] = p->fog_param[1];
-    if (!cb_write(s_cb_draw, &dc, sizeof dc)) return 1;
+    {
+        static struct { uint32_t info[4]; float param[4]; float fog[4]; } held;
+        static int held_ok;
+        if (!held_ok || memcmp(&held, &dc, sizeof dc)) {
+            held_ok = 0;
+            if (!cb_write(s_cb_draw, &dc, sizeof dc)) return 1;
+            memcpy(&held, &dc, sizeof dc); held_ok = 1;
+        }
+    }
 
     s_draw_squeeze = 0.0f;
     if (WIDE_SURF(r->w, r->h)) {

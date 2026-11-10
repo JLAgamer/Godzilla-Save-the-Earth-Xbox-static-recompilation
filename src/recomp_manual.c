@@ -198,6 +198,28 @@ void sub_002237F0(void)
     uint32_t dev = GZ_MEM32(GZ_D3D_DEVICE_PTR);
     uint32_t sem_va = dev ? GZ_MEM32(dev + 0x30) : 0;
 
+    {
+        /* GZ_FENCE_LOG=1: who blocks on fences, per 2000 calls. */
+        static int flog = -1;
+        static unsigned n, begin, swap, other, other_ra[4], other_n[4];
+        if (flog < 0) flog = getenv("GZ_FENCE_LOG") != NULL;
+        if (flog) {
+            uint32_t r0 = GZ_MEM32(g_esp), r1 = GZ_MEM32(g_esp + 12);
+            int k;
+            if (r0 == 0x0021ED7Cu && r1 == 0x000A853Bu) begin++;
+            else if (r0 == 0x00223B10u) swap++;
+            else {
+                uint32_t key = r0 == 0x0021ED7Cu ? r1 : r0;
+                other++;
+                for (k = 0; k < 4; k++) if (other_ra[k] == key || !other_ra[k]) { other_ra[k] = key; other_n[k]++; break; }
+            }
+            if (++n >= 2000) {
+                fprintf(stderr, "[FENCE] 2000 waits: begin-frame %u, swap %u, other %u (%08X x%u, %08X x%u, %08X x%u, %08X x%u)\n",
+                        begin, swap, other, other_ra[0], other_n[0], other_ra[1], other_n[1], other_ra[2], other_n[2], other_ra[3], other_n[3]);
+                n = begin = swap = other = 0; memset(other_ra, 0, sizeof other_ra); memset(other_n, 0, sizeof other_n);
+            }
+        }
+    }
     /* Called as BlockOnFence (return 0x0021ED7C) from begin-frame (0x000A853B). */
     if (GZ_MEM32(g_esp) == 0x0021ED7Cu && GZ_MEM32(g_esp + 12) == 0x000A853Bu) {
         fence = gz_lag_fence(fence);

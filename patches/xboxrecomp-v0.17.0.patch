@@ -350,7 +350,7 @@ index 87788ed..624b417 100644
   * of the semaphore the title reads GPU progress from (for XDK D3D, the
   * pointer at device+0x30). The executor writes each release there once it
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a5ea9cc..7300842 100644
+index a5ea9cc..932072f 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -448,6 +448,13 @@ static void dump_texture_bmp(uint32_t seq);
@@ -376,7 +376,7 @@ index a5ea9cc..7300842 100644
      const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
      int drawn = s_gpu.drawn_offset != 0;
      uint32_t offset = drawn ? s_gpu.drawn_offset : s_gpu.color_offset;
-@@ -839,16 +846,104 @@ static void current_render_state(Nv2aRenderState *r)
+@@ -839,16 +846,108 @@ static void current_render_state(Nv2aRenderState *r)
      r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
      r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
      r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
@@ -385,6 +385,8 @@ index a5ea9cc..7300842 100644
  
  static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
  
++static int decode_swizzled_fast(const Nv2aTexture *tex, uint32_t *argb_out);
++
 +/* One DXT1/3/5 block to 16 texels (0xAARRGGBB, row-major), as
 + * d3d8_dxt_decode_texel gives them one at a time. */
 +static void dxt_decode_block(const uint8_t *b, uint32_t fmt, uint32_t px[16])
@@ -458,6 +460,8 @@ index a5ea9cc..7300842 100644
 +     * sixteen times over, and a 512x512 texture took about 150 ms: the bulk
 +     * of a level load on a back end, and a hitch whenever an effect's
 +     * texture was first used. */
++    if (decode_swizzled_fast(tex, argb_out))
++        return 1;
 +    if (d3d8_format_dxt_block_bytes(tex->color) && tex->width && tex->height) {
 +        uint32_t bb = d3d8_format_dxt_block_bytes(tex->color);
 +        uint32_t bw = (tex->width + 3u) >> 2, bh = (tex->height + 3u) >> 2, bx, by, i;
@@ -481,7 +485,7 @@ index a5ea9cc..7300842 100644
      s_gpu.texs[0].offset = tex->offset;
      s_gpu.texs[0].width  = tex->width;
      s_gpu.texs[0].height = tex->height;
-@@ -856,7 +951,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+@@ -856,7 +955,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
      s_gpu.texs[0].color  = tex->color;
      s_gpu.texs[0].addr_u = 3;
      s_gpu.texs[0].addr_v = 3;
@@ -490,7 +494,7 @@ index a5ea9cc..7300842 100644
      s_gpu.texs[0].levels = 1;
      s_gpu.texs[0].filter = 0;
      s_gpu.texs[0].cube   = 0;
-@@ -871,6 +966,16 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+@@ -871,6 +970,16 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
      return ok;
  }
  
@@ -507,7 +511,7 @@ index a5ea9cc..7300842 100644
  /* Swizzled colour surfaces (SURFACE_FORMAT type 2, log2 width/height in bits
   * 16-19/24-27): render-to-texture. The pixel at (x, y) lives at the same
   * Morton offset a swizzled texture of that size uses, so the texture sampler
-@@ -1238,6 +1343,14 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+@@ -1238,6 +1347,14 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          *argb = ((const uint32_t *)(mem + t->palette))[p[u]];
          return 1;
  
@@ -522,7 +526,51 @@ index a5ea9cc..7300842 100644
      /* 32-bit, other channel orders. The name gives the byte order from the
       * top of the dword down, so each is a permutation of the same four. */
      case 0x3F: {                                    /* LIN_A8B8G8R8 */
-@@ -1359,7 +1472,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+@@ -1344,6 +1461,43 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+     return sample_tex(&s_gpu.texs[0], 0, u, v, argb);
+ }
+ 
++/* The common swizzled formats, a whole texture in one loop (the values are
++ * sample_tex's). A title that animates small textures on the CPU has them
++ * decoded again every few frames. Returns 0 for any other format. */
++static int decode_swizzled_fast(const Nv2aTexture *tex, uint32_t *argb_out)
++{
++    const uint8_t *p = (const uint8_t *)xbox_GetMemoryOffset() + tex->offset;
++    uint32_t w = tex->width, h = tex->height, x, y, fmt = tex->color, bpp;
++
++    switch (fmt) {
++    case 0x00: case 0x01: case 0x19: bpp = 1; break;    /* L8, AY8, A8 */
++    case 0x04:                       bpp = 2; break;    /* A4R4G4B4 */
++    case 0x06: case 0x07:            bpp = 4; break;    /* A8R8G8B8, X8R8G8B8 */
++    default: return 0;
++    }
++    if (!w || !h || !guest_span_ok(tex->offset, w * h * bpp))
++        return 0;
++    for (y = 0; y < h; y++) {
++        uint32_t *o = argb_out + (size_t)y * w;
++        for (x = 0; x < w; x++) {
++            uint32_t i = swizzle_offset(x, y, w, h), t;
++            switch (fmt) {
++            case 0x00: t = p[i]; o[x] = 0xFF000000u | (t << 16) | (t << 8) | t; break;
++            case 0x01: t = p[i]; o[x] = (t << 24) | (t << 16) | (t << 8) | t; break;
++            case 0x19: o[x] = ((uint32_t)p[i] << 24) | 0x00FFFFFFu; break;
++            case 0x04:
++                t = ((const uint16_t *)p)[i];
++                o[x] = (expand((t >> 12) & 0x0F, 4) << 24) | (expand((t >> 8) & 0x0F, 4) << 16)
++                     | (expand((t >> 4) & 0x0F, 4) << 8) | expand(t & 0x0F, 4);
++                break;
++            case 0x06: o[x] = ((const uint32_t *)p)[i]; break;
++            default:   o[x] = ((const uint32_t *)p)[i] | 0xFF000000u; break;
++            }
++        }
++    }
++    return 1;
++}
++
+ /* Write a bound texture out as a BMP, through the sampler rather than around it.
+  *
+  * "Which texture is this" is not answerable from an address and a format, and
+@@ -1359,7 +1513,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
   */
  static void dump_texture_bmp(uint32_t seq)
  {
@@ -531,7 +579,7 @@ index a5ea9cc..7300842 100644
      uint32_t w = s_gpu.texs[0].width, h = s_gpu.texs[0].height, x, y;
      uint32_t row_bytes, pad, filesz;
      uint8_t hdr[54];
-@@ -2168,9 +2281,12 @@ static Nv2aVertex *backend_slot(void)
+@@ -2168,9 +2322,12 @@ static Nv2aVertex *backend_slot(void)
      return &s_bverts[s_bcount];
  }
  
@@ -544,7 +592,7 @@ index a5ea9cc..7300842 100644
  
      if (tex_size_from_format(s_gpu.texs[0].color)) {
          su = (float)s_gpu.texs[0].width;
-@@ -2183,37 +2299,67 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+@@ -2183,37 +2340,67 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
      o->diffuse = pack_color(v->d0);
      o->u = v->tex[0][0] * su;
      o->v = v->tex[0][1] * sv;
@@ -622,7 +670,7 @@ index a5ea9cc..7300842 100644
      s_backend->draw(&surf, &batch);
      s_gpu.tris_drawn += s_bcount / 3;
      s_bcount = 0;
-@@ -2258,6 +2404,13 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+@@ -2258,6 +2445,13 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
              o[k].diffuse = vertex_color(ix[k]);
              o[k].u = textured ? uv[k][0] : 0.0f;
              o[k].v = textured ? uv[k][1] : 0.0f;
@@ -636,7 +684,7 @@ index a5ea9cc..7300842 100644
          }
          s_bcount += 3;
          return;
-@@ -3321,15 +3474,269 @@ static void xf_set_viewport(void)
+@@ -3321,15 +3515,342 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -691,18 +739,33 @@ index a5ea9cc..7300842 100644
 +        memset(vc_gen, 0, 65536 * sizeof *vc_gen);
 +        gen = 1;
 +    }
-+    /* Unique vertices, in first-use order, and each batch position's slot. */
 +    for (i = 0; i < n; i++) {
-+        uint32_t idx = s_gpu.idx[i], h = idx & 0xFFFFu;
-+        if (vc_gen[h] == gen && vc_idx[h] == idx) {
-+            slot_of[i] = vc_slot[h];
-+            continue;
-+        }
++        uint32_t idx = s_gpu.idx[i];
 +        if (idx < idx_min) idx_min = idx;
 +        if (idx > idx_max) idx_max = idx;
-+        uniq[nv] = idx;
-+        vc_gen[h] = gen; vc_idx[h] = idx; vc_slot[h] = nv;
-+        slot_of[i] = nv++;
++    }
++    if (n && idx_max - idx_min < n && idx_max - idx_min < NV_MAX_INDICES) {
++        /* The indices cover a range no longer than the batch itself (a mesh
++         * drawn from its own stretch of the vertex buffer, the usual case):
++         * take the range whole and in order. No look-up per index, and the
++         * vertex data is read front to back. */
++        nv = idx_max - idx_min + 1;
++        for (i = 0; i < n; i++)
++            slot_of[i] = s_gpu.idx[i] - idx_min;
++        for (i = 0; i < nv; i++)
++            uniq[i] = idx_min + i;
++    } else {
++        /* Unique vertices, in first-use order, and each batch position's slot. */
++        for (i = 0; i < n; i++) {
++            uint32_t idx = s_gpu.idx[i], h = idx & 0xFFFFu;
++            if (vc_gen[h] == gen && vc_idx[h] == idx) {
++                slot_of[i] = vc_slot[h];
++                continue;
++            }
++            uniq[nv] = idx;
++            vc_gen[h] = gen; vc_idx[h] = idx; vc_slot[h] = nv;
++            slot_of[i] = nv++;
++        }
 +    }
 +    s_vc_total += n;
 +    s_vc_hits += n - nv;
@@ -819,6 +882,64 @@ index a5ea9cc..7300842 100644
 +    p.attrs = NULL;
 +    p.packed = packed;
 +    p.packed_mask = packed_mask;
++    {
++        /* RECOMP_VB_DYN_LOG=1: does the title rewrite vertex data in place?
++         * Each array-fed batch is keyed by where its vertices come from; the
++         * same key arriving with different contents is a buffer rewritten
++         * between draws. A title that does that depends on the GPU having
++         * read the old contents first (the fence waits it makes). */
++        static int on = -1;
++        static struct { uint32_t off, lo, nv, hash, seen, changed; } tab[8192];
++        static uint32_t draws, changed_draws, inline_draws;
++        if (on < 0) on = getenv("RECOMP_VB_DYN_LOG") != NULL;
++        if (on) {
++            draws++;
++            if (s_gpu.inline_active) inline_draws++;
++            else if (nv) {
++                /* each array-fed input on its own: where it lies in guest
++                 * memory, and what the bytes of this batch's vertices are */
++                const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
++                uint32_t ai, any = 0;
++                for (ai = 0; ai < NV_VERTEX_ATTRS; ai++) {
++                    const VertexAttr *at = &s_gpu.attr[ai];
++                    uint32_t off = at->offset, hsh = 2166136261u, k, slot, eb;
++                    if (!at->size || !at->stride || !off) continue;
++                    eb = attr_elem_bytes(at) & ~3u;
++                    if (!eb || !guest_span_ok((uint64_t)off + (uint64_t)idx_max * at->stride, eb)) continue;
++                    for (k = 0; k < nv; k++) {
++                        const uint32_t *w = (const uint32_t *)(gm + off + (size_t)uniq[k] * at->stride);
++                        uint32_t q;
++                        for (q = 0; q < eb / 4; q++) hsh = (hsh ^ w[q]) * 16777619u;
++                    }
++                    slot = (off * 2654435761u ^ idx_min * 40503u ^ nv ^ (ai << 9)) & 8191u;
++                    if (tab[slot].seen && tab[slot].off == off && tab[slot].lo == idx_min && tab[slot].nv == nv) {
++                        if (tab[slot].hash != hsh) {
++                            any = 1;
++                            if (tab[slot].changed++ < 2)
++                                fprintf(stderr, "[VBDYN] input %u at %08X +%u x%u rewritten in place\n", ai, off, idx_min, nv);
++                        }
++                    } else {
++                        tab[slot].off = off; tab[slot].lo = idx_min; tab[slot].nv = nv; tab[slot].seen = 1; tab[slot].changed = 0;
++                    }
++                    tab[slot].hash = hsh;
++                }
++                changed_draws += any;
++            }
++            if (draws >= 200000) {
++                fprintf(stderr, "[VBDYN] %u program draws: %u from inline data, %u from arrays rewritten in place\n",
++                        draws, inline_draws, changed_draws);
++                draws = changed_draws = inline_draws = 0;
++                {
++                    uint32_t q;
++                    for (q = 0; q < 8192; q++) {
++                        if (tab[q].changed >= 20)
++                            fprintf(stderr, "[VBDYN]   %08X +%u x%u: %u times\n", tab[q].off, tab[q].lo, tab[q].nv, tab[q].changed);
++                        tab[q].changed = 0;
++                    }
++                }
++            }
++        }
++    }
 +    p.nverts = nv;
 +    p.indices = tris;
 +    p.nindices = nt;
@@ -909,7 +1030,7 @@ index a5ea9cc..7300842 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -3615,8 +4022,6 @@ static void draw_primitive(void)
+@@ -3615,8 +4136,6 @@ static void draw_primitive(void)
      if (!s_gpu.prim || !s_gpu.idx_count)
          return;
      s_gpu.draws++;
@@ -918,7 +1039,7 @@ index a5ea9cc..7300842 100644
      s_gpu.verts += s_gpu.idx_count;
  
      /* How many batches carry coordinates at all, and what range they span.
-@@ -3687,7 +4092,8 @@ static void draw_primitive(void)
+@@ -3687,7 +4206,8 @@ static void draw_primitive(void)
          }
      }
  
@@ -928,7 +1049,7 @@ index a5ea9cc..7300842 100644
          static int shown;
          if (shown++ < 6) {
              fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
-@@ -4173,6 +4579,29 @@ int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
+@@ -4173,6 +4693,29 @@ int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
      return 1;
  }
  
@@ -958,7 +1079,7 @@ index a5ea9cc..7300842 100644
  void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  {
      /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
-@@ -4346,7 +4775,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4346,7 +4889,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x033C: s_gpu.alpha_func = param; break;
      case 0x0340: s_gpu.alpha_ref = param; break;
      case 0x02A4: s_gpu.fog_enable = param; break;
@@ -972,7 +1093,7 @@ index a5ea9cc..7300842 100644
      case 0x029C: s_gpu.fog_mode = param; break;
      case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
      case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
-@@ -4792,7 +5226,7 @@ static void find_nan_matrices(void)
+@@ -4792,7 +5340,7 @@ static void find_nan_matrices(void)
   * pointer or a number", and guessing wrong costs a run. */
  static void peek_addresses(void)
  {
@@ -981,7 +1102,7 @@ index a5ea9cc..7300842 100644
      const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
      char buf[256];
      char *tok, *ctx = NULL;
-@@ -4823,7 +5257,7 @@ static void peek_addresses(void)
+@@ -4823,7 +5371,7 @@ static void peek_addresses(void)
   */
  static void peek_chain(void)
  {
@@ -990,7 +1111,7 @@ index a5ea9cc..7300842 100644
      const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
      char buf[256], *tok, *ctx = NULL;
      uint32_t cur = 0;
-@@ -4861,13 +5295,15 @@ void nv2a_pb_exec_report(void)
+@@ -4861,13 +5409,15 @@ void nv2a_pb_exec_report(void)
  {
      peek_addresses();
      peek_chain();
@@ -1008,7 +1129,7 @@ index a5ea9cc..7300842 100644
          static int done;
          if (!done) { done = 1; find_quad_vertices(); }
      }
-@@ -4885,6 +5321,12 @@ void nv2a_pb_exec_report(void)
+@@ -4885,6 +5435,12 @@ void nv2a_pb_exec_report(void)
          last_flips = s_gpu.flips;
          last_ms = now;
      }
@@ -1022,7 +1143,7 @@ index a5ea9cc..7300842 100644
      fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
                      " clears %u | %u unhandled methods (%d distinct)\n",
 diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
-index 5fab4c3..a628a9e 100644
+index 5fab4c3..3f83d87 100644
 --- a/src/kernel/nv2a_pb_scan.c
 +++ b/src/kernel/nv2a_pb_scan.c
 @@ -44,6 +44,7 @@ static uint32_t s_tot_calls;
@@ -1043,6 +1164,26 @@ index 5fab4c3..a628a9e 100644
      nv2a_pb_exec_method(subch, method, param);
  }
  static int s_exec_enabled = -1;
+@@ -84,7 +88,18 @@ static uint16_t s_seen_slot[8][0x2000 / 4];
+ 
+ static void note(uint32_t subch, uint32_t method)
+ {
+-    uint16_t *slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
++    /* RECOMP_PB_INVENTORY=0: no method inventory. It is a bring-up aid, and
++     * counting every pushbuffer word was 6% of the executor at 240 fps. */
++    static int on = -1;
++    uint16_t *slot;
++
++    if (on < 0) {
++        const char *e = getenv("RECOMP_PB_INVENTORY");
++        on = !(e && e[0] == '0');
++    }
++    if (!on)
++        return;
++    slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
+ 
+     if (*slot) {
+         s_seen[*slot - 1].count++;
 diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
 index c7fd25d..63673f2 100644
 --- a/src/kernel/nv2a_vsh_interp.c

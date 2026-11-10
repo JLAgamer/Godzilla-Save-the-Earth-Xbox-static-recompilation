@@ -307,6 +307,22 @@ static void gz_refresh_disk_cache(const char *save_dir)
     unsigned n = 0;
 
     if (keep && *keep == '1') return;
+    /* Another copy of the game using the same cache folder has files in it
+     * open and remembers which ones it wrote: deleting them under it breaks
+     * its next level load. Each run holds a named mutex for its cache folder
+     * and only the first one may empty it. */
+    {
+        char name[MAX_PATH + 32], *c;
+        HANDLE m;
+        const char *base = (save_dir && *save_dir) ? save_dir : "default";
+        snprintf(name, sizeof name, "Local\\gz_cache_%s", base);
+        for (c = name + 6; *c; c++) if (*c == '\\' || *c == ':' || *c == '/') *c = '_';
+        m = CreateMutexA(NULL, FALSE, name);       /* kept open for the whole run */
+        if (m && GetLastError() == ERROR_ALREADY_EXISTS) {
+            fprintf(stderr, "[CACHE] another copy of the game uses this cache; not touching it\n");
+            return;
+        }
+    }
     if (save_dir && *save_dir) snprintf(dir, sizeof dir, "%s\\Cache", save_dir);
     else {
         const char *la = getenv("LOCALAPPDATA");

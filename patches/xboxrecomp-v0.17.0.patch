@@ -162,6 +162,184 @@ index bd36f2a..9e944cd 100644
              /* Clamp to [-1, 1] range */
              if (left > 1.0f) left = 1.0f;
              if (left < -1.0f) left = -1.0f;
+diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
+index eb33b70..50767c2 100644
+--- a/src/apu/apu_state.h
++++ b/src/apu/apu_state.h
+@@ -234,7 +234,7 @@ hrtf_filter_set_target_params(HrtfFilter *f, float hrir_coeff[2][HRTF_NUM_TAPS],
+         for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+             s += fabsf(coeff[k]);
+         }
+-        if (s == 0.0f || s == 1.0f) break;
++        if (s == 0.0f || s == 1.0f) continue;   /* (was break: skipped the right channel) */
+         for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+             coeff[k] /= s;
+         }
+@@ -429,6 +429,12 @@ typedef struct MCPXAPUVPState {
+     uint8_t submix_headroom[NUM_MIXBINS];
+     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
+     volatile uint8_t voice_locked[MCPX_HW_MAX_VOICES];
++    /* voice_spin is re-entrant on the thread that holds it (owner + depth):
++     * a register write holds its target voice for the whole method, and the
++     * method may lock the voice again (VOICE_ON, VOICE_RELEASE, VOICE_LOCK). */
++    volatile DWORD voice_spin_owner[MCPX_HW_MAX_VOICES];
++    int voice_spin_depth[MCPX_HW_MAX_VOICES];
++    volatile LONG fe_spin;          /* one front-end method at a time (see mcpx_apu_vp_write) */
+     volatile LONG voice_spin[MCPX_HW_MAX_VOICES];   /* see voice_spin_lock */
+ 
+     struct {
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index 94e57da..40125b5 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -150,12 +150,22 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
+  * wait while the voice processor is working on the voice it locks. */
+ static void voice_spin_lock(MCPXAPUState *d, uint16_t v)
+ {
++    DWORD me = GetCurrentThreadId();
++    if (d->vp.voice_spin_owner[v] == me) {      /* already ours: nest */
++        d->vp.voice_spin_depth[v]++;
++        return;
++    }
+     while (InterlockedCompareExchange(&d->vp.voice_spin[v], 1, 0))
+         SwitchToThread();
++    d->vp.voice_spin_owner[v] = me;
++    d->vp.voice_spin_depth[v] = 1;
+ }
+ 
+ static void voice_spin_unlock(MCPXAPUState *d, uint16_t v)
+ {
++    if (--d->vp.voice_spin_depth[v] > 0)
++        return;
++    d->vp.voice_spin_owner[v] = 0;
+     InterlockedExchange(&d->vp.voice_spin[v], 0);
+ }
+ 
+@@ -193,8 +203,24 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+ {
+     unsigned int slot;
+ 
+-    d->regs[NV_PAPU_FEDECMETH] = method;
+-    d->regs[NV_PAPU_FEDECPARAM] = argument;
++    /* FEDECMETH/FEDECPARAM are what the service routine reads after a trap
++     * (the idle voice's handle, for SE2FE_IDLE_VOICE). While the front end is
++     * trapped the hardware decodes nothing further, so a later method must
++     * not replace them: here the title's own writes kept arriving and
++     * overwrote the idle voice's handle, and DirectSound retired whichever
++     * voice it then read - one still playing, given to the next sound while
++     * it was still in a voice list. */
++    if (method == SE2FE_IDLE_VOICE
++            || (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
++               != NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
++        d->regs[NV_PAPU_FEDECMETH] = method;
++        d->regs[NV_PAPU_FEDECPARAM] = argument;
++    } else {
++        static unsigned kept;
++        if (getenv("RECOMP_APU_RACE_LOG") && (++kept <= 3 || kept % 500 == 0))
++            fprintf(stderr, "[APU-RACE] method 0x%04X arrived while the front end was trapped on voice %u; trap registers kept (%u so far)\n",
++                    method, d->regs[NV_PAPU_FEDECPARAM], kept);
++    }
+     unsigned int selected_handle, list;
+ 
+     switch (method) {
+@@ -582,8 +608,35 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
+     MCPXAPUState *d = (MCPXAPUState *)opaque;
+     (void)size;
+ 
+-    /* Dispatch known methods through fe_method */
+-    fe_method(d, (uint32_t)addr, (uint32_t)val);
++    /* One method at a time, and the voice it changes held for all of it:
++     * the title's writes arrive on its own threads while the frame thread
++     * processes voices, and each voice field is a read-modify-write of a
++     * shared dword (the VP rewrites the envelope level next to CBO, and the
++     * state bits next to ACTIVE, every frame). Without this a VOICE_ON's
++     * CBO = 0 or a VOICE_OFF could be lost, and a voice set up halfway was
++     * played. The frame thread's idle-voice trap takes fe_spin as well, so
++     * the trap's registers are written as a unit. RECOMP_APU_FE_LOCK=0: off. */
++    static int on = -1;
++    uint32_t method = (uint32_t)addr, arg = (uint32_t)val, target = 0xFFFFu;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_APU_FE_LOCK");
++        on = !(e && e[0] == '0');
++    }
++    if (!on) {
++        fe_method(d, method, arg);
++        return;
++    }
++    if (method == NV1BA0_PIO_VOICE_ON || method == NV1BA0_PIO_VOICE_OFF
++            || method == NV1BA0_PIO_VOICE_RELEASE || method == NV1BA0_PIO_VOICE_PAUSE)
++        target = arg & NV1BA0_PIO_VOICE_ON_HANDLE;
++    else if (method != NV1BA0_PIO_SET_CURRENT_VOICE)
++        target = d->regs[NV_PAPU_FECV] & 0xFFFFu;
++    while (InterlockedCompareExchange(&d->vp.fe_spin, 1, 0))
++        SwitchToThread();
++    if (target < MCPX_HW_MAX_VOICES) voice_spin_lock(d, (uint16_t)target);
++    fe_method(d, method, arg);
++    if (target < MCPX_HW_MAX_VOICES) voice_spin_unlock(d, (uint16_t)target);
++    InterlockedExchange(&d->vp.fe_spin, 0);
+ }
+ 
+ /* ============================================================
+@@ -1697,13 +1750,48 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+                  * idle voice in the same frame would overwrite FEDECPARAM
+                  * before the ISR has read the first. The rest trap on later
+                  * frames, after the ISR has resumed the front end. */
++                while (InterlockedCompareExchange(&d->vp.fe_spin, 1, 0))
++                    SwitchToThread();
+                 if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+                         != NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+                     fe_method(d, SE2FE_IDLE_VOICE, v);
++                InterlockedExchange(&d->vp.fe_spin, 0);
+             } else {
+-                /* Process voice directly (single-threaded) */
++                /* A voice the title holds locked (NV1BA0_PIO_VOICE_LOCK, or
++                 * VOICE_ON's own lock) is being rewritten: its buffer,
++                 * stream segments, position and volumes arrive as a series
++                 * of method writes on the title's thread. Playing it in the
++                 * middle of that mixed old and new state - a voice line
++                 * played from the wrong data, a slot left half set up for
++                 * the next sound. The hardware stalls a locked voice; here
++                 * it sits out this frame. voice_lock takes the same spin
++                 * lock, so a lock never lands while the voice is mid-frame.
++                 * A lock held for more than ~0.2 s is taken to be stuck and
++                 * the voice plays anyway (logged once).
++                 * RECOMP_APU_HONOR_LOCK=0: as before (never skips). */
++                static int honor = -1;
++                static uint16_t held[MCPX_HW_MAX_VOICES];
++                if (honor < 0) {
++                    const char *e = getenv("RECOMP_APU_HONOR_LOCK");
++                    honor = !(e && e[0] == '0');
++                }
+                 voice_spin_lock(d, v);
+-                voice_process(d, mixbins, d->vp.sample_buf, v, list);
++                if (honor && d->vp.voice_locked[v] && held[v] < 300) {
++                    held[v]++;
++                    {
++                        static unsigned skips;
++                        if (getenv("RECOMP_APU_RACE_LOG") && (++skips == 1 || skips % 2000 == 0))
++                            fprintf(stderr, "[APU-RACE] locked voice skipped for a frame (%u so far)\n", skips);
++                    }
++                } else {
++                    if (honor && held[v] >= 300) {
++                        static int warned;
++                        if (warned++ < 4)
++                            fprintf(stderr, "[APU] voice %u locked for 300 frames; playing it anyway\n", v);
++                    }
++                    if (!d->vp.voice_locked[v]) held[v] = 0;
++                    voice_process(d, mixbins, d->vp.sample_buf, v, list);
++                }
+                 voice_spin_unlock(d, v);
+             }
+             d->regs[current] = d->regs[next];
+@@ -1774,6 +1862,8 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
+     memset(d->vp.hrtf_submix, 0, sizeof(d->vp.hrtf_submix));
+     memset(d->vp.submix_headroom, 0, sizeof(d->vp.submix_headroom));
+     memset((void *)d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
++    memset((void *)d->vp.voice_spin_owner, 0, sizeof(d->vp.voice_spin_owner));
++    memset(d->vp.voice_spin_depth, 0, sizeof(d->vp.voice_spin_depth));
+     for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+         hrtf_filter_init(&d->vp.filters[v].hrtf);
+     }
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
 index 2991d89..bffc8d7 100644
 --- a/src/kernel/kernel_file.c

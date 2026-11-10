@@ -2,6 +2,7 @@
 # One quick fight per stage at the given frame rate: a screenshot, the fps
 # lines and the pacing summary (frames / late frames / longest frame per
 # second, GZ_PACE_LOG) for each.
+# Runs in its own save/cache folder (GZ_SAVE_DIR, default %LOCALAPPDATA%oxrecomp_test), never the player's.
 # Usage: stage_sweep.sh <work dir> [rate=240] [stage ...]
 W=${1:?work dir}; RATE=${2:-240}; shift; shift
 P="$(cd "$(dirname "$0")/.." && pwd)"

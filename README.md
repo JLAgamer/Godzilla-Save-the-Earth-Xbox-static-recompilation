@@ -1,5 +1,9 @@
 # Godzilla: Save the Earth — Xbox static recompilation
 
+![Overall progress](https://img.shields.io/badge/overall-76%25-green)
+![Boot and menus](https://img.shields.io/badge/Boot_and_menus-95%25-brightgreen) ![Versus fights](https://img.shields.io/badge/Versus_fights-90%25-brightgreen) ![Other modes](https://img.shields.io/badge/Other_modes-20%25-red) ![Stages](https://img.shields.io/badge/Stages-40%25-orange) ![Graphics](https://img.shields.io/badge/Graphics-90%25-brightgreen)
+![Audio](https://img.shields.io/badge/Audio-85%25-green) ![Movies](https://img.shields.io/badge/Movies-100%25-brightgreen) ![Widescreen](https://img.shields.io/badge/Widescreen-90%25-brightgreen) ![High frame rate](https://img.shields.io/badge/High_frame_rate-90%25-brightgreen) ![Online (System Link)](https://img.shields.io/badge/Online_%28System_Link%29-60%25-yellow)
+
 A native Windows port of the Xbox version of *Godzilla: Save the Earth* (2004), made by statically
 recompiling the game's `default.xbe` into C with the [xboxrecomp](https://github.com/sp00nznet/xboxrecomp)
 toolkit and running it on a Direct3D 11 renderer.
@@ -19,6 +23,23 @@ files dumped from a disc you own. The setup script translates *your* `default.xb
 - **FMV movies** (intro, story, credits) decoded with ffmpeg
 - **System Link over the internet/LAN** (the game's own Xbox LAN multiplayer, on UDP sockets)
 - Texture replacement packs (drop BMPs into a folder), screenshots (F12)
+
+## Progress
+
+Estimates from what has been checked in game so far. Overall is the average of the areas.
+
+| Area | Done | Status |
+|---|---|---|
+| Boot and menus | 95% | Every menu works, including the new Options entries and the Biollante cell |
+| Versus fights | 90% | Played many times (mostly Tokyo): HUD, beams, destruction, win/lose |
+| Other modes | 20% | Action, Melee, Survival and Challenges have not been played through yet |
+| Stages | 40% | Tokyo fully checked; others load (Mothership seen in play) but are not checked one by one |
+| Graphics | 90% | Combiners, cube maps, water reflections, fog; rare effects may still be wrong |
+| Audio | 85% | Music and effects play; menu crackle reported once, not reproduced |
+| Movies | 100% | Intro, story and credits play through ffmpeg |
+| Widescreen | 90% | Wider camera with matching culling, HUD in the corners; not checked on every stage |
+| High frame rate | 90% | 60–240 fps with correct game speed; the attract demo can slow down |
+| Online (System Link) | 60% | Works between two copies on one PC; not yet tested PC to PC over the internet |
 
 ## Requirements
 

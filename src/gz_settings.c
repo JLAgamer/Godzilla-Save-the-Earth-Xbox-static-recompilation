@@ -7,7 +7,9 @@
  *   prompts     button pictures: 1 = cross/circle/square/triangle, 0 = Xbox
  *   widescreen  1 = 16:9 picture with a wider view, 0 = the original 4:3
  *   frame_rate  the game's frame rate setting (60 on the console); the menu
- *               entry steps through 60 / 120 / 144 / 165 / 240
+ *               entry steps through 60 / 120 / 144. Higher rates were too
+ *               unstable in play; a saved or GZ_RATE value above 144 is
+ *               treated as 144.
  *
  * They are kept in gz_settings.ini in the working folder (GZ_SETTINGS_FILE
  * overrides the path). GZ_TOURNAMENT / GZ_PS_PROMPTS / GZ_WIDE (0 or 1) and GZ_RATE
@@ -21,7 +23,8 @@
 enum { OPT_TOURNAMENT, OPT_PROMPTS, OPT_RATE, OPT_WIDE, OPT_COUNT };
 
 static int s_val[OPT_COUNT] = { 0, 1, 60, 0 };
-static const int s_rates[] = { 60, 120, 144, 165, 240 };
+static const int s_rates[] = { 60, 120, 144 };
+#define GZ_RATE_MAX 144
 static const char *const s_key[OPT_COUNT] = { "tournament", "ps_prompts", "frame_rate", "widescreen" };
 static const char *const s_env[OPT_COUNT] = { "GZ_TOURNAMENT", "GZ_PS_PROMPTS", "GZ_RATE", "GZ_WIDE" };
 static int s_loaded;
@@ -56,6 +59,10 @@ static void load(void)
         else if (e && (*e == '0' || *e == '1')) s_val[i] = *e == '1';
     }
     if (s_val[OPT_RATE] < 20 || s_val[OPT_RATE] > 1000) s_val[OPT_RATE] = 60;
+    if (s_val[OPT_RATE] > GZ_RATE_MAX) {
+        fprintf(stderr, "[SETTINGS] frame_rate %d is above the maximum; using %d\n", s_val[OPT_RATE], GZ_RATE_MAX);
+        s_val[OPT_RATE] = GZ_RATE_MAX;
+    }
     fprintf(stderr, "[SETTINGS] tournament=%d ps_prompts=%d frame_rate=%d widescreen=%d (%s)\n",
             s_val[OPT_TOURNAMENT], s_val[OPT_PROMPTS], s_val[OPT_RATE], s_val[OPT_WIDE], settings_path());
 }

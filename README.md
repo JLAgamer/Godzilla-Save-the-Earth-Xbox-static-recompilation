@@ -16,7 +16,7 @@ files dumped from a disc you own. The setup script translates *your* `default.xb
 - Runs natively on Windows with a D3D11 renderer for the Xbox GPU's command stream
 - Higher internal resolution (up to 6x), mip-mapped 16x anisotropic filtering, borderless fullscreen
 - **Widescreen 16:9**: a wider view at the camera (culling follows), HUD kept in shape and pinned to the corners
-- **Frame rate 60 / 120 / 144 / 165 / 240**, with game speed kept to real time when the PC can't hold the rate
+- **Frame rate 60 / 120 / 144**, with game speed kept to real time when the PC can't hold the rate
 - **In-game Options entries**: tournament mode, PlayStation or Xbox button icons, frame rate, aspect ratio
 - **Tournament mode**: every monster and city unlocked, whatever the profile holds
 - **Biollante**: the cut monster (complete on the disc) gets a cell on the monster select screen
@@ -38,7 +38,7 @@ Estimates from what has been checked in game so far. Overall is the average of t
 | Audio | 85% | Music and effects play; menu crackle reported once, not reproduced |
 | Movies | 100% | Intro, story and credits play through ffmpeg |
 | Widescreen | 90% | Wider camera with matching culling, HUD in the corners; not checked on every stage |
-| High frame rate | 95% | 240 fps holds on the ten checked stages; the heaviest moments can dip briefly; the attract demo is not re-checked |
+| High frame rate | 95% | Up to 144 fps (higher rates were too unstable in play); game speed stays correct |
 | Online (System Link) | 60% | Works between two copies on one PC; not yet tested PC to PC over the internet |
 
 ## Requirements
@@ -87,9 +87,7 @@ Logs go to `play.log` next to the launcher; include it when reporting a problem.
 ## Known issues
 
 - Not every stage and mode has been played through; the recompilation can still hit untranslated paths.
-- 240 fps holds on the ten city and arena stages on a fast PC (tested: RTX 3080, Ryzen 7 7800X3D, 2x
-  internal resolution). The heaviest moments (many buildings collapsing at once) can dip to about 200 for
-  a second or two; game speed stays correct. The first run compiles shaders into `shader_cache\` and is
+- The frame rate setting goes up to 144. The first run compiles shaders into `shader_cache\` and is
   less smooth than later ones.
 - Online play has been tested between two copies on one PC (including simulated lag and loss), not yet
   between two PCs over the internet.

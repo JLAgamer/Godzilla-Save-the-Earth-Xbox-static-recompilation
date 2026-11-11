@@ -739,6 +739,7 @@ int gz_launch_init(void)
         }
         /* what play.bat sets for normal play (see the comments there) */
         set_env_default("RECOMP_USB", "1");
+        set_env_default("RECOMP_USB_PADS", "4");     /* local multiplayer: pad N on the PC is player N */
         set_env_default("RECOMP_PB_EXEC", "1");
         set_env_default("RECOMP_PB_WALK", "dma");
         set_env_default("RECOMP_AC97_READY", "1");

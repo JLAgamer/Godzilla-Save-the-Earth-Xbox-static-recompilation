@@ -66,11 +66,11 @@ rem set GZ_TICK_LOG=1
 rem Diagnostics, off for normal play (remove "rem" to use): frame limiter and
 rem clock logs, per-second channel levels, and the mixed output as a WAV
 rem (the WAV grows about 11 MB per minute).
-set RECOMP_APU_LEVELS=1
-set RECOMP_AUDIO_WAV=%~dp0play_audio.wav
-rem Temporary sound diagnostics (per-voice statistics, register races); remove after the audio bug hunt.
-set RECOMP_APU_TRACE=1
-set RECOMP_APU_RACE_LOG=1
+rem set RECOMP_APU_LEVELS=1
+rem set RECOMP_AUDIO_WAV=%~dp0play_audio.wav
+rem Per-voice sound statistics and sound-register race counters:
+rem set RECOMP_APU_TRACE=1
+rem set RECOMP_APU_RACE_LOG=1
 
 set GZ_PROFILE=
 if "%GZ_PROFILE%"=="1" (

@@ -10,9 +10,6 @@ cd /d "%~dp0"
 rem Options menu entries for tournament mode and button icons.
 set RECOMP_OVERLAY_DIR=%~dp0mods\menu
 set RECOMP_USB=1
-rem Four controllers plugged into the emulated Xbox (local multiplayer): the Nth
-rem pad on this PC is player N, and ones not connected read as idle.
-set RECOMP_USB_PADS=4
 set RECOMP_PB_EXEC=1
 set RECOMP_PB_WALK=dma
 set RECOMP_AC97_READY=1

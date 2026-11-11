@@ -37,7 +37,6 @@ Windows 10/11 (64-bit) with a Direct3D 11 graphics card. Movies need `ffmpeg.exe
 - **Tournament mode**: every monster and city unlocked, whatever the profile holds
 - **Biollante**: the cut monster (complete on the disc) gets a cell on the monster select screen
 - **FMV movies** (intro, story, credits) decoded with ffmpeg
-- **Local multiplayer** with up to four controllers
 - **System Link over the internet/LAN** (the game's own Xbox LAN multiplayer, on UDP sockets)
 - Texture replacement packs (drop BMPs into a folder), screenshots (F12)
 
@@ -101,8 +100,6 @@ while another program's window is in front (`RECOMP_PAD_BACKGROUND=1` reads them
 - **`play.bat`** options at the top: fullscreen, window size, internal resolution, texture filtering,
   online play, movies
 - **Keys:** F12 screenshot (`screenshots\`), F9 trace one frame into the log, F10 water reflection on/off
-- **Local multiplayer:** up to four controllers; the first one connected is player 1, the second player 2, and so
-  on (`RECOMP_USB_PADS` sets how many the game sees, 4 by default)
 - **Biollante:** the green "?" cell at the end of the top row of the monster select screen
 - **`play_fight.bat`** boots straight into a match replaying the last match you started from the menus
 - **Online:** set `online=1` (and `online_peer=<other player's IP>` over the internet) in `gz_settings.ini`, or

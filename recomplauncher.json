@@ -1,0 +1,441 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "Godzilla: Save the Earth",
+  "repo": "JLAgamer/Godzilla-Save-the-Earth-Xbox-static-recompilation",
+  "game": {
+    "kind": "iso_or_folder",
+    "label": "Your copy of Godzilla: Save the Earth for the original Xbox (USA/Europe): its disc image (.iso or .xiso.iso), or its extracted folder with default.xbe.",
+    "check": {
+      "file": "default.xbe",
+      "xdvdfs": "default.xbe"
+    },
+    "dumps": [
+      {
+        "name": "USA, Europe",
+        "size": 7825162240,
+        "crc32": "ce3388e7"
+      }
+    ]
+  },
+  "start": {
+    "program": [
+      "godzilla_ste_recomp.exe"
+    ],
+    "args": [
+      "--game",
+      "{game}",
+      "--log",
+      "{install}/logs/godzilla.log"
+    ]
+  },
+  "prepare": {
+    "program": [
+      "godzilla_ste_recomp.exe"
+    ],
+    "args": [
+      "--prepare",
+      "--game",
+      "{game}"
+    ],
+    "label": "Unpacking your disc and adding the menu extras",
+    "timeout": 600
+  },
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [
+        {
+          "path": "{install}/gz_settings.ini"
+        }
+      ],
+      "new": {
+        "tournament": "0",
+        "frame_rate": "60",
+        "widescreen": "0"
+      }
+    },
+    {
+      "id": "controls",
+      "format": "ini",
+      "file": [
+        {
+          "path": "{install}/gz_controls.ini"
+        }
+      ]
+    }
+  ],
+  "folders": {
+    "saves": [
+      {
+        "path": "{install}/saves",
+        "if": "{install}/saves"
+      },
+      {
+        "path": "{local}/GodzillaSTE"
+      }
+    ],
+    "logs": [
+      {
+        "path": "{install}/logs"
+      }
+    ],
+    "screenshots": [
+      {
+        "path": "{install}/screenshots"
+      }
+    ],
+    "install": [
+      {
+        "path": "{install}"
+      }
+    ]
+  },
+  "saves": [
+    "{install}/saves/UDATA",
+    "{local}/GodzillaSTE/UDATA",
+    "{install}/gz_settings.ini",
+    "{install}/gz_controls.ini"
+  ],
+  "exit_codes": {
+    "0": "ok",
+    "1": "The game couldn't find default.xbe in your copy. Pick your copy again on the game's page.",
+    "2": "That copy can't be read, or isn't Godzilla: Save the Earth for Xbox. Pick its disc image or folder again.",
+    "3": "Your copy's default.xbe is a different version from the one this build was made from. It needs the USA/Europe release.",
+    "4": "The game couldn't write next to its program. Unpacking the disc needs about 1 GB free in the game's folder."
+  },
+  "settings": [
+    {
+      "id": "aspect",
+      "label": "Aspect ratio",
+      "help": "Widescreen shows more of each side of the city, with the HUD kept in the corners. 4:3 is the console's picture.",
+      "choices": [
+        {
+          "label": "4:3 (original)",
+          "set": {
+            "widescreen": "0"
+          }
+        },
+        {
+          "label": "16:9 widescreen",
+          "set": {
+            "widescreen": "1"
+          }
+        }
+      ],
+      "defaults": {
+        "widescreen": "0"
+      }
+    },
+    {
+      "id": "frame_rate",
+      "label": "Frame rate",
+      "help": "60 is the console's rate. Game speed stays real time at every rate; 120 and 144 need a fast PC and a screen that shows them.",
+      "choices": [
+        {
+          "label": "60 (console)",
+          "set": {
+            "frame_rate": "60"
+          }
+        },
+        {
+          "label": "120",
+          "set": {
+            "frame_rate": "120"
+          }
+        },
+        {
+          "label": "144",
+          "set": {
+            "frame_rate": "144"
+          }
+        }
+      ],
+      "defaults": {
+        "frame_rate": "60"
+      }
+    },
+    {
+      "id": "prompts",
+      "label": "Button icons",
+      "help": "The buttons shown in menus and tips. The first start picks the controller that is plugged in.",
+      "choices": [
+        {
+          "label": "Xbox",
+          "set": {
+            "ps_prompts": "0"
+          }
+        },
+        {
+          "label": "PlayStation",
+          "set": {
+            "ps_prompts": "1"
+          }
+        }
+      ],
+      "defaults": {
+        "ps_prompts": "1"
+      }
+    },
+    {
+      "id": "tournament",
+      "label": "Tournament mode",
+      "help": "Every monster and city unlocked, whatever your profile has earned. Online play turns it on for both players.",
+      "choices": [
+        {
+          "label": "Off",
+          "set": {
+            "tournament": "0"
+          }
+        },
+        {
+          "label": "On",
+          "set": {
+            "tournament": "1"
+          }
+        }
+      ],
+      "defaults": {
+        "tournament": "0"
+      }
+    },
+    {
+      "id": "online",
+      "label": "Online (System Link)",
+      "help": "Multi-Player > System Link over your network. Over the internet, put the other player's IP address after online_peer= in gz_settings.ini; UDP ports 1000-1002 must be open.",
+      "choices": [
+        {
+          "label": "Off",
+          "set": {
+            "online": "0"
+          }
+        },
+        {
+          "label": "On",
+          "set": {
+            "online": "1"
+          }
+        }
+      ],
+      "defaults": {
+        "online": "0"
+      }
+    },
+    {
+      "id": "window",
+      "label": "Window",
+      "in": "args",
+      "help": "Automatic is full screen in Big Picture mode and a window on the desktop. Full screen is borderless, with the picture letterboxed.",
+      "choices": [
+        {
+          "label": "Automatic",
+          "args": []
+        },
+        {
+          "label": "Full screen",
+          "args": [
+            "--fullscreen"
+          ]
+        },
+        {
+          "label": "Windowed",
+          "args": [
+            "--windowed"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "window_size",
+      "label": "Window size",
+      "in": "args",
+      "help": "The size of the game's window when it isn't full screen.",
+      "choices": [
+        {
+          "label": "1280 x 960",
+          "args": [
+            "--window-scale",
+            "2"
+          ]
+        },
+        {
+          "label": "640 x 480",
+          "args": [
+            "--window-scale",
+            "1"
+          ]
+        },
+        {
+          "label": "1920 x 1440",
+          "args": [
+            "--window-scale",
+            "3"
+          ]
+        },
+        {
+          "label": "2560 x 1920",
+          "args": [
+            "--window-scale",
+            "4"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "resolution",
+      "label": "Resolution",
+      "in": "args",
+      "help": "What the game draws at, in steps of the console's 640 x 480. Match the window is sharp at any size.",
+      "choices": [
+        {
+          "label": "Match the window",
+          "args": [
+            "--render-scale",
+            "0"
+          ]
+        },
+        {
+          "label": "480p (console)",
+          "args": [
+            "--render-scale",
+            "1"
+          ]
+        },
+        {
+          "label": "960p",
+          "args": [
+            "--render-scale",
+            "2"
+          ]
+        },
+        {
+          "label": "1440p",
+          "args": [
+            "--render-scale",
+            "3"
+          ]
+        },
+        {
+          "label": "1920p",
+          "args": [
+            "--render-scale",
+            "4"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "filtering",
+      "label": "Texture filtering",
+      "help": "Sharp keeps streets and buildings crisp at shallow angles and costs next to nothing.",
+      "choices": [
+        {
+          "label": "Sharp (16x)",
+          "args": [
+            "--aniso",
+            "16"
+          ]
+        },
+        {
+          "label": "Original",
+          "args": [
+            "--aniso",
+            "1"
+          ]
+        }
+      ],
+      "in": "args"
+    },
+    {
+      "id": "movies",
+      "label": "Movies",
+      "in": "args",
+      "help": "The intro, story and credits movies. Playing them needs ffmpeg.exe in the game's folder or on PATH; without it they are skipped.",
+      "choices": [
+        {
+          "label": "Skip",
+          "args": [
+            "--movies",
+            "0"
+          ]
+        },
+        {
+          "label": "Play",
+          "args": [
+            "--movies",
+            "1"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "face_buttons",
+      "label": "Face buttons",
+      "in": "controls",
+      "help": "Swapped puts the game's A on the right face button and B on the bottom one, as on Nintendo pads. Every button can be changed in gz_controls.ini.",
+      "choices": [
+        {
+          "label": "As on an Xbox pad",
+          "set": {
+            "a": "south",
+            "b": "east"
+          }
+        },
+        {
+          "label": "Swapped",
+          "set": {
+            "a": "east",
+            "b": "south"
+          }
+        }
+      ],
+      "defaults": {
+        "a": "south",
+        "b": "east"
+      }
+    },
+    {
+      "id": "deadzone",
+      "label": "Stick deadzone",
+      "in": "controls",
+      "help": "How far the sticks move before the game sees it, in percent. Raise it if your monster drifts on its own.",
+      "slider": {
+        "key": "deadzone_left",
+        "min": 0,
+        "max": 40,
+        "step": 5,
+        "format": "%g"
+      },
+      "defaults": {
+        "deadzone_left": "0"
+      }
+    }
+  ],
+  "actions": [
+    {
+      "id": "saves",
+      "label": "Saves",
+      "help": "Your profile and the game's own save files.",
+      "open": "saves"
+    },
+    {
+      "id": "controls",
+      "label": "Controller layout",
+      "help": "gz_controls.ini, where every button and both sticks can be changed.",
+      "open": "install"
+    },
+    {
+      "id": "screenshots",
+      "label": "Screenshots",
+      "help": "Pictures taken with F12 in game.",
+      "open": "screenshots"
+    },
+    {
+      "id": "shaders",
+      "label": "Shader cache",
+      "help": "Shaders the game has built, so later starts don't stutter. Clearing only helps if graphics look wrong after an update.",
+      "clear": "install/shader_cache"
+    }
+  ]
+}

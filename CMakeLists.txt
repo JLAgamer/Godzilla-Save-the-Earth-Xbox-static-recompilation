@@ -12,6 +12,10 @@ cmake_minimum_required(VERSION 3.20)
 
 project(godzilla_ste_recomp C)
 
+# The C runtime linked into the program (every target, the toolkit's too), so
+# a release runs without the Visual C++ Redistributable installed.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
@@ -41,6 +45,16 @@ set(XBOXRECOMP_DIR "${_xr_default}" CACHE PATH
 
 # Add xboxrecomp as a subdirectory -- this builds all 6 runtime libraries
 # and provides the 'xboxrecomp' umbrella target to link against.
+# SDL3 for controllers (setup.ps1 fetches the development package into
+# third_party\sdl3). Without it the build uses XInput only.
+file(GLOB _sdl3_cfg "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sdl3/SDL3-*/cmake/SDL3Config.cmake")
+if(_sdl3_cfg AND NOT SDL3_DIR)
+    list(GET _sdl3_cfg 0 _sdl3_cfg)
+    get_filename_component(_sdl3_dir "${_sdl3_cfg}" DIRECTORY)
+    set(SDL3_DIR "${_sdl3_dir}" CACHE PATH "SDL3 development package (cmake folder)")
+endif()
+find_package(SDL3 CONFIG QUIET)   # here too, for copying SDL3.dll below
+
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
 # ── Recompiled game executable ──────────────────────────────────
@@ -63,6 +77,9 @@ set(GAME_SOURCES
     src/gz_settings.c        # in-game switches (Options menu), gz_settings.ini
     src/gz_movie.c           # host XMV playback through ffmpeg
     src/gz_profile.c         # GZ_PROFILE sampling profiler (started mid-fight by the back end)
+    src/gz_launch.c          # --game / --prepare / --log for launchers (recomplauncher.json)
+    src/gz_controls.c        # controller remapping and deadzones (gz_controls.ini)
+    src/gz_ach.c             # Recomp Achievements events (match results)
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c
@@ -101,7 +118,32 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     # Lets the fault handler resolve the host RIP back to the generated
     # function's symbol, i.e. to the guest function that faulted.
     dbghelp
+    shell32              # gz_launch.c: CommandLineToArgvW
+    bcrypt               # gz_launch.c: SHA-1 of the player's default.xbe
 )
+
+# The program only runs the default.xbe it was translated from: record its
+# SHA-1 so --game can tell a player when their copy is a different one.
+set(GZ_XBE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/game/GodzillaSTE/default.xbe")
+if(EXISTS "${GZ_XBE_FILE}")
+    file(SHA1 "${GZ_XBE_FILE}" GZ_XBE_SHA1)
+    set_property(SOURCE src/gz_launch.c APPEND PROPERTY COMPILE_DEFINITIONS GZ_XBE_SHA1="${GZ_XBE_SHA1}")
+endif()
+
+# Recomp Achievements (setup.ps1 fetches it into third_party). Its own license
+# (free to use in games): third_party\RecompAchievements\LICENSE.
+set(GZ_ACH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/RecompAchievements/sdk")
+if(EXISTS "${GZ_ACH_DIR}/CMakeLists.txt")
+    add_subdirectory("${GZ_ACH_DIR}" "${CMAKE_BINARY_DIR}/rl_achievements")
+    target_link_libraries(${PROJECT_NAME} PRIVATE rl_achievements)
+    set_property(SOURCE src/gz_ach.c APPEND PROPERTY COMPILE_DEFINITIONS GZ_ACHIEVEMENTS)
+endif()
+
+# SDL3.dll next to the program (controllers; see src/input in the toolkit).
+if(TARGET SDL3::SDL3-shared)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL3::SDL3-shared> $<TARGET_FILE_DIR:${PROJECT_NAME}>)
+endif()
 
 # MSVC-specific: large address aware, increase section limit for big generated files
 if(MSVC)

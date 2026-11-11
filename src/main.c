@@ -84,8 +84,9 @@ extern ptrdiff_t g_xbox_mem_offset;
  * Run: py -3 -m tools.xbe_parser game/default.xbe
  */
 #define YOUR_GAME_ENTRY_POINT   0x00015586  /* XBE entry point VA */
-#define YOUR_GAME_XBE_PATH      "game\\GodzillaSTE\\default.xbe"
-#define YOUR_GAME_DIR            "game\\GodzillaSTE"
+/* The extracted disc: game\GodzillaSTE, or what --game picked (gz_launch.c). */
+extern const char *gz_launch_game_dir(void);
+extern int gz_launch_init(void);
 
 /* ── Forward declarations ──────────────────────────────────── */
 
@@ -370,6 +371,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)lpCmdLine;
     (void)nCmdShow;
 
+    /* Launcher options (--game, --prepare, --log, ...); none = as before. */
+    {
+        int rc = gz_launch_init();
+        if (rc >= 0) return rc;
+    }
+
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -386,11 +393,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     AddVectoredExceptionHandler(1, veh_handler);
 
     /* Step 1: Load XBE */
-    if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {
-        MessageBoxA(NULL, "Failed to load default.xbe.\n"
-                    "Place the game files in the 'game' subdirectory.",
-                    "Recomp", MB_ICONERROR);
-        return 1;
+    {
+        char xbe_path[MAX_PATH * 3];
+        snprintf(xbe_path, sizeof xbe_path, "%s\\default.xbe", gz_launch_game_dir());
+        if (!load_xbe(xbe_path, &xbe_data, &xbe_size)) {
+            MessageBoxA(NULL, "Failed to load default.xbe.\n"
+                        "Place the game files in the 'game' subdirectory.",
+                        "Recomp", MB_ICONERROR);
+            return 1;
+        }
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
 
@@ -455,7 +466,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
          * files (Z:) open, and a second opener gets a sharing violation and
          * crashes at boot. Unset = the default (%LOCALAPPDATA%/xboxrecomp). */
         const char *gz_save = getenv("GZ_SAVE_DIR");
-        xbox_path_init(YOUR_GAME_DIR, (gz_save && *gz_save) ? gz_save : NULL);
+        xbox_path_init(gz_launch_game_dir(),(gz_save && *gz_save) ? gz_save : NULL);
         gz_refresh_disk_cache((gz_save && *gz_save) ? gz_save : NULL);
     }
 
@@ -529,7 +540,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
 static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
 {
-    FILE *f = fopen(path, "rb");
+    WCHAR wpath[MAX_PATH];
+    FILE *f = MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH) ? _wfopen(wpath, L"rb") : NULL;
     if (!f) {
         fprintf(stderr, "Cannot open XBE: %s\n", path);
         return FALSE;

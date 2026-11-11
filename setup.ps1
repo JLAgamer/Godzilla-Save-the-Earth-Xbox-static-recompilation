@@ -4,7 +4,8 @@
 
 .DESCRIPTION
   Nothing from the game ships with this repository. This script:
-    1. fetches the xboxrecomp toolkit (pinned version) and applies patches\xboxrecomp-v0.17.0.patch
+    1. fetches the xboxrecomp toolkit (pinned version) and applies patches\xboxrecomp-v0.17.0.patch,
+       and SDL3 (controllers) and Recomp Achievements (pinned versions) into third_party\
     2. extracts your disc image (or copies your extracted folder) into game\GodzillaSTE
     3. translates the game's default.xbe into C (src\recomp\gen)
     4. builds the patched menu bundles in mods\ from your ControlRoom.bdl
@@ -34,6 +35,10 @@ $ToolkitRepo = "https://github.com/sp00nznet/xboxrecomp.git"
 $ToolkitCommit = "343b6d8"                      # v0.17.0
 $Patch = Join-Path $Root "patches\xboxrecomp-v0.17.0.patch"
 $KnownXbeSha1 = "c2ef3448786662e5797a1d9e545b3859967c01ed"   # Godzilla: Save the Earth (USA, Europe)
+$Sdl3Version = "3.4.18"
+$Sdl3Sha256 = "78d84602ae616cfe26b33a73b7d3b9b6b56e8a6650e53d92c9c6ca938f747acd"   # SDL3-devel-3.4.18-VC.zip
+$AchRepo = "https://github.com/elripalda/RecompAchievements.git"
+$AchCommit = "9a23d1f749ae4586f3bdd166464943454fa4dc1a"
 
 function Step($text) { Write-Host "`n== $text" -ForegroundColor Cyan }
 # Windows PowerShell 5.1 turns anything a program writes to stderr into an error
@@ -82,6 +87,31 @@ try {
         Write-Host "patch applied"
     }
 } finally { Pop-Location }
+
+# -- libraries --------------------------------------------------------------------
+# SDL3 for controllers (zlib license; SDL3.dll goes next to the program). The
+# download is checked against its SHA-256 from the GitHub release.
+Step "SDL3 $Sdl3Version (controllers)"
+$sdlDir = Join-Path $Root "third_party\sdl3"
+if (-not (Test-Path (Join-Path $sdlDir "SDL3-$Sdl3Version\cmake\SDL3Config.cmake"))) {
+    $zip = Join-Path $Root "third_party\SDL3-devel-$Sdl3Version-VC.zip"
+    New-Item -ItemType Directory -Force (Split-Path $zip) | Out-Null
+    $prevProgress = $ProgressPreference; $ProgressPreference = "SilentlyContinue"
+    try { Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/libsdl-org/SDL/releases/download/release-$Sdl3Version/SDL3-devel-$Sdl3Version-VC.zip" -OutFile $zip }
+    finally { $ProgressPreference = $prevProgress }
+    $got = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+    if ($got -ne $Sdl3Sha256) { Remove-Item -Force $zip; throw "SDL3 download has SHA-256 $got, expected $Sdl3Sha256" }
+    Expand-Archive -Force $zip $sdlDir
+    Remove-Item -Force $zip
+} else { Write-Host "already there" }
+
+# Recomp Achievements (its own license, free to use in games: see its LICENSE).
+# Does nothing unless RecompLauncher started the game.
+Step "Recomp Achievements ($AchCommit)"
+$achDir = Join-Path $Root "third_party\RecompAchievements"
+if (-not (Test-Path (Join-Path $achDir ".git"))) { Run git @("clone", "-q", $AchRepo, $achDir) }
+Push-Location $achDir
+try { Run git @("-c", "advice.detachedHead=false", "checkout", "-q", $AchCommit) } finally { Pop-Location }
 
 # -- game files -----------------------------------------------------------------
 Step "Game files"

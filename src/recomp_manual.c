@@ -335,6 +335,8 @@ int  gz_movie_enabled(void);
 int  gz_movie_open(uint32_t obj, const char *xbox_path);
 int  gz_movie_update(uint32_t obj, uint8_t *dst);
 void gz_movie_tick(void);
+void gz_ach_frame(void);           /* gz_ach.c: achievements, once per frame */
+static void gz_pad_activity_tick(void);
 extern void sub_001F0650_gen(void);
 
 /* Skipped movies (no host playback): the title's own movie player still
@@ -564,17 +566,89 @@ void sub_00223560(void)
  *       g_eax = result;
  *   }
  */
+/* -- Match results, for achievements (gz_ach.c) -----------------------------
+ *
+ * The game's scripts reach native objects through per-class "invoke"
+ * functions: invoke(this = wrapper, method index, args, result), ret 0x14,
+ * reached only through vtables (so only indirect calls, which ask this lookup
+ * first). The wrapper's +4 is the object.
+ *   GameResults   invoke 0x00104330: 0 getPlayer(i) -> object + i * 0x3C,
+ *                 1 setVictoryAchieved, 2 victoryAchieved
+ *   PlayerResults invoke 0x00104260: 0 isVictorious, 1 getScore, 2 setScore,
+ *                 3 awardPoints, 4 setVictory (sub_000FE970: byte +0x34)
+ * A player's results are a 0x3C-byte record: +0x34 victory, +0x38 score. */
+#include <string.h>
+#ifndef GZ_GAMEINFO
+#define GZ_GAMEINFO 0x003F0958u      /* the match setup (see "Quick fight" below) */
+#endif
+void sub_00104260(void);
+void sub_00104330(void);
+void gz_ach_event(const char *name);
+int gz_net_on(void);
+static uint32_t gz_results_base;     /* the GameResults object = player 0's record */
+static int gz_results_won[4];
+
+/* "New_Tokyo_Main_DAY" -> "new_tokyo"; names in events are short and lower case. */
+static void gz_ach_name(const char *in, char *out, size_t n, int stop_at_main)
+{
+    size_t k = 0;
+    for (; *in && k + 1 < n; in++) {
+        if (stop_at_main && !strncmp(in, "_Main", 5)) break;
+        out[k++] = (*in >= 'A' && *in <= 'Z') ? (char)(*in + 32) : *in;
+    }
+    out[k] = 0;
+}
+
+/* The match is over (setVictoryAchieved(true)): events for player 1, the one
+ * on the first controller. */
+static void gz_match_over(void)
+{
+    const char *gi = (const char *)((uintptr_t)GZ_GAMEINFO + g_xbox_mem_offset);
+    uint32_t players = GZ_MEM32(GZ_GAMEINFO + 0x118);
+    char monster[40], city[72], ev[128];
+    int online = gz_net_on();
+    gz_ach_name(gi + 0x160, monster, sizeof monster, 0);
+    gz_ach_name(gi + 0xD0, city, sizeof city, 1);
+    fprintf(stderr, "[MATCH] over: %u players, player 1 (%s) %s, city %s%s\n", players, monster,
+            gz_results_won[0] ? "won" : "lost", city, online ? ", online" : "");
+    gz_ach_event("match_played");
+    if (online) gz_ach_event("online_match_played");
+    if (gz_results_won[0]) {
+        gz_ach_event("match_won");
+        snprintf(ev, sizeof ev, "match_won_%s", monster); gz_ach_event(ev);
+        snprintf(ev, sizeof ev, "match_won_city_%s", city); gz_ach_event(ev);
+        if (online) gz_ach_event("online_match_won");
+    }
+    memset(gz_results_won, 0, sizeof gz_results_won);
+}
+
+static void gz_game_results_invoke(void)
+{
+    uint32_t idx = GZ_MEM32(g_esp + 4), self = g_ecx, obj;
+    sub_00104330();
+    if (!self || (obj = GZ_MEM32(self + 4)) == 0) return;
+    gz_results_base = obj;
+    if (idx == 1 && (GZ_MEM32(obj + 0xF8) & 0xFF)) gz_match_over();   /* setVictoryAchieved(true) */
+}
+
+static void gz_player_results_invoke(void)
+{
+    uint32_t idx = GZ_MEM32(g_esp + 4), self = g_ecx;
+    sub_00104260();
+    if (idx == 4 && self) {                      /* setVictory */
+        uint32_t obj = GZ_MEM32(self + 4), off = obj - gz_results_base;
+        int won = (GZ_MEM32(obj + 0x34) & 0xFF) != 0;
+        if (gz_results_base && obj >= gz_results_base && off % 0x3C == 0 && off / 0x3C < 4)
+            gz_results_won[off / 0x3C] = won;
+        fprintf(stderr, "[MATCH] setVictory(%d) on results %08X (player %d)\n", won, obj,
+                gz_results_base && obj >= gz_results_base && off % 0x3C == 0 ? (int)(off / 0x3C) + 1 : 0);
+    }
+}
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
-    /*
-     * TODO: Add your overrides here. Examples:
-     *
-     * if (xbox_va == 0x00012345) return traced_sub_00012345;
-     * if (xbox_va == 0x00067890) return stub_00067890;
-     * if (xbox_va == 0x000ABCDE) return fixed_sub_000ABCDE;
-     */
-
-    (void)xbox_va;
+    if (xbox_va == 0x00104330u) return gz_game_results_invoke;
+    if (xbox_va == 0x00104260u) return gz_player_results_invoke;
     return (recomp_func_t)0;
 }
 
@@ -800,7 +874,9 @@ static const char *gz_qf_file(void)
     const char *f = getenv("GZ_QF_FILE");
     return (f && *f) ? f : "gz_quickfight.bin";
 }
+#ifndef GZ_GAMEINFO
 #define GZ_GAMEINFO 0x003F0958u
+#endif
 
 static void gz_qf_str(uint32_t va, const char *s, size_t max)
 {
@@ -822,6 +898,24 @@ static void gz_qf_str(uint32_t va, const char *s, size_t max)
 #include <xinput.h>
 extern void sub_0009AA20_gen(void);
 int usb_gamepad_report(int pad, uint8_t *out, int max);
+
+/* When a player last pressed or released a button (any pad), so a match the
+ * player started can be told from one the main menu's attract demo starts:
+ * the demo runs with nobody touching the controller. Called once per frame. */
+static DWORD gz_pad_last_change;
+static void gz_pad_activity_tick(void)
+{
+    static uint8_t last[4][10];
+    uint8_t rep[20];
+    int i;
+    for (i = 0; i < 4; i++) {
+        if (usb_gamepad_report(i, rep, sizeof rep) < 20) continue;
+        if (memcmp(last[i], rep + 2, 10)) {       /* digital and analog buttons */
+            memcpy(last[i], rep + 2, 10);
+            gz_pad_last_change = GetTickCount();
+        }
+    }
+}
 
 void sub_0009AA20(void)
 {
@@ -845,8 +939,13 @@ void sub_0009AA20(void)
             fprintf(stderr, "[BIOLLANTE] player %u plays Biollante\n", i + 1);
         }
     }
-    if (!gz_qf_launching) {
-        /* A match the menus set up: keep its setup for the quick-fight boot. */
+    /* A Versus match the menus set up (two or more players): keep its setup for
+     * the quick-fight boot. Not a single-player mode's: replayed without the
+     * menus it has no profile, and its save at the end of the match (a save
+     * with no name) never finishes. Not the attract demo's either (nobody has
+     * touched a controller for 10 s): replayed, it goes back to the menu. */
+    if (!gz_qf_launching && players >= 2 && GZ_MEM32(GZ_GAMEINFO + 0x238) != 0
+            && gz_pad_last_change && GetTickCount() - gz_pad_last_change < 10000) {
         FILE *f = fopen(gz_qf_file(), "wb");
         if (f) {
             fwrite((const void *)((uintptr_t)GZ_GAMEINFO + g_xbox_mem_offset), 1, GZ_GAMEINFO_SIZE, f);
@@ -941,6 +1040,15 @@ static void gz_quick_fight_tick(void)
             return;
         }
         fclose(f);
+        {
+            uint32_t players;
+            memcpy(&players, blob + 0x118, 4);
+            if (players < 2 || !blob[0x238]) {
+                fprintf(stderr, "[QUICKFIGHT] %s holds a single-player setup (from an older version): "
+                        "start one Versus match from the menus first, and quick fight will replay that\n", gz_qf_file());
+                return;
+            }
+        }
         for (i = 0; i < sizeof blob; i++) gi[i] = blob[i];
         GZ_MEM32(GZ_GAMEINFO + 0x138) = GetTickCount();        /* random seed */
         if (p1 && *p1) { gz_qf_str(GZ_GAMEINFO + 0x160, p1, 0x1F); gz_qf_str(GZ_GAMEINFO + 0x17F, p1, 0x1F); }
@@ -1565,6 +1673,8 @@ void sub_00012240(void)
     gz_biollante_slot_tick();
     gz_movie_tick();
     gz_movie_mute_tick();
+    gz_ach_frame();
+    gz_pad_activity_tick();
     {
         /* GZ_RATE=<n>: the game derives its frame period as 1 / (unsigned)
          * MEM32(0x4323A0) (sub_00012590). Overriding that rate is how to run

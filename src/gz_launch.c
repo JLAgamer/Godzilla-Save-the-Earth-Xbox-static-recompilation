@@ -626,17 +626,24 @@ static void set_env_default(const char *name, const char *value)
 /* The last log is renamed <file>.1, the one before <file>.2. */
 static void open_log(const WCHAR *path)
 {
-    WCHAR a[MAX_PATH], b[MAX_PATH], dir[MAX_PATH], *slash;
+    WCHAR p[MAX_PATH], a[MAX_PATH], b[MAX_PATH], dir[MAX_PATH], *c, *slash;
     FILE *f;
-    wcsncpy_s(dir, MAX_PATH, path, _TRUNCATE);
-    if ((slash = wcsrchr(dir, L'\\')) != NULL || (slash = wcsrchr(dir, L'/')) != NULL) { *slash = 0; make_dirs(dir); }
-    swprintf_s(a, MAX_PATH, L"%s.1", path);
-    swprintf_s(b, MAX_PATH, L"%s.2", path);
+    /* RecompLauncher writes "{install}/logs/x.log": a backslash path with
+     * forward slashes after it. One kind, so the folder is found. */
+    wcsncpy_s(p, MAX_PATH, path, _TRUNCATE);
+    for (c = p; *c; c++) if (*c == L'/') *c = L'\\';
+    wcsncpy_s(dir, MAX_PATH, p, _TRUNCATE);
+    if ((slash = wcsrchr(dir, L'\\')) != NULL) { *slash = 0; make_dirs(dir); }
+    swprintf_s(a, MAX_PATH, L"%s.1", p);
+    swprintf_s(b, MAX_PATH, L"%s.2", p);
     MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING);
-    MoveFileExW(path, a, MOVEFILE_REPLACE_EXISTING);
-    if ((f = _wfopen(path, L"w")) != NULL) fclose(f);
-    _wfreopen(path, L"a", stderr);         /* both streams append to one file */
-    _wfreopen(path, L"a", stdout);
+    MoveFileExW(p, a, MOVEFILE_REPLACE_EXISTING);
+    /* Only redirect when the file opens: a failed freopen closes the stream,
+     * and the next line written to it ends the program. */
+    if ((f = _wfopen(p, L"w")) == NULL) return;
+    fclose(f);
+    _wfreopen(p, L"a", stderr);            /* both streams append to one file */
+    _wfreopen(p, L"a", stdout);
 }
 
 static int folder_writable(const WCHAR *dir)
@@ -711,6 +718,46 @@ int gz_launch_init(void)
         else if (!wcscmp(a, L"--render-scale") && v) { _putenv_s("GZ_RENDER_SCALE", v8); i++; }
         else if (!wcscmp(a, L"--aniso") && v) { _putenv_s("GZ_ANISO", v8); i++; }
         else if (!wcscmp(a, L"--movies") && v) { _putenv_s("GZ_MOVIES", v8); i++; }
+    }
+
+    /* Started on its own (the exe double-clicked: no options, and not from
+     * play.bat or a test script, which set RECOMP_USB): play the copy
+     * Play.bat remembered, or the unpacked one next to the program. Before,
+     * this ran without the setup play.bat makes and never opened a window. */
+    if (!game && !prepare && !getenv("RECOMP_USB")) {
+        static WCHAR found[MAX_PATH], logp[MAX_PATH];
+        WCHAR p[MAX_PATH];
+        char line[MAX_PATH * 2];
+        FILE *f;
+        swprintf_s(p, MAX_PATH, L"%s\\game_path.txt", s_exe_dir);
+        if ((f = _wfopen(p, L"r")) != NULL) {
+            if (fgets(line, sizeof line, f)) {
+                size_t n = strlen(line);
+                while (n && (line[n - 1] == '\n' || line[n - 1] == '\r' || line[n - 1] == ' ')) line[--n] = 0;
+                if (n && MultiByteToWideChar(CP_OEMCP, 0, line, -1, found, MAX_PATH)
+                        && GetFileAttributesW(found) != INVALID_FILE_ATTRIBUTES)
+                    game = found;
+            }
+            fclose(f);
+        }
+        if (!game) {
+            swprintf_s(p, MAX_PATH, L"%s\\game\\GodzillaSTE\\default.xbe", s_exe_dir);
+            if (file_exists(p)) {
+                swprintf_s(found, MAX_PATH, L"%s\\game\\GodzillaSTE", s_exe_dir);
+                game = found;
+            }
+        }
+        if (!game) {
+            MessageBoxW(NULL, L"Drag your Godzilla: Save the Earth disc image or game folder onto Play.bat "
+                              L"(next to this program), or start the game from RecompLauncher.",
+                        L"Godzilla: Save the Earth", MB_ICONINFORMATION);
+            LocalFree(argv);
+            return 1;
+        }
+        if (!log) {
+            swprintf_s(logp, MAX_PATH, L"%s\\logs\\godzilla.log", s_exe_dir);
+            log = logp;
+        }
     }
 
     if (log) open_log(log);

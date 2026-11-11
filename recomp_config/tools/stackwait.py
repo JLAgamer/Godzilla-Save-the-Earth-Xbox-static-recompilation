@@ -45,7 +45,24 @@ N = int(sys.argv[3]) if len(sys.argv) > 3 else 300
 DEPTH = int(sys.argv[4]) if len(sys.argv) > 4 else 3
 tot = collections.Counter(); inexe = collections.Counter(); wait = {t: collections.Counter() for t in tids}
 top = {t: collections.Counter() for t in tids}
+import os
+BUSY = os.environ.get('SWBUSY') == '1'   # SWBUSY=1: also list the stacks of busy samples
+busy = {t: collections.Counter() for t in tids}
+COND = os.environ.get('SWCOND')   # SWCOND=<function>: what every thread does while some thread has it on its stack
+cond = {t: collections.Counter() for t in tids}; cond_rounds = 0
+def stack_of(h, c, first):
+    buf = (ctypes.c_ulonglong * 512)(); got = ctypes.c_size_t()
+    k.ReadProcessMemory(w.HANDLE(hp), ctypes.c_void_p(c.Rsp), buf, 4096, ctypes.byref(got))
+    seen = list(first)
+    for v in buf:
+        if base <= v < base + mi.size:
+            f = name(v).split('+')[0]
+            if f.startswith(('s_', '??', '__')): continue   # data, not code
+            if f not in seen: seen.append(f)
+            if len(seen) >= max(DEPTH, 8): break
+    return seen
 for _ in range(N):
+    desc = {}
     for t in tids:
         h = k.OpenThread(0x004A, False, t)
         if not h: continue
@@ -54,20 +71,29 @@ for _ in range(N):
             if k.GetThreadContext(w.HANDLE(h), ctypes.byref(c)):
                 tot[t] += 1
                 if base <= c.Rip < base + mi.size:
-                    inexe[t] += 1; top[t][name(c.Rip).split('+')[0]] += 1
+                    leaf = name(c.Rip).split('+')[0]
+                    inexe[t] += 1; top[t][leaf] += 1
+                    st = stack_of(h, c, [leaf]) if (BUSY or COND) else [leaf]
+                    if BUSY: busy[t][' < '.join(st[:DEPTH])] += 1
+                    desc[t] = ('busy', st)
                 else:
-                    buf = (ctypes.c_ulonglong * 512)(); got = ctypes.c_size_t()
-                    k.ReadProcessMemory(w.HANDLE(hp), ctypes.c_void_p(c.Rsp), buf, 4096, ctypes.byref(got))
-                    fr = [name(v).split('+')[0] for v in buf if base <= v < base + mi.size]
-                    seen = []
-                    for f in fr:
-                        if f not in seen: seen.append(f)
-                        if len(seen) == DEPTH: break
-                    wait[t][' < '.join(seen) or '(no exe frame)'] += 1
+                    st = stack_of(h, c, [])
+                    wait[t][' < '.join(st[:DEPTH]) or '(no exe frame)'] += 1
+                    desc[t] = ('wait', st)
             k.ResumeThread(w.HANDLE(h))
         k.CloseHandle(w.HANDLE(h))
+    if COND and any(COND in st for _, st in desc.values()):
+        cond_rounds += 1
+        for t, (kind, st) in desc.items():
+            cond[t]['%s %s' % (kind, ' < '.join(st[:DEPTH]) or '(no exe frame)')] += 1
     time.sleep(0.005)
 for t in sorted(tids, key=lambda t: -inexe[t])[:5]:
     print('thread %d: %d samples, %d%% in exe' % (t, tot[t], 100 * inexe[t] // max(1, tot[t])))
     print('   busy in:', ', '.join('%s %d' % kv for kv in top[t].most_common(8)))
     for kv in wait[t].most_common(8): print('   waiting %4d  %s' % (kv[1], kv[0]))
+    for kv in busy[t].most_common(30): print('   busy    %4d  %s' % (kv[1], kv[0]))
+if COND:
+    print('while %s is on a stack: %d rounds' % (COND, cond_rounds))
+    for t in sorted(tids, key=lambda t: -inexe[t])[:3]:
+        print(' thread %d' % t)
+        for kv in cond[t].most_common(14): print('   %4d  %s' % (kv[1], kv[0]))

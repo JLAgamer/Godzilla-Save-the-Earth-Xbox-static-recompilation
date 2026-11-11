@@ -118,6 +118,8 @@ try {
     Run py @("-3", "-m", "tools.recomp", "game_files/default.xbe", "--all", "--split", "250",
              "--gen-dir", $gen, "--exclude-manual", (Join-Path $Root "src\recomp_manual.c"))
 } finally { Pop-Location }
+# sound-chip register writes without the trap (see the script)
+Run py @("-3", (Join-Path $Root "recomp_config\tools\fast_mmio.py"), $gen)
 
 # -- menu mods (built from your own ControlRoom.bdl) -------------------------------
 Step "Menu additions (Options entries, Biollante cell)"

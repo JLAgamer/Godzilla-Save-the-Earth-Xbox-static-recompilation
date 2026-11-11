@@ -51,7 +51,15 @@ extern ptrdiff_t g_xbox_mem_offset;
 
 static int s_rcdbg;
 static int s_scale = 1, s_win_scale = 2, s_vsync, s_cull, s_trace, s_readback;
+/* GZ_PACE_LOG: where a slow frame's time went on this thread (microseconds). */
+static LONGLONG stat_qpc_us(void);
+static LONGLONG s_h_map, s_h_map_max, s_h_present, s_h_last_flip, s_h_tex, s_h_flip_t0;
+static LONGLONG s_h_be[3]; static UINT s_h_ben[3];
+static UINT     s_h_discards;
 static int s_aniso = 16;   /* GZ_ANISO: >1 = mip chain + anisotropic filtering on linear textures */
+#define GZ_SWAP_ALLOW_TEARING    2048u   /* DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING */
+#define GZ_PRESENT_ALLOW_TEARING 0x200u  /* DXGI_PRESENT_ALLOW_TEARING */
+static int s_tearing;
 static int s_fullscreen;   /* GZ_FULLSCREEN=1: borderless window over the primary monitor */
 /* Widescreen (Options > aspect, GZ_WIDE): the game renders its 640x480 frame
  * with a 16:9 camera (recomp_manual.c widens the projection), so the frame is
@@ -125,6 +133,7 @@ static ID3D11Buffer       *s_vb, *s_cb;
 /* GPU vertex programs (be_draw_program). */
 static ID3D11VertexShader *s_vs_prog;
 static ID3D11InputLayout  *s_layout_prog;
+static ID3DBlob           *s_prog_blob;
 static ID3D11Buffer       *s_cb_prog, *s_cb_const, *s_cb_draw, *s_vb2, *s_ib;
 static UINT                s_vb2_size, s_vb2_pos, s_ib_size, s_ib_pos;
 static uint32_t            s_prog_rev_up = 0xFFFFFFFFu, s_const_rev_up = 0xFFFFFFFFu;
@@ -155,6 +164,7 @@ typedef struct {
 
 typedef struct {
     uint32_t offset, w, h, color, hash, frame, used, cube;
+    uint32_t tick;                      /* GetTickCount() of the last content hash */
     unsigned gen;                       /* gz_opt_generation() it was decoded under */
     ID3D11Texture2D          *tex;
     ID3D11ShaderResourceView *srv;
@@ -204,7 +214,29 @@ static const char s_hlsl[] =
 "  uint4 stage[8];       /* color_icw, alpha_icw, color_ocw, alpha_ocw */\n"
 "  float4 factor0[8]; float4 factor1[8];\n"
 "  float4 wide;         /* 2D in widescreen: x squeeze (0 = off) about x = y; height scale z about y = w */\n"
+"  float4 dbg;          /* x: GZ_DEBUG_ZOOM, scale of 3D geometry about the screen centre (1 = off) */\n"
 "};\n"
+"/* SPEC: a pixel shader compiled for one combiner setup. Everything that\n"
+" * steers control flow is a constant, so the interpreter below folds into\n"
+" * straight code (ps_variant in the C source). */\n"
+"#ifdef SPEC\n"
+"static const uint4 k_fin = uint4(SPEC_FIN);\n"
+"static const uint4 k_misc = uint4(SPEC_MISC);\n"
+"static const uint4 k_stage[8] = { SPEC_STAGE };\n"
+"static const float k_bound[4] = { SPEC_BOUND };\n"
+"#define fin k_fin\n"
+"#define misc k_misc\n"
+"#define stage k_stage\n"
+"#define rc_on SPEC_RC\n"
+"#define tex0_on SPEC_T0\n"
+"#define alpha_func SPEC_AF\n"
+"#define zclip_on SPEC_ZC\n"
+"#define TS(n) float4(tex_scale[n].xy, k_bound[n], tex_scale[n].w)\n"
+"#define RC_LOOP [unroll(8)]\n"
+"#else\n"
+"#define TS(n) tex_scale[n]\n"
+"#define RC_LOOP [loop]\n"
+"#endif\n"
 "struct VI { float3 p : POSITION; float rhw : TEXCOORD1; float4 c : COLOR0; float2 uv : TEXCOORD0;\n"
 "            float4 spec : COLOR1; float fog : TEXCOORD2;\n"
 "            float4 tc0 : TEXCOORD3; float4 tc1 : TEXCOORD4; float4 tc2 : TEXCOORD5; float4 tc3 : TEXCOORD6; };\n"
@@ -220,6 +252,7 @@ static const char s_hlsl[] =
 "  if (wide.x > 0.0 && abs(w - 1.0) < 1e-3) py = wide.w + (py - wide.w) * wide.z;\n"
 "  float y = 1.0 - py * inv_size.y * 2.0;\n"
 "  float z = saturate(i.p.z * zscale);\n"
+"  if (abs(w - 1.0) >= 1e-3) { x *= dbg.x; y *= dbg.x; }\n"
 "  o.p = float4(x * w, y * w, z * w, w); o.c = i.c; o.uv = i.uv * tex0_inv; o.zr = float2(i.p.z * w, w);\n"
 "  o.spec = i.spec; o.fog = i.fog; o.tc0 = i.tc0; o.tc1 = i.tc1; o.tc2 = i.tc2; o.tc3 = i.tc3;\n"
 "  return o;\n"
@@ -280,7 +313,7 @@ static const char s_hlsl[] =
 "  R[3] = float4(fog_color.rgb, fogf); R[4] = v0; R[5] = v1;\n"
 "  R[8] = t0; R[9] = t1; R[10] = t2; R[11] = t3;\n"
 "  R[12].a = (fin.w & 31) ? t0.a : 1.0;\n"
-"  [loop] for (s = 0; s < n; s++) {\n"
+"  RC_LOOP for (s = 0; s < n; s++) {\n"
 "    uint4 sw = stage[s]; uint icw = sw.x, aicw = sw.y, ocw = sw.z, aocw = sw.w;\n"
 "    uint fl = ocw >> 12, afl = aocw >> 12, om = fl & 0x38, aom = afl & 0x38;\n"
 "    R[1] = factor0[(flags & 0x10) ? s : 0]; R[2] = factor1[(flags & 0x100) ? s : 0];\n"
@@ -334,7 +367,7 @@ static const char s_hlsl[] =
 "  if (zclip_on > 0.5 && (zr < zmin || zr > zmax)) discard;\n"
 "  if (rc_on > 0.5) {\n"
 "    uint sp = fin.w;\n"
-"    float4 t0 = fetch(sp & 31, i.tc0, tex_scale[0], tx0, cx0, sm0, 0);\n"
+"    float4 t0 = fetch(sp & 31, i.tc0, TS(0), tx0, cx0, sm0, 0);\n"
 "    /* Dot-product stage modes (xemu psh.c): 17 DOT_PRODUCT feeds a later\n"
 "     * stage; 9 DOT_ST (2D lookup), 11 DOT_REFLECT_DIFFUSE, 12\n"
 "     * DOT_REFLECT_SPECULAR and 14 DOT_STR_CUBE look the last stage's\n"
@@ -348,14 +381,14 @@ static const char s_hlsl[] =
 "    float4 t1, t2, t3;\n"
 "    float d1 = 0.0, d2 = 0.0, d3 = 0.0;\n"
 "    if (m1 == 17) { d1 = dot(i.tc1.xyz, dotmap(t0.rgb, misc.z & 15)); t1 = float4(0, 0, 0, 0); }\n"
-"    else t1 = fetch(m1, i.tc1, tex_scale[1], tx1, cx1, sm1, 1);\n"
+"    else t1 = fetch(m1, i.tc1, TS(1), tx1, cx1, sm1, 1);\n"
 "    float4 in2 = (((misc.w >> 16) & 15) == 1) ? t1 : t0;\n"
 "    if (m2 == 17) { d2 = dot(i.tc2.xyz, dotmap(in2.rgb, (misc.z >> 4) & 15)); t2 = float4(0, 0, 0, 0); }\n"
 "    else if (m2 == 9) {\n"
 "      d2 = dot(i.tc2.xyz, dotmap(in2.rgb, (misc.z >> 4) & 15));\n"
-"      t2 = tex_scale[2].z > 0.5 ? tx2.Sample(sm2, float2(d1, d2)) : float4(1, 1, 1, 1);\n"
+"      t2 = TS(2).z > 0.5 ? tx2.Sample(sm2, float2(d1, d2)) : float4(1, 1, 1, 1);\n"
 "    }\n"
-"    else t2 = fetch(m2, i.tc2, tex_scale[2], tx2, cx2, sm2, 2);\n"
+"    else t2 = fetch(m2, i.tc2, TS(2), tx2, cx2, sm2, 2);\n"
 "    uint o3 = (misc.w >> 20) & 15;\n"
 "    float4 in3 = (o3 == 2) ? t2 : ((o3 == 1) ? t1 : t0);\n"
 "    if (m3 == 11 || m3 == 12 || m3 == 14) {\n"
@@ -365,10 +398,10 @@ static const char s_hlsl[] =
 "        float3 eye = float3(i.tc1.w, i.tc2.w, i.tc3.w);\n"
 "        dir = 2.0 * dot(nrm, eye) / max(dot(nrm, nrm), 1e-12) * nrm - eye;\n"
 "      }\n"
-"      if (tex_scale[3].z > 1.5) t3 = cx3.Sample(sm3, dir);\n"
+"      if (TS(3).z > 1.5) t3 = cx3.Sample(sm3, dir);\n"
 "      else t3 = float4(1, 1, 1, 1);\n"
 "    }\n"
-"    else t3 = fetch(m3, i.tc3, tex_scale[3], tx3, cx3, sm3, 3);\n"
+"    else t3 = fetch(m3, i.tc3, TS(3), tx3, cx3, sm3, 3);\n"
 "    c = combine(i.c, i.spec, saturate(i.fog), t0, t1, t2, t3);\n"
 "    if (misc.y == 1) c = t0; else if (misc.y == 2) c = i.c; else if (misc.y == 3) c = float4(i.fog.xxx, 1);\n"
 "    else if (misc.y == 4) c = float4(R[12].rgb, 1);\n"
@@ -509,6 +542,7 @@ static const char s_hlsl[] =
 "   * vertex just in front of the camera made the near water fail the depth\n"
 "   * test and the riverbed show through, as a green flash). With depth clip\n"
 "   * off, the rasterizer clamps each pixel's depth to [0, 1] instead. */\n"
+"  if (abs(pw - 1.0) >= 1e-3) { x *= dbg.x; y *= dbg.x; }\n"
 "  o.p = float4(x * pw, y * pw, pos.z * zscale * pw, pw);\n"
 "  o.zr = float2(pos.z * pw, pw);\n"
 "  o.cd = float2(pw - vparam.z, vinfo.y ? (pos.z - cst[59].z) * pw : 1.0);\n"
@@ -549,7 +583,214 @@ typedef struct {
     uint32_t stage[8][4];       /* color_icw, alpha_icw, color_ocw, alpha_ocw */
     float    factor0[8][4], factor1[8][4];
     float    wide[4];           /* 2D in widescreen: x squeeze (0 = off) about x = [1]; height x [2] about y = [3] */
+    float    dbg[4];            /* [0]: GZ_DEBUG_ZOOM */
 } Consts;
+
+/* ---- Pixel shader variants ------------------------------------------------
+ * ps_main interprets the combiner per pixel (register file, up to 8 stages,
+ * four texture modes): fine at 60 fps, the limit at 240 fps and high internal
+ * resolutions. Each distinct setup (PsKey) is also compiled as its own
+ * shader with that setup baked in; a worker thread compiles (or loads from
+ * shader_cache/) while the generic shader draws, so nothing waits for it.
+ * GZ_PS_SPEC=0: generic shader only. */
+typedef struct {
+    uint32_t rc_on, tex0_on, alpha_func, zclip_on;
+    uint32_t fin[4], misc[4], stage[8][4], bound[4];
+} PsKey;
+typedef struct {
+    PsKey key;
+    uint64_t hash;
+    volatile LONG state;                /* 0 empty, 1 queued, 2 ready, 3 failed */
+    ID3D11PixelShader *ps;
+} PsVar;
+#define PS_VARS 1024
+static PsVar  s_psv[PS_VARS];
+static PsKey  s_ps_key;                 /* of the draw being set up (set_consts) */
+static int    s_ps_spec = -1;
+static HANDLE s_ps_event;
+static volatile LONG s_ps_queue[PS_VARS], s_ps_qhead, s_ps_qtail;
+static uint64_t s_ps_src_hash;
+
+static uint64_t fnv64(const void *d, size_t n, uint64_t h)
+{
+    const uint8_t *p = (const uint8_t *)d;
+    while (n--) h = (h ^ *p++) * 1099511628211ull;
+    return h;
+}
+
+static void ps_compile(PsVar *v)
+{
+    char path[MAX_PATH], fin[96], misc[96], stage[8 * 64], bound[64], rc[8], t0[8], af[16], zc[8];
+    D3D_SHADER_MACRO mac[10];
+    ID3DBlob *blob = NULL, *err = NULL;
+    const PsKey *k = &v->key;
+    void *code = NULL;
+    size_t size = 0;
+    FILE *f;
+    int i, n = 0;
+
+    snprintf(path, sizeof path, "shader_cache/%016llX.cso", (unsigned long long)v->hash);
+    {
+        snprintf(fin, sizeof fin, "%uu,%uu,%uu,%uu", k->fin[0], k->fin[1], k->fin[2], k->fin[3]);
+        snprintf(misc, sizeof misc, "%uu,%uu,%uu,%uu", k->misc[0], k->misc[1], k->misc[2], k->misc[3]);
+        for (i = 0; i < 8; i++)
+            n += snprintf(stage + n, sizeof stage - (size_t)n, "%suint4(%uu,%uu,%uu,%uu)", i ? "," : "",
+                          k->stage[i][0], k->stage[i][1], k->stage[i][2], k->stage[i][3]);
+        snprintf(bound, sizeof bound, "%u.0,%u.0,%u.0,%u.0", k->bound[0], k->bound[1], k->bound[2], k->bound[3]);
+        snprintf(rc, sizeof rc, "%u.0", k->rc_on); snprintf(t0, sizeof t0, "%u.0", k->tex0_on);
+        snprintf(af, sizeof af, "%u.0", k->alpha_func); snprintf(zc, sizeof zc, "%u.0", k->zclip_on);
+        mac[0].Name = "SPEC"; mac[0].Definition = "1";
+        mac[1].Name = "SPEC_FIN"; mac[1].Definition = fin;
+        mac[2].Name = "SPEC_MISC"; mac[2].Definition = misc;
+        mac[3].Name = "SPEC_STAGE"; mac[3].Definition = stage;
+        mac[4].Name = "SPEC_BOUND"; mac[4].Definition = bound;
+        mac[5].Name = "SPEC_RC"; mac[5].Definition = rc;
+        mac[6].Name = "SPEC_T0"; mac[6].Definition = t0;
+        mac[7].Name = "SPEC_AF"; mac[7].Definition = af;
+        mac[8].Name = "SPEC_ZC"; mac[8].Definition = zc;
+        mac[9].Name = NULL; mac[9].Definition = NULL;
+        if (FAILED(D3DCompile(s_hlsl, sizeof s_hlsl - 1, "gz_gpu_spec", mac, NULL, "ps_main", "ps_5_0",
+                              D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &err))) {
+            static LONG shown;
+            if (InterlockedIncrement(&shown) <= 4)
+                fprintf(stderr, "[GPU-D3D11] shader variant %016llX failed: %s\n", (unsigned long long)v->hash,
+                        err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+            if (err) ID3D10Blob_Release(err);
+            InterlockedExchange(&v->state, 3);
+            return;
+        }
+        if (err) ID3D10Blob_Release(err);
+        CreateDirectoryA("shader_cache", NULL);
+        if ((f = fopen(path, "wb")) != NULL) {
+            /* header: magic, shader source hash, key; then the bytecode (ps_preload) */
+            fwrite("GZPS", 1, 4, f);
+            fwrite(&s_ps_src_hash, 1, sizeof s_ps_src_hash, f);
+            fwrite(k, 1, sizeof *k, f);
+            fwrite(ID3D10Blob_GetBufferPointer(blob), 1, ID3D10Blob_GetBufferSize(blob), f);
+            fclose(f);
+        }
+    }
+    (void)code; (void)size;
+    if (SUCCEEDED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(blob),
+                                                 ID3D10Blob_GetBufferSize(blob), NULL, &v->ps)))
+        InterlockedExchange(&v->state, 2);
+    else
+        InterlockedExchange(&v->state, 3);
+    if (blob) ID3D10Blob_Release(blob);
+}
+
+/* Create every variant an earlier run compiled (shader_cache/), before the
+ * worker thread exists: the driver then has them ready long before a fight
+ * needs them, instead of stalling the first frame that uses each. */
+static void ps_preload(void)
+{
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA("shader_cache/*.cso", &fd);
+    unsigned loaded = 0, stale = 0;
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        char path[MAX_PATH], magic[4];
+        uint64_t src;
+        PsKey key;
+        uint8_t *code;
+        long size;
+        uint32_t i, at;
+        uint64_t hh;
+        FILE *f;
+        snprintf(path, sizeof path, "shader_cache/%s", fd.cFileName);
+        if (!(f = fopen(path, "rb"))) continue;
+        fseek(f, 0, SEEK_END); size = ftell(f) - (long)(4 + sizeof src + sizeof key); fseek(f, 0, SEEK_SET);
+        if (size <= 0 || size > (1 << 20) || fread(magic, 1, 4, f) != 4 || memcmp(magic, "GZPS", 4)
+                || fread(&src, 1, sizeof src, f) != sizeof src || src != s_ps_src_hash
+                || fread(&key, 1, sizeof key, f) != sizeof key || !(code = (uint8_t *)malloc((size_t)size))) {
+            fclose(f);
+            stale++;
+            DeleteFileA(path);                  /* an older shader source: never used again */
+            continue;
+        }
+        if (fread(code, 1, (size_t)size, f) == (size_t)size) {
+            hh = fnv64(&key, sizeof key, s_ps_src_hash);
+            at = (uint32_t)(hh ^ (hh >> 32)) % PS_VARS;
+            for (i = 0; i < 16; i++, at = (at + 1) % PS_VARS) {
+                PsVar *v = &s_psv[at];
+                if (v->state) continue;
+                if (SUCCEEDED(ID3D11Device_CreatePixelShader(s_dev, code, (SIZE_T)size, NULL, &v->ps))) {
+                    v->key = key; v->hash = hh; v->state = 2;
+                    loaded++;
+                }
+                break;
+            }
+        }
+        free(code);
+        fclose(f);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    fprintf(stderr, "[GPU-D3D11] %u pixel shader variant(s) loaded from shader_cache, %u stale removed\n", loaded, stale);
+}
+
+static DWORD WINAPI ps_worker(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        WaitForSingleObject(s_ps_event, INFINITE);
+        while (s_ps_qtail != s_ps_qhead) {
+            LONG slot = s_ps_queue[s_ps_qtail % PS_VARS];
+            ps_compile(&s_psv[slot]);
+            InterlockedIncrement(&s_ps_qtail);
+        }
+    }
+}
+
+/* The shader for the draw whose constants were just set: its variant once
+ * compiled, the generic interpreter until then. */
+static ID3D11PixelShader *ps_variant(void)
+{
+    uint64_t h;
+    uint32_t i, at;
+    if (s_ps_spec < 0) {
+        s_ps_spec = env_int("GZ_PS_SPEC", 1, 0, 1);
+        if (s_ps_spec) {
+            s_ps_src_hash = fnv64(s_hlsl, sizeof s_hlsl - 1, 14695981039346656037ull);
+            ps_preload();
+            s_ps_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+            if (!s_ps_event || !CreateThread(NULL, 0, ps_worker, NULL, 0, NULL)) s_ps_spec = 0;
+        }
+    }
+    if (!s_ps_spec) return s_ps;
+    {
+        static PsKey last_key;
+        static PsVar *last;
+        if (last && last->state == 2 && !memcmp(&last_key, &s_ps_key, sizeof s_ps_key)) return last->ps;
+        last = NULL;
+        h = fnv64(&s_ps_key, sizeof s_ps_key, s_ps_src_hash);
+        at = (uint32_t)(h ^ (h >> 32)) % PS_VARS;
+        for (i = 0; i < 16; i++, at = (at + 1) % PS_VARS) {
+            PsVar *v = &s_psv[at];
+            if (v->state == 0) break;
+            if (v->hash == h && !memcmp(&v->key, &s_ps_key, sizeof s_ps_key)) {
+                if (v->state != 2) return s_ps;
+                last = v; last_key = s_ps_key;
+                return v->ps;
+            }
+        }
+    }
+    at = (uint32_t)(h ^ (h >> 32)) % PS_VARS;
+    for (i = 0; i < 16; i++, at = (at + 1) % PS_VARS) {
+        PsVar *v = &s_psv[at];
+        if (v->state == 0) {
+            if (s_ps_qhead - s_ps_qtail >= PS_VARS - 1) return s_ps;      /* queue full: later */
+            v->key = s_ps_key; v->hash = h;
+            InterlockedExchange(&v->state, 1);
+            s_ps_queue[s_ps_qhead % PS_VARS] = (LONG)at;
+            InterlockedIncrement(&s_ps_qhead);
+            SetEvent(s_ps_event);
+            return s_ps;
+        }
+        if (v->hash == h && !memcmp(&v->key, &s_ps_key, sizeof s_ps_key))
+            return v->state == 2 ? v->ps : s_ps;
+    }
+    return s_ps;
+}
 
 static void unpack_argb(uint32_t c, float o[4])
 {
@@ -654,7 +895,7 @@ static int init_device(void)
     }
 
     memset(&sd, 0, sizeof sd);
-    sd.BufferCount       = 2;
+    sd.BufferCount       = 3;
     sd.BufferDesc.Width  = s_win_w;
     sd.BufferDesc.Height = s_win_h;
     sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -664,8 +905,19 @@ static int init_device(void)
     sd.Windowed          = TRUE;
     sd.SwapEffect        = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
+    /* Tearing-capable swap chain: without it a flip-model present with
+     * vsync off still waits for the compositor once it has a frame queued,
+     * which stalled presents for 6-28 ms several times a second above the
+     * display's refresh rate. GZ_TEARING=0 creates it the old way. */
+    s_tearing = env_int("GZ_TEARING", 1, 0, 1);
+    if (s_tearing) sd.Flags = GZ_SWAP_ALLOW_TEARING;
     hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, &fl, 1,
                                        D3D11_SDK_VERSION, &sd, &s_swap, &s_dev, &got, &s_ctx);
+    if (FAILED(hr) && s_tearing) {
+        s_tearing = 0; sd.Flags = 0;
+        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, &fl, 1,
+                                           D3D11_SDK_VERSION, &sd, &s_swap, &s_dev, &got, &s_ctx);
+    }
     if (FAILED(hr)) {
         fprintf(stderr, "[GPU-D3D11] D3D11CreateDeviceAndSwapChain failed 0x%08lX\n", (unsigned long)hr);
         return 0;
@@ -700,7 +952,7 @@ static int init_device(void)
                                                             ID3D10Blob_GetBufferSize(pb), NULL, &s_vs_prog));
             ok &= SUCCEEDED(ID3D11Device_CreateInputLayout(s_dev, el, 16, ID3D10Blob_GetBufferPointer(pb),
                                                            ID3D10Blob_GetBufferSize(pb), &s_layout_prog));
-            ID3D10Blob_Release(pb);
+            s_prog_blob = pb;               /* kept: layouts per packed mask are made on demand */
             memset(&bd, 0, sizeof bd);
             bd.Usage = D3D11_USAGE_DYNAMIC; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
             bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -924,6 +1176,24 @@ static Ds *ds_get(uint32_t va, uint32_t w, uint32_t h)
     return d;
 }
 
+/* What the device context holds from the last program draw. A frame is one
+ * to two thousand program draws in a row, most of them with the same shaders,
+ * textures and states as the one before: with ok set, a state is sent only
+ * when it differs. Anything else that draws (be_draw, be_clear, be_flip)
+ * clears ok, and the next program draw sends everything again.
+ * GZ_STATE_CACHE=0: always send. */
+static struct {
+    int ok;
+    ID3D11ShaderResourceView *srvs[8];
+    ID3D11SamplerState *smps[4];
+    ID3D11PixelShader *ps;
+    ID3D11BlendState *blend; float bf[4];
+    ID3D11DepthStencilState *depth; UINT ref;
+    ID3D11InputLayout *layout;
+    ID3D11Buffer *ib;
+} s_sc;
+static int s_sc_on = -1;
+
 static void bind_targets(Rt *r, Ds *d)
 {
     D3D11_VIEWPORT vp;
@@ -931,6 +1201,7 @@ static void bind_targets(Rt *r, Ds *d)
 
     if (r == s_bound_rt && d == s_bound_ds) return;
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &null_srv);  /* RT may have been sampled */
+    s_sc.ok = 0;
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &r->rtv, d ? d->dsv : NULL);
     vp.TopLeftX = 0; vp.TopLeftY = 0;
     vp.Width = (FLOAT)PX_W(r->w, r->h); vp.Height = (FLOAT)(r->h * (UINT)s_scale);
@@ -1123,7 +1394,9 @@ static uint32_t tex_hash(const Nv2aTexture *t)
     step &= ~3u;
     for (i = 0; i + 4 <= bytes; i += step)
         h = (h ^ *(const uint32_t *)(p + i)) * 16777619u;
-    if (t->palette) {                       /* SZ_I8: a palette swap changes the texture */
+    if (t->palette && t->color == 0x0B) {   /* SZ_I8 only: a palette swap changes the texture. Other
+                                             * formats carry a stale palette pointer, which made them
+                                             * look rewritten (a decode hitch about once a second). */
         const uint32_t *pal = (const uint32_t *)GUEST_PTR(t->palette);
         h = (h ^ t->palette) * 16777619u;
         for (i = 0; i < 256; i += 4)
@@ -1133,6 +1406,7 @@ static uint32_t tex_hash(const Nv2aTexture *t)
 }
 
 static uint32_t *s_decode_buf;
+static LONGLONG  s_decode_t0;
 static size_t    s_decode_cap;
 
 /* -- Texture dump / replacement ------------------------------------------
@@ -1219,6 +1493,18 @@ static uint32_t *repl_load(uint32_t hash, uint32_t *w, uint32_t *h)
  * target skipped for memory, 0 guest memory. */
 static int s_tex_src, s_tex_src_age;
 
+static uint16_t *s_tex_ix_slot;
+/* For the hitch log (GZ_PACE_LOG): time spent decoding textures, and how many. */
+volatile LONG gz_stat_decode_us, gz_stat_decode_n, gz_stat_decode_px;
+static LONGLONG stat_qpc_us(void)
+{
+    static LARGE_INTEGER f;
+    LARGE_INTEGER q;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&q);
+    return q.QuadPart * 1000000 / f.QuadPart;
+}
+static uint32_t  s_frame_tick;          /* GetTickCount() at the last flip */
 static ID3D11ShaderResourceView *texture_srv(const Nv2aTexture *t)
 {
     uint32_t i, slot = MAX_TEX, oldest = 0, h;
@@ -1251,10 +1537,25 @@ static ID3D11ShaderResourceView *texture_srv(const Nv2aTexture *t)
             }
 
     if (t->cube || i >= MAX_RT) s_tex_src = 0;
-    for (i = 0; i < MAX_TEX; i++) {
+    {
+        /* Most binds are of a texture bound before: look in a small index
+         * first (the table has 1,536 slots, searched per bind otherwise). */
+        static uint16_t ix[4096];
+        uint32_t k = ((t->offset >> 5) ^ (t->offset >> 17) ^ t->color) & 4095u, c = ix[k];
+        i = 0;
+        if (c) {
+            x = &s_texs[c - 1];
+            if (x->srv && x->offset == t->offset && x->w == t->width && x->h == t->height
+                    && x->color == t->color && x->cube == (t->cube ? 1u : 0u))
+                i = c - 1;                  /* the loop below starts on the match */
+        }
+        s_tex_ix_slot = &ix[k];
+    }
+    for (; i < MAX_TEX; i++) {
         x = &s_texs[i];
         if (x->srv && x->offset == t->offset && x->w == t->width && x->h == t->height
                 && x->color == t->color && x->cube == (t->cube ? 1u : 0u)) {
+            *s_tex_ix_slot = (uint16_t)(i + 1);
             if (x->gen != gz_opt_generation()) {
                 /* A setting changed (button pictures): decode again. */
                 x->gen = gz_opt_generation();
@@ -1263,8 +1564,13 @@ static ID3D11ShaderResourceView *texture_srv(const Nv2aTexture *t)
                 goto decode;
             }
             if (x->frame == s_frame) { x->used = s_frame; return x->srv; }
-            h = tex_hash(t);
+            /* Check for rewritten contents once per timer tick (~64 times a
+             * second), not once per frame: at 240 fps the hashing alone was
+             * a visible share of the frame. */
             x->frame = s_frame; x->used = s_frame;
+            if (x->tick == s_frame_tick) return x->srv;
+            x->tick = s_frame_tick;
+            h = tex_hash(t);
             if (h == x->hash) return x->srv;
             x->hash = h;
             slot = i;                       /* contents changed: re-decode below */
@@ -1283,8 +1589,20 @@ static ID3D11ShaderResourceView *texture_srv(const Nv2aTexture *t)
     x->hash = tex_hash(t); x->frame = s_frame; x->used = s_frame;
     x->gen = gz_opt_generation();
 decode:
+    {
+        /* GZ_TEX_LOG=1: which textures get decoded again and again. */
+        static int tlog = -1, shown;
+        if (tlog < 0) tlog = getenv("GZ_TEX_LOG") ? atoi(getenv("GZ_TEX_LOG")) : 0;
+        if (tlog && s_frame > (uint32_t)tlog && shown < 4000) {
+            shown++;
+            fprintf(stderr, "[TEXDEC] frame %u %08X %ux%u fmt %02X cube %u pal %08X\n", s_frame, t->offset, t->width, t->height, t->color, t->cube, t->palette);
+        }
+    }
     x = &s_texs[slot];
     need = (size_t)t->width * t->height * (t->cube ? 6u : 1u);
+    s_decode_t0 = stat_qpc_us();
+    InterlockedIncrement(&gz_stat_decode_n);
+    InterlockedExchangeAdd(&gz_stat_decode_px, (LONG)need);
     if (need > s_decode_cap) {
         free(s_decode_buf);
         s_decode_buf = (uint32_t *)malloc(need * 4);
@@ -1368,6 +1686,8 @@ decode:
         free(rp);
     }
     s_st_uploads++;
+    InterlockedExchangeAdd(&gz_stat_decode_us, (LONG)(stat_qpc_us() - s_decode_t0));
+    s_h_tex += stat_qpc_us() - s_decode_t0;
     return x->srv;
 }
 
@@ -1385,6 +1705,14 @@ static void set_consts(const Nv2aSurface *s, const Nv2aBatch *b, int tex0_on,
 
     memset(&c, 0, sizeof c);
     c.wide[0] = s_draw_squeeze; c.wide[1] = s_draw_anchor; c.wide[2] = s_draw_yscale; c.wide[3] = 0.0f;
+    {
+        /* GZ_DEBUG_ZOOM=0.6: draw the 3D scene at 60% size, so what lies just
+         * outside the normal picture shows - where the game stops drawing
+         * (its culling) becomes visible as the edge of the scenery. */
+        static float zoom = -1.0f;
+        if (zoom < 0.0f) { const char *e = getenv("GZ_DEBUG_ZOOM"); zoom = (e && atof(e) > 0.05) ? (float)atof(e) : 1.0f; }
+        c.dbg[0] = zoom;
+    }
     {
         static int wl = -1; static unsigned nsq, nanc, ntot, last;
         if (wl < 0) wl = getenv("GZ_WIDE_LOG") != NULL;
@@ -1435,9 +1763,36 @@ static void set_consts(const Nv2aSurface *s, const Nv2aBatch *b, int tex0_on,
     /* SET_CLIP_MIN/MAX only clip; skip when unset or degenerate. */
     c.zmin = rs->depth_min; c.zmax = rs->depth_max;
     c.zclip_on = (rs->depth_max > rs->depth_min && rs->depth_max > 0.0f) ? 1.0f : 0.0f;
-    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-        memcpy(m.pData, &c, sizeof c);
-        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb, 0);
+    {
+        /* What a specialized shader bakes in (ps_variant). */
+        PsKey *k = &s_ps_key;
+        memset(k, 0, sizeof *k);
+        k->alpha_func = (uint32_t)c.alpha_func;
+        k->zclip_on = c.zclip_on > 0.5f;
+        if (rc) {
+            uint32_t n = c.fin[2] & 255u;
+            if (n > 8) n = 8;
+            k->rc_on = 1;
+            memcpy(k->fin, c.fin, sizeof k->fin);
+            memcpy(k->misc, c.misc, sizeof k->misc);
+            memcpy(k->stage, c.stage, n * sizeof k->stage[0]);
+            for (st = 0; st < 4; st++) k->bound[st] = (uint32_t)c.tex_scale[st][2];
+        } else {
+            k->tex0_on = tex0_on ? 1u : 0u;
+        }
+    }
+    {
+        /* Consecutive draws very often share every constant: write the
+         * buffer only when something changed. */
+        static Consts held;
+        static int held_ok;
+        if (held_ok && !memcmp(&held, &c, sizeof c)) return;
+        held_ok = 0;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            memcpy(m.pData, &c, sizeof c);
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb, 0);
+            held = c; held_ok = 1;
+        }
     }
 }
 
@@ -1702,22 +2057,46 @@ static void draw_state(const Nv2aSurface *s, const Nv2aBatch *b, Rt *r, Ds *d)
             }
         }
         set_consts(s, b, srv != NULL, bound);
-        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 8, srvs);
-        ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smps);
+        if (!s_sc.ok || memcmp(s_sc.srvs, srvs, sizeof srvs)) {
+            ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 8, srvs);
+            memcpy(s_sc.srvs, srvs, sizeof srvs);
+        }
+        if (!s_sc.ok || memcmp(s_sc.smps, smps, sizeof smps)) {
+            ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smps);
+            memcpy(s_sc.smps, smps, sizeof smps);
+        }
     }
 
-    ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
-    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
-    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    {
+        ID3D11PixelShader *ps = ps_variant();
+        if (!s_sc.ok || s_sc.ps != ps) {
+            ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
+            s_sc.ps = ps;
+        }
+    }
+    if (!s_sc.ok) {
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+        ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    }
     bc = b->state->blend_color;
     bf[0] = (float)((bc >> 16) & 0xFF) / 255.0f; bf[1] = (float)((bc >> 8) & 0xFF) / 255.0f;
     bf[2] = (float)(bc & 0xFF) / 255.0f;         bf[3] = (float)(bc >> 24) / 255.0f;
     if (b->state->blend_src == 0x8003 || b->state->blend_src == 0x8004
         || b->state->blend_dst == 0x8003 || b->state->blend_dst == 0x8004)
         bf[0] = bf[1] = bf[2] = bf[3];        /* constant alpha */
-    ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_state(b->state), bf, 0xFFFFFFFFu);
-    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, depth_state(b->state, d != NULL),
-                                               b->state->stencil_ref & 0xFF);
+    {
+        ID3D11BlendState *bs = blend_state(b->state);
+        ID3D11DepthStencilState *dss = depth_state(b->state, d != NULL);
+        UINT ref = b->state->stencil_ref & 0xFF;
+        if (!s_sc.ok || s_sc.blend != bs || memcmp(s_sc.bf, bf, sizeof bf)) {
+            ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
+            s_sc.blend = bs; memcpy(s_sc.bf, bf, sizeof bf);
+        }
+        if (!s_sc.ok || s_sc.depth != dss || s_sc.ref != ref) {
+            ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss, ref);
+            s_sc.depth = dss; s_sc.ref = ref;
+        }
+    }
 }
 
 /* One [PROBE] line: grid (or GZ_GPU_PROBE) pixels of target r after the
@@ -2039,6 +2418,8 @@ static void burst_copy(int k, const char *path)
 
 static void be_flip(void)
 {
+    s_h_flip_t0 = stat_qpc_us();
+    s_sc.ok = 0;
     MSG msg;
     D3D11_VIEWPORT vp;
     ID3D11ShaderResourceView *null_srv = NULL;
@@ -2151,7 +2532,38 @@ static void be_flip(void)
         ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_sampler);
         ID3D11DeviceContext_Draw(s_ctx, 3, 0);
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &null_srv);
-        IDXGISwapChain_Present(s_swap, (UINT)s_vsync, 0);
+        {
+            static int hlog = -1;
+            LONGLONG p0 = stat_qpc_us(), p1;
+            IDXGISwapChain_Present(s_swap, (UINT)s_vsync, (!s_vsync && s_tearing) ? GZ_PRESENT_ALLOW_TEARING : 0);
+            p1 = stat_qpc_us();
+            s_h_present = p1 - p0;
+            if (hlog < 0) hlog = getenv("GZ_PACE_LOG") != NULL;
+            if (hlog && s_h_last_flip && p1 - s_h_last_flip > 10000)
+                fprintf(stderr, "[GPUHITCH] flip to flip %.1f ms: present %.1f, buffer maps %.1f (longest %.1f, %u discards), texture decodes %.1f"
+                        " | back end: clears %.1f (%u), draws %.1f (%u), program draws %.1f (%u), rest of flip %.1f\n",
+                        (p1 - s_h_last_flip) / 1000.0, s_h_present / 1000.0, s_h_map / 1000.0, s_h_map_max / 1000.0,
+                        s_h_discards, s_h_tex / 1000.0, s_h_be[0] / 1000.0, s_h_ben[0], s_h_be[1] / 1000.0, s_h_ben[1],
+                        s_h_be[2] / 1000.0, s_h_ben[2], (p0 - s_h_flip_t0) / 1000.0);
+            if (hlog) {
+                static LONGLONG sec_t0, sec_be[3], sec_present, sec_tex, sec_flip;
+                static UINT sec_n[3], sec_flips;
+                int k;
+                for (k = 0; k < 3; k++) { sec_be[k] += s_h_be[k]; sec_n[k] += s_h_ben[k]; }
+                sec_present += s_h_present; sec_tex += s_h_tex; sec_flip += p0 - s_h_flip_t0; sec_flips++;
+                if (!sec_t0) sec_t0 = p1;
+                if (p1 - sec_t0 >= 1000000) {
+                    fprintf(stderr, "[GPUSEC] %u flips: back end %.0f ms (clears %.0f/%u, draws %.0f/%u, program draws %.0f/%u, of which texture decodes %.0f),"
+                            " present %.0f, rest of flip %.0f\n", sec_flips,
+                            (sec_be[0] + sec_be[1] + sec_be[2]) / 1000.0, sec_be[0] / 1000.0, sec_n[0], sec_be[1] / 1000.0, sec_n[1],
+                            sec_be[2] / 1000.0, sec_n[2], sec_tex / 1000.0, sec_present / 1000.0, sec_flip / 1000.0);
+                    sec_t0 = p1; sec_flips = 0; sec_present = sec_tex = sec_flip = 0;
+                    for (k = 0; k < 3; k++) { sec_be[k] = 0; sec_n[k] = 0; }
+                }
+            }
+            s_h_last_flip = p1; s_h_map = s_h_map_max = 0; s_h_discards = 0; s_h_tex = 0;
+            s_h_be[0] = s_h_be[1] = s_h_be[2] = 0; s_h_ben[0] = s_h_ben[1] = s_h_ben[2] = 0;
+        }
         s_st_presents++;
         s_bound_rt = NULL; s_bound_ds = NULL;       /* rebind on the next draw */
     }
@@ -2184,12 +2596,13 @@ static void be_flip(void)
                 s_win_w = nw;
                 ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
                 if (s_back_rtv) { ID3D11RenderTargetView_Release(s_back_rtv); s_back_rtv = NULL; }
-                IDXGISwapChain_ResizeBuffers(s_swap, 0, s_win_w, s_win_h, DXGI_FORMAT_UNKNOWN, 0);
+                IDXGISwapChain_ResizeBuffers(s_swap, 0, s_win_w, s_win_h, DXGI_FORMAT_UNKNOWN, s_tearing ? GZ_SWAP_ALLOW_TEARING : 0);
                 create_back_rtv();
             }
         }
     }
     s_frame++;
+    s_frame_tick = GetTickCount();
     {
         /* Screenshots: F12 writes screenshots\shot_<n>.bmp; GZ_SHOT_FILE=<path>
          * (tests) writes <path>.bmp whenever the file <path> exists, then
@@ -2277,6 +2690,7 @@ static void be_flip(void)
 static UINT ring_upload(ID3D11Buffer **buf, UINT *size, UINT *pos, UINT bind,
                         const void *data, UINT bytes)
 {
+    LONGLONG h0 = stat_qpc_us(), h1;
     D3D11_MAPPED_SUBRESOURCE m;
     D3D11_MAP mode = D3D11_MAP_WRITE_NO_OVERWRITE;
     UINT at;
@@ -2294,11 +2708,13 @@ static UINT ring_upload(ID3D11Buffer **buf, UINT *size, UINT *pos, UINT bind,
         mode = D3D11_MAP_WRITE_DISCARD;
     }
     if (*pos + bytes > *size) { *pos = 0; mode = D3D11_MAP_WRITE_DISCARD; }
+    if (mode == D3D11_MAP_WRITE_DISCARD) s_h_discards++;
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)*buf, 0, mode, 0, &m))) return (UINT)-1;
     memcpy((uint8_t *)m.pData + *pos, data, bytes);
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)*buf, 0);
     at = *pos;
     *pos += (bytes + 255u) & ~255u;
+    h1 = stat_qpc_us() - h0; s_h_map += h1; if (h1 > s_h_map_max) s_h_map_max = h1;
     return at;
 }
 
@@ -2313,24 +2729,74 @@ static int cb_write(ID3D11Buffer *cb, const void *data, size_t bytes)
 }
 
 /* A vertex-program batch: the program runs in vs_prog. */
+/* Program draws arrive packed (Nv2aProgramDraw.packed): slot 0 carries the
+ * inputs named in the mask, 16 bytes each, per vertex; slot 1 carries all 16
+ * inputs once (per instance, one instance) for the rest. One layout per mask. */
+static ID3D11InputLayout *prog_layout(uint32_t mask)
+{
+    static struct { uint32_t mask; ID3D11InputLayout *l; } tab[64];
+    static int n;
+    D3D11_INPUT_ELEMENT_DESC el[16];
+    int k, rank = 0;
+    for (k = 0; k < n; k++) if (tab[k].mask == mask) return tab[k].l;
+    if (n >= 64 || !s_prog_blob) return NULL;
+    for (k = 0; k < 16; k++) {
+        int per_vertex = (mask >> k) & 1;
+        el[k].SemanticName = "ATTR"; el[k].SemanticIndex = (UINT)k;
+        el[k].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        el[k].InputSlot = per_vertex ? 0 : 1;
+        el[k].AlignedByteOffset = (UINT)(16 * (per_vertex ? rank++ : k));
+        el[k].InputSlotClass = per_vertex ? D3D11_INPUT_PER_VERTEX_DATA : D3D11_INPUT_PER_INSTANCE_DATA;
+        el[k].InstanceDataStepRate = per_vertex ? 0 : 1;
+    }
+    tab[n].mask = mask; tab[n].l = NULL;
+    ID3D11Device_CreateInputLayout(s_dev, el, 16, ID3D10Blob_GetBufferPointer(s_prog_blob),
+                                   ID3D10Blob_GetBufferSize(s_prog_blob), &tab[n].l);
+    return tab[n++].l;
+}
+
+static uint32_t prog_nact(uint32_t mask)
+{
+    uint32_t n = 0;
+    for (mask &= 0xFFFFu; mask; mask &= mask - 1) n++;
+    return n;
+}
+
+/* Vertex k of a packed draw as the 16 x 4 floats nv2a_vsh_run takes. */
+static const float (*pv(const Nv2aProgramDraw *p, uint32_t k))[4]
+{
+    static float v[16][4];
+    const float *src = p->packed + 64 + (size_t)k * prog_nact(p->packed_mask) * 4;
+    int a;
+    memcpy(v, p->packed, sizeof v);
+    for (a = 0; a < 16; a++)
+        if ((p->packed_mask >> a) & 1) { memcpy(v[a], src, 16); src += 4; }
+    return (const float (*)[4])v;
+}
+
 static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aProgramDraw *p)
 {
     Rt *r;
     Ds *d;
-    UINT vat, iat, stride = 256, offset = 0;
+    UINT vat, iat, strides[2], offsets[2];
+    ID3D11Buffer *vbs[2];
+    ID3D11InputLayout *layout;
+    uint32_t nact;
     ID3D11Buffer *cbs[4];
     struct { uint32_t info[4]; float param[4]; float fog[4]; } dc;
 
     if (!s_prog_ok || p->ninstr == 0 || p->ninstr > 136) return 0;
     if (!ready()) return 0;
     if (!s->color_va || !s->width || !s->height || p->nindices < 3) return 1;
+    if (!p->packed || !(layout = prog_layout(p->packed_mask))) return 0;
+    nact = prog_nact(p->packed_mask);
     if (!(r = rt_get(s))) return 1;
     d = ds_get(b->state->zeta_va, r->w, r->h);
     bind_targets(r, d);
     note_present_candidate(r, s);
 
     vat = ring_upload(&s_vb2, &s_vb2_size, &s_vb2_pos, D3D11_BIND_VERTEX_BUFFER,
-                      p->attrs, p->nverts * 256u);
+                      p->packed, 256u + p->nverts * nact * 16u);
     iat = ring_upload(&s_ib, &s_ib_size, &s_ib_pos, D3D11_BIND_INDEX_BUFFER,
                       p->indices, p->nindices * 4u);
     if (vat == (UINT)-1 || iat == (UINT)-1) return 1;
@@ -2348,7 +2814,15 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     dc.param[0] = p->aa_sx; dc.param[1] = p->aa_sy; dc.param[2] = p->clip_w;
     dc.param[3] = (b->texture && b->texture->normalized) ? 1.0f : 0.0f;
     dc.fog[0] = p->fog_param[0]; dc.fog[1] = p->fog_param[1];
-    if (!cb_write(s_cb_draw, &dc, sizeof dc)) return 1;
+    {
+        static struct { uint32_t info[4]; float param[4]; float fog[4]; } held;
+        static int held_ok;
+        if (!held_ok || memcmp(&held, &dc, sizeof dc)) {
+            held_ok = 0;
+            if (!cb_write(s_cb_draw, &dc, sizeof dc)) return 1;
+            memcpy(&held, &dc, sizeof dc); held_ok = 1;
+        }
+    }
 
     s_draw_squeeze = 0.0f;
     if (WIDE_SURF(r->w, r->h)) {
@@ -2363,7 +2837,7 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
             int flat = 1;
             for (k = 0; k < p->nverts && flat; k++) {
                 Nv2aVshOutput o;
-                if (!nv2a_vsh_run((const float (*)[4])p->attrs[k], &o)) { flat = 0; break; }
+                if (!nv2a_vsh_run(pv(p, k), &o)) { flat = 0; break; }
                 if (o.pos[0] < mn) mn = o.pos[0];
                 if (o.pos[0] > mx) mx = o.pos[0];
                 if (o.pos[1] < ymn) ymn = o.pos[1];
@@ -2380,20 +2854,34 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
         }
     }
     draw_state(s, b, r, d);
-    ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout_prog);
-    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb2, &stride, &offset);
-    ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib, DXGI_FORMAT_R32_UINT, 0);
-    ID3D11DeviceContext_VSSetShader(s_ctx, s_vs_prog, NULL, 0);
-    cbs[0] = s_cb; cbs[1] = s_cb_prog; cbs[2] = s_cb_const; cbs[3] = s_cb_draw;
-    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 4, cbs);
-    ID3D11DeviceContext_DrawIndexed(s_ctx, p->nindices, iat / 4u, (INT)(vat / 256u));
+    if (!s_sc.ok || s_sc.layout != layout) {
+        ID3D11DeviceContext_IASetInputLayout(s_ctx, layout);
+        s_sc.layout = layout;
+    }
+    if (!s_sc.ok)
+        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    vbs[0] = s_vb2; vbs[1] = s_vb2;
+    strides[0] = nact ? nact * 16u : 16u; strides[1] = 256u;
+    offsets[0] = vat + 256u; offsets[1] = vat;
+    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 2, vbs, strides, offsets);
+    if (!s_sc.ok || s_sc.ib != s_ib) {
+        ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib, DXGI_FORMAT_R32_UINT, 0);
+        s_sc.ib = s_ib;
+    }
+    if (!s_sc.ok) {
+        ID3D11DeviceContext_VSSetShader(s_ctx, s_vs_prog, NULL, 0);
+        cbs[0] = s_cb; cbs[1] = s_cb_prog; cbs[2] = s_cb_const; cbs[3] = s_cb_draw;
+        ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 4, cbs);
+    }
+    if (s_sc_on < 0) s_sc_on = env_int("GZ_STATE_CACHE", 1, 0, 1);
+    s_sc.ok = s_sc_on;          /* everything above is now what the context holds */
+    ID3D11DeviceContext_DrawIndexedInstanced(s_ctx, p->nindices, 1, iat / 4u, 0, 0);
     if (s_water_pending) {
         /* + the CPU interpreter's outputs for the first vertex: colours, fog, texcoords */
         Nv2aVshOutput o;
         s_water_pending = 0;
         fprintf(stderr, " | after %06X", probe1(r) & 0xFFFFFFu);
-        if (nv2a_vsh_run((const float (*)[4])p->attrs[0], &o))
+        if (nv2a_vsh_run(pv(p, 0), &o))
             fprintf(stderr, " | v0 d0 %.2f %.2f %.2f %.2f d1 %.2f %.2f %.2f %.2f fog %.3g tc0 %.3g %.3g %.3g %.3g tc1 %.3g %.3g %.3g %.3g tc2 %.3g %.3g %.3g %.3g tc3 %.3g %.3g %.3g %.3g",
                     o.d0[0], o.d0[1], o.d0[2], o.d0[3], o.d1[0], o.d1[1], o.d1[2], o.d1[3], o.fog[0],
                     o.tex[0][0], o.tex[0][1], o.tex[0][2], o.tex[0][3], o.tex[1][0], o.tex[1][1], o.tex[1][2], o.tex[1][3],
@@ -2405,7 +2893,7 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
                 float wmin = 1e30f, ymax = -1e30f, ymin = 1e30f, zmax = -1e30f, zmin = 1e30f;
                 uint32_t bad = 0, kmin = 0, kymax = 0;
                 for (k = 0; k < p->nverts; k++)
-                    if (nv2a_vsh_run((const float (*)[4])p->attrs[k], &o)) {
+                    if (nv2a_vsh_run(pv(p, k), &o)) {
                         int j, fin = 1;
                         for (j = 0; j < 4; j++) if (!(o.pos[j] == o.pos[j]) || o.pos[j] > 1e30f || o.pos[j] < -1e30f) fin = 0;
                         if (!fin) { bad++; continue; }
@@ -2416,7 +2904,7 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
                         if (o.pos[2] < zmin) zmin = o.pos[2];
                     }
                 fprintf(stderr, " nonfinite %u wmin %.4g (v%u) y %.4g..%.4g (max at v%u) z %.6g..%.6g", bad, wmin, kmin, ymin, ymax, kymax, zmin, zmax);
-                if (nv2a_vsh_run((const float (*)[4])p->attrs[kymax], &o))
+                if (nv2a_vsh_run(pv(p, kymax), &o))
                     fprintf(stderr, " lowest [%.4g %.4g %.6g %.4g]", o.pos[0], o.pos[1], o.pos[2], o.pos[3]);
                 fprintf(stderr, " c59 %.6g clipw %.4g nearz %u", p->constants[59][2], p->clip_w, p->near_z);
             }
@@ -2431,7 +2919,7 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
         int st, ok;
         s_trace_req_n++;
         trace_probe(s, r);
-        ok = nv2a_vsh_run((const float (*)[4])p->attrs[0], &cpu);
+        ok = nv2a_vsh_run(pv(p, 0), &cpu);
         fprintf(stderr, "[TRACE] d%u: PROG %u tris %u verts ninstr %u rev %u surf %08X | blend %u(%X,%X,%X) atest %u z %u/%X/%u"
                 " | sp %08X fin %08X fogc %08X fog %u/%X | v0 in0 %.3g %.3g %.3g %.3g",
                 s_trace_req_n, p->nindices / 3, p->nverts, p->ninstr, p->program_rev, s->color_va,
@@ -2439,7 +2927,7 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
                 b->state->alpha_test_enable, b->state->depth_test_enable, b->state->depth_func,
                 b->state->depth_write, b->combiner ? b->combiner->stage_program : 0,
                 b->combiner ? b->combiner->final0 : 0, b->fog_color, p->fog_enable, p->fog_mode,
-                p->attrs[0][0][0], p->attrs[0][0][1], p->attrs[0][0][2], p->attrs[0][0][3]);
+                pv(p, 0)[0][0], pv(p, 0)[0][1], pv(p, 0)[0][2], pv(p, 0)[0][3]);
         if (ok)
             fprintf(stderr, " | cpu pos %.1f %.1f %.4g w %.4g d0 %.2f %.2f %.2f %.2f fog %.3g tc0 %.3g %.3g %.3g %.3g",
                     cpu.pos[0], cpu.pos[1], cpu.pos[2], cpu.pos[3], cpu.d0[0], cpu.d0[1], cpu.d0[2], cpu.d0[3],
@@ -2451,7 +2939,7 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
             fprintf(stderr, " | c59 %.6g %.6g %.6g | all", p->constants[59][0], p->constants[59][1], p->constants[59][2]);
             for (v = 0; v < p->nverts; v++) {
                 Nv2aVshOutput o;
-                if (nv2a_vsh_run((const float (*)[4])p->attrs[v], &o))
+                if (nv2a_vsh_run(pv(p, v), &o))
                     fprintf(stderr, " [%.6g %.6g %.6g %.6g]", o.pos[0] * p->aa_sx, o.pos[1] * p->aa_sy, o.pos[2], o.pos[3]);
             }
             fprintf(stderr, " idx");
@@ -2470,7 +2958,15 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     return 1;
 }
 
-static const Nv2aBackend s_backend = { be_clear, be_draw, be_flip, be_draw_program };
+/* Timed entry points (for the GZ_PACE_LOG hitch line): how long this thread
+ * spent inside the back end, and in how many calls, since the last flip. */
+static void be_clear_t(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t flags, uint32_t argb, uint32_t zs)
+{ LONGLONG t = stat_qpc_us(); s_sc.ok = 0; be_clear(s, rs, flags, argb, zs); s_sc.ok = 0; s_h_be[0] += stat_qpc_us() - t; s_h_ben[0]++; }
+static void be_draw_t(const Nv2aSurface *s, const Nv2aBatch *b)
+{ LONGLONG t = stat_qpc_us(); s_sc.ok = 0; be_draw(s, b); s_sc.ok = 0; s_h_be[1] += stat_qpc_us() - t; s_h_ben[1]++; }
+static int be_draw_program_t(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aProgramDraw *p)
+{ LONGLONG t = stat_qpc_us(); int r = be_draw_program(s, b, p); s_h_be[2] += stat_qpc_us() - t; s_h_ben[2]++; return r; }
+static const Nv2aBackend s_backend = { be_clear_t, be_draw_t, be_flip, be_draw_program_t };
 
 /* Called from main() before the title starts. GZ_GPU=0 keeps the CPU
  * rasteriser. Needs RECOMP_PB_EXEC (the executor is what calls us). */

@@ -1,3 +1,87 @@
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index a6a3657..00225ed 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -139,6 +139,49 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
+  * where the host mapped RAM) or "wrap" (above the mapping, folded into the
+  * low 64 MB). A voice reading noise from "wrap" or "hiwin" is the address
+  * resolution, not the decoder. */
++/* mcpx_apu_phys for a voice's SAMPLE data (not the APU's own structures).
++ *
++ * A heap page carries the RAM mark only once the title has asked for its
++ * physical address (xbox_PhysNoteRamName), and the mark goes when the heap
++ * block is freed. Godzilla's sound banks live in the heap; pages of banks
++ * whose mark was missing resolved to the contiguous window wherever the
++ * window had also handed out that number, and the effect voices played the
++ * window's bytes: in two runs every such voice had valid ADPCM in RAM (16 of
++ * 16 block headers) and mostly not in the window (3-6 of 16) - harsh noise on
++ * menu UI sounds and in the attract fight. Sample data inside a live heap
++ * block is therefore read from RAM. The APU's own structures (voice array,
++ * SGE and SSL tables, notifiers) are allocated contiguous and keep the plain
++ * rules. RECOMP_APU_HEAP_SAMPLES=0: plain rules for samples too. */
++uint8_t *mcpx_apu_phys_sample(uint64_t addr)
++{
++    static int on = -1;
++    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_APU_HEAP_SAMPLES");
++        on = !(e && e[0] == '0');
++    }
++    if (on && a < (64u << 20) && xbox_ContiguousPageMap()[a >> 12]
++            && !xbox_PhysRamNamedAt(a) && xbox_HeapLiveAt(a)) {
++        static volatile long n;
++        if (++n <= 3 || n % 100000 == 0)
++            fprintf(stderr, "[APU] sample data at %08X: inside a live heap block, read from RAM (%ld)\n", a, n);
++        return g_apu_ram_ptr + a;
++    }
++    if (on && a < (64u << 20) && xbox_ContiguousPageMap()[a >> 12] && !xbox_PhysRamNamedAt(a)
++            && getenv("RECOMP_APU_TRACE")) {
++        /* Diagnostics: sample data read from the window; what does the heap say? */
++        static uint8_t seen[(64u << 20) >> 16];
++        if (!seen[a >> 16]) {
++            uint32_t ba = 0, bs = 0;
++            int fr = 0, nm = 0, have = xbox_HeapBlockInfo(a, &ba, &bs, &fr, &nm);
++            seen[a >> 16] = 1;
++            fprintf(stderr, "[APU-WIN] sample data at %08X read from the window; heap block %s%08X+%X%s%s\n", a,
++                    have ? "" : "(none) ", ba, bs, have ? (fr ? " FREE" : " live") : "", have && nm ? " named" : "");
++        }
++    }
++    return mcpx_apu_phys(addr);
++}
++
+ const char *mcpx_apu_phys_class(uint64_t addr)
+ {
+     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+@@ -1501,6 +1544,29 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
+ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)
+ {
+     if (!d) return;
++    {
++        /* RECOMP_APU_RACE_LOG=1: DirectSound writes a voice's parameters as a
++         * sequence - select the voice (0x202F8), lock (0x202FC = 1), values,
++         * unlock - at raised IRQL, where nothing else runs on the console.
++         * Count sequences another thread writes into: its select replaces
++         * this one's, and the values land on the wrong voice. */
++        static int on = -1;
++        static volatile LONG owner, races, seqs;
++        if (on < 0) on = getenv("RECOMP_APU_RACE_LOG") != NULL;
++        if (on && addr >= 0x202F8 && addr < 0x20400) {
++            LONG me = (LONG)GetCurrentThreadId(), o = owner;
++            if (o && o != me) {
++                LONG n = InterlockedIncrement(&races);
++                if (n <= 5 || n % 200 == 0)
++                    fprintf(stderr, "[APU-RACE] thread %ld wrote 0x%05X = %08X inside thread %ld's locked sequence (%ld so far, %ld sequences)\n",
++                            (long)me, (unsigned)addr, (unsigned)val, (long)o, (long)n, (long)seqs);
++            }
++            if (addr == 0x202FC) {
++                if (val & 1) { owner = me; InterlockedIncrement(&seqs); }
++                else if (owner == me) owner = 0;
++            }
++        }
++    }
+     mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
+ }
+ 
 diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
 index bd36f2a..9e944cd 100644
 --- a/src/apu/apu_dsp.c
@@ -128,6 +212,371 @@ index bd36f2a..9e944cd 100644
              /* Clamp to [-1, 1] range */
              if (left > 1.0f) left = 1.0f;
              if (left < -1.0f) left = -1.0f;
+diff --git a/src/apu/apu_shim.h b/src/apu/apu_shim.h
+index 3a3996f..3b17552 100644
+--- a/src/apu/apu_shim.h
++++ b/src/apu/apu_shim.h
+@@ -100,6 +100,7 @@ static inline void qemu_thread_join(QemuThread *t) {
+ extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
+ /* Where a physical address the title handed the APU lives. See apu_core.c. */
+ uint8_t *mcpx_apu_phys(uint64_t addr);
++uint8_t *mcpx_apu_phys_sample(uint64_t addr);   /* voice sample data (see apu_core.c) */
+ /* Which case of mcpx_apu_phys resolved an address, for trace lines. */
+ const char *mcpx_apu_phys_class(uint64_t addr);
+ 
+diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
+index eb33b70..50767c2 100644
+--- a/src/apu/apu_state.h
++++ b/src/apu/apu_state.h
+@@ -234,7 +234,7 @@ hrtf_filter_set_target_params(HrtfFilter *f, float hrir_coeff[2][HRTF_NUM_TAPS],
+         for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+             s += fabsf(coeff[k]);
+         }
+-        if (s == 0.0f || s == 1.0f) break;
++        if (s == 0.0f || s == 1.0f) continue;   /* (was break: skipped the right channel) */
+         for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+             coeff[k] /= s;
+         }
+@@ -429,6 +429,12 @@ typedef struct MCPXAPUVPState {
+     uint8_t submix_headroom[NUM_MIXBINS];
+     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
+     volatile uint8_t voice_locked[MCPX_HW_MAX_VOICES];
++    /* voice_spin is re-entrant on the thread that holds it (owner + depth):
++     * a register write holds its target voice for the whole method, and the
++     * method may lock the voice again (VOICE_ON, VOICE_RELEASE, VOICE_LOCK). */
++    volatile DWORD voice_spin_owner[MCPX_HW_MAX_VOICES];
++    int voice_spin_depth[MCPX_HW_MAX_VOICES];
++    volatile LONG fe_spin;          /* one front-end method at a time (see mcpx_apu_vp_write) */
+     volatile LONG voice_spin[MCPX_HW_MAX_VOICES];   /* see voice_spin_lock */
+ 
+     struct {
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index 94e57da..ca66fd5 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -80,6 +80,13 @@ static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
+     d->vp.filters[v].rs_pos = 0.0f;
+ }
+ 
++/* Set by the host (a game's skipped-movie path): while non-zero, stream
++ * voices that carry PCM (not ADPCM) are processed - their packets still
++ * complete - but not mixed. A game whose own movie player cannot run here
++ * still queues the movie's soundtrack on such a stream, and what it queues
++ * while being skipped is not the soundtrack. */
++volatile long g_apu_mute_pcm_streams;
++
+ static bool voice_should_mute(uint16_t v)
+ {
+     bool m = (g_dbg_voice_monitor >= 0) && (v != g_dbg_voice_monitor);
+@@ -150,12 +157,22 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
+  * wait while the voice processor is working on the voice it locks. */
+ static void voice_spin_lock(MCPXAPUState *d, uint16_t v)
+ {
++    DWORD me = GetCurrentThreadId();
++    if (d->vp.voice_spin_owner[v] == me) {      /* already ours: nest */
++        d->vp.voice_spin_depth[v]++;
++        return;
++    }
+     while (InterlockedCompareExchange(&d->vp.voice_spin[v], 1, 0))
+         SwitchToThread();
++    d->vp.voice_spin_owner[v] = me;
++    d->vp.voice_spin_depth[v] = 1;
+ }
+ 
+ static void voice_spin_unlock(MCPXAPUState *d, uint16_t v)
+ {
++    if (--d->vp.voice_spin_depth[v] > 0)
++        return;
++    d->vp.voice_spin_owner[v] = 0;
+     InterlockedExchange(&d->vp.voice_spin[v], 0);
+ }
+ 
+@@ -193,8 +210,24 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+ {
+     unsigned int slot;
+ 
+-    d->regs[NV_PAPU_FEDECMETH] = method;
+-    d->regs[NV_PAPU_FEDECPARAM] = argument;
++    /* FEDECMETH/FEDECPARAM are what the service routine reads after a trap
++     * (the idle voice's handle, for SE2FE_IDLE_VOICE). While the front end is
++     * trapped the hardware decodes nothing further, so a later method must
++     * not replace them: here the title's own writes kept arriving and
++     * overwrote the idle voice's handle, and DirectSound retired whichever
++     * voice it then read - one still playing, given to the next sound while
++     * it was still in a voice list. */
++    if (method == SE2FE_IDLE_VOICE
++            || (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
++               != NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
++        d->regs[NV_PAPU_FEDECMETH] = method;
++        d->regs[NV_PAPU_FEDECPARAM] = argument;
++    } else {
++        static unsigned kept;
++        if (getenv("RECOMP_APU_RACE_LOG") && (++kept <= 3 || kept % 500 == 0))
++            fprintf(stderr, "[APU-RACE] method 0x%04X arrived while the front end was trapped on voice %u; trap registers kept (%u so far)\n",
++                    method, d->regs[NV_PAPU_FEDECPARAM], kept);
++    }
+     unsigned int selected_handle, list;
+ 
+     switch (method) {
+@@ -582,8 +615,35 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
+     MCPXAPUState *d = (MCPXAPUState *)opaque;
+     (void)size;
+ 
+-    /* Dispatch known methods through fe_method */
+-    fe_method(d, (uint32_t)addr, (uint32_t)val);
++    /* One method at a time, and the voice it changes held for all of it:
++     * the title's writes arrive on its own threads while the frame thread
++     * processes voices, and each voice field is a read-modify-write of a
++     * shared dword (the VP rewrites the envelope level next to CBO, and the
++     * state bits next to ACTIVE, every frame). Without this a VOICE_ON's
++     * CBO = 0 or a VOICE_OFF could be lost, and a voice set up halfway was
++     * played. The frame thread's idle-voice trap takes fe_spin as well, so
++     * the trap's registers are written as a unit. RECOMP_APU_FE_LOCK=0: off. */
++    static int on = -1;
++    uint32_t method = (uint32_t)addr, arg = (uint32_t)val, target = 0xFFFFu;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_APU_FE_LOCK");
++        on = !(e && e[0] == '0');
++    }
++    if (!on) {
++        fe_method(d, method, arg);
++        return;
++    }
++    if (method == NV1BA0_PIO_VOICE_ON || method == NV1BA0_PIO_VOICE_OFF
++            || method == NV1BA0_PIO_VOICE_RELEASE || method == NV1BA0_PIO_VOICE_PAUSE)
++        target = arg & NV1BA0_PIO_VOICE_ON_HANDLE;
++    else if (method != NV1BA0_PIO_SET_CURRENT_VOICE)
++        target = d->regs[NV_PAPU_FECV] & 0xFFFFu;
++    while (InterlockedCompareExchange(&d->vp.fe_spin, 1, 0))
++        SwitchToThread();
++    if (target < MCPX_HW_MAX_VOICES) voice_spin_lock(d, (uint16_t)target);
++    fe_method(d, method, arg);
++    if (target < MCPX_HW_MAX_VOICES) voice_spin_unlock(d, (uint16_t)target);
++    InterlockedExchange(&d->vp.fe_spin, 0);
+ }
+ 
+ /* ============================================================
+@@ -761,8 +821,36 @@ struct VpVoiceStat {
+     uint16_t vol0, vol1;
+     uint8_t  bin0, bin1;
+     const char *cls;
++    float rms_ram, zcr_ram, rms_win, zcr_win;   /* the 4 KB at addr, read from each copy */
+ };
+ static struct VpVoiceStat s_vstat[MCPX_HW_MAX_VOICES];
++
++/* ADPCM: of 16 consecutive 36-byte blocks at p (one channel's header each),
++ * how many have a plausible header (step index 0..88, reserved byte 0).
++ * Random bytes pass about 1 time in 700. */
++static int vp_stat_adpcm_ok(const uint8_t *p, unsigned channels)
++{
++    int ok = 0, k;
++    for (k = 0; k < 16; k++) {
++        const uint8_t *h = p + (size_t)k * 36u * channels;
++        if (h[2] <= 88 && h[3] == 0) ok++;
++    }
++    return ok;
++}
++
++/* RMS and zero-crossing rate of 2048 s16 samples at p. */
++static void vp_stat_probe(const uint8_t *p, float *rms, float *zcr)
++{
++    const int16_t *q = (const int16_t *)p;
++    double sq = 0;
++    int zc = 0, k;
++    for (k = 0; k < 2048; k++) {
++        sq += (double)q[k] * q[k];
++        if (k && ((q[k] < 0) != (q[k - 1] < 0))) zc++;
++    }
++    *rms = (float)sqrt(sq / 2048.0);
++    *zcr = zc / 2048.0f;
++}
+ static int s_vstat_on = -1;
+ static int s_vdump_voice = -1;      /* -2: every voice, one file each */
+ static FILE *s_vdump;
+@@ -807,6 +895,25 @@ static void vp_stat_samples(uint32_t v, const float samples[][2], int n,
+         s->addr = (uint32_t)first_addr;
+         s->cls = mcpx_apu_phys_class(first_addr);
+         s->fmt = fmt;
++        {
++            /* Both copies a physical number below 64 MB can name: which one
++             * holds the sound? (see mcpx_apu_phys) */
++            uint32_t a = (uint32_t)first_addr & 0x0FFFFFFFu;
++            s->rms_ram = s->rms_win = -1.0f;
++            if (a < (64u << 20) - 4096u) {
++                if (((fmt & NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE) >> ctz32(NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE))
++                        == NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM) {
++                    unsigned ch = (fmt & NV_PAVS_VOICE_CFG_FMT_STEREO) ? 2u : 1u;
++                    /* ADPCM: blocks with a plausible header, of 16 (rms field), zcr unused */
++                    s->rms_ram = (float)vp_stat_adpcm_ok(g_apu_ram_ptr + a, ch);
++                    s->rms_win = (float)vp_stat_adpcm_ok(g_apu_ram_ptr + 0x80000000u + a, ch);
++                    s->zcr_ram = s->zcr_win = -1.0f;
++                } else {
++                    vp_stat_probe(g_apu_ram_ptr + a, &s->rms_ram, &s->zcr_ram);
++                    vp_stat_probe(g_apu_ram_ptr + 0x80000000u + a, &s->rms_win, &s->zcr_win);
++                }
++            }
++        }
+     }
+     for (int i = 0; i < n; i++) {
+         float x = samples[i][0];
+@@ -856,7 +963,7 @@ static void vp_stat_report(void)
+         if (!s->frames) continue;
+         fprintf(stderr, "[APU-VSTAT] t=%us v=%u fmt=%08X stream=%u st=%u ss=%u cs=%u spb=%u"
+                 " rate=%.3f ea=%.2f vol=%03X/%03X bin=%u/%u addr=%08X %s"
+-                " frames=%u rms=%.0f zcr=%.2f\n",
++                " frames=%u rms=%.0f zcr=%.2f | copies: ram %.0f/%.2f win %.0f/%.2f\n",
+                 s_vstat_secs, v, s->fmt,
+                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0),
+                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_STEREO) != 0),
+@@ -865,7 +972,8 @@ static void vp_stat_report(void)
+                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK) >> ctz32(NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK)),
+                 s->rate, s->ea, s->vol0, s->vol1, s->bin0, s->bin1, s->addr,
+                 s->cls ? s->cls : "?", s->frames,
+-                sqrt(s->sq / s->frames) * 32768.0, (double)s->zc / s->frames);
++                sqrt(s->sq / s->frames) * 32768.0, (double)s->zc / s->frames,
++                s->rms_ram, s->zcr_ram, s->rms_win, s->zcr_win);
+         s->frames = 0; s->zc = 0; s->sq = 0;
+     }
+ }
+@@ -1211,7 +1319,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+                 uint32_t linear_addr = block_index * (uint32_t)block_size;
+                 if (stream) {
+                     hwaddr addr = segment_offset + linear_addr;
+-                    memcpy(adpcm_block, mcpx_apu_phys(addr),
++                    memcpy(adpcm_block, mcpx_apu_phys_sample(addr),
+                            block_size);
+                 } else {
+                     linear_addr += ba;
+@@ -1219,8 +1327,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+                          word_index < (9 * samples_per_block); word_index++) {
+                         hwaddr addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
+                                                    0xFFFFFFFF, linear_addr);
+-                        adpcm_block[word_index] =
+-                            ldl_le_phys(address_space_memory, addr);
++                        memcpy(&adpcm_block[word_index], mcpx_apu_phys_sample(addr), 4);
+                         linear_addr += 4;
+                     }
+                 }
+@@ -1250,19 +1357,22 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+                 float fval;
+                 switch (sample_size) {
+                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8:
+-                    ival = ldub_phys(address_space_memory, addr);
++                    ival = *mcpx_apu_phys_sample(addr);
+                     fval = uint8_to_float((uint8_t)(ival & 0xff));
+                     break;
+-                case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16:
+-                    ival = lduw_le_phys(address_space_memory, addr);
++                case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16: {
++                    uint16_t h;
++                    memcpy(&h, mcpx_apu_phys_sample(addr), 2);
++                    ival = h;
+                     fval = int16_to_float((int16_t)(ival & 0xffff));
+                     break;
++                }
+                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24:
+-                    ival = ldl_le_phys(address_space_memory, addr);
++                    memcpy(&ival, mcpx_apu_phys_sample(addr), 4);
+                     fval = int24_to_float(ival);
+                     break;
+                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S32:
+-                    ival = ldl_le_phys(address_space_memory, addr);
++                    memcpy(&ival, mcpx_apu_phys_sample(addr), 4);
+                     fval = int32_to_float(ival);
+                     break;
+                 default:
+@@ -1541,6 +1651,11 @@ static void voice_process(MCPXAPUState *d,
+     }
+ 
+     if (voice_should_mute(v)) return;
++    if (g_apu_mute_pcm_streams
++            && voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_DATA_TYPE)
++            && voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE)
++               != NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM)
++        return;
+ 
+     /* Low-pass filter */
+     int fmode = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_MISC,
+@@ -1697,13 +1812,48 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+                  * idle voice in the same frame would overwrite FEDECPARAM
+                  * before the ISR has read the first. The rest trap on later
+                  * frames, after the ISR has resumed the front end. */
++                while (InterlockedCompareExchange(&d->vp.fe_spin, 1, 0))
++                    SwitchToThread();
+                 if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+                         != NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+                     fe_method(d, SE2FE_IDLE_VOICE, v);
++                InterlockedExchange(&d->vp.fe_spin, 0);
+             } else {
+-                /* Process voice directly (single-threaded) */
++                /* A voice the title holds locked (NV1BA0_PIO_VOICE_LOCK, or
++                 * VOICE_ON's own lock) is being rewritten: its buffer,
++                 * stream segments, position and volumes arrive as a series
++                 * of method writes on the title's thread. Playing it in the
++                 * middle of that mixed old and new state - a voice line
++                 * played from the wrong data, a slot left half set up for
++                 * the next sound. The hardware stalls a locked voice; here
++                 * it sits out this frame. voice_lock takes the same spin
++                 * lock, so a lock never lands while the voice is mid-frame.
++                 * A lock held for more than ~0.2 s is taken to be stuck and
++                 * the voice plays anyway (logged once).
++                 * RECOMP_APU_HONOR_LOCK=0: as before (never skips). */
++                static int honor = -1;
++                static uint16_t held[MCPX_HW_MAX_VOICES];
++                if (honor < 0) {
++                    const char *e = getenv("RECOMP_APU_HONOR_LOCK");
++                    honor = !(e && e[0] == '0');
++                }
+                 voice_spin_lock(d, v);
+-                voice_process(d, mixbins, d->vp.sample_buf, v, list);
++                if (honor && d->vp.voice_locked[v] && held[v] < 300) {
++                    held[v]++;
++                    {
++                        static unsigned skips;
++                        if (getenv("RECOMP_APU_RACE_LOG") && (++skips == 1 || skips % 2000 == 0))
++                            fprintf(stderr, "[APU-RACE] locked voice skipped for a frame (%u so far)\n", skips);
++                    }
++                } else {
++                    if (honor && held[v] >= 300) {
++                        static int warned;
++                        if (warned++ < 4)
++                            fprintf(stderr, "[APU] voice %u locked for 300 frames; playing it anyway\n", v);
++                    }
++                    if (!d->vp.voice_locked[v]) held[v] = 0;
++                    voice_process(d, mixbins, d->vp.sample_buf, v, list);
++                }
+                 voice_spin_unlock(d, v);
+             }
+             d->regs[current] = d->regs[next];
+@@ -1774,6 +1924,8 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
+     memset(d->vp.hrtf_submix, 0, sizeof(d->vp.hrtf_submix));
+     memset(d->vp.submix_headroom, 0, sizeof(d->vp.submix_headroom));
+     memset((void *)d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
++    memset((void *)d->vp.voice_spin_owner, 0, sizeof(d->vp.voice_spin_owner));
++    memset(d->vp.voice_spin_depth, 0, sizeof(d->vp.voice_spin_depth));
+     for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+         hrtf_filter_init(&d->vp.filters[v].hrtf);
+     }
+diff --git a/src/apu/apu_xaudio2.c b/src/apu/apu_xaudio2.c
+index e725646..b7d41e0 100644
+--- a/src/apu/apu_xaudio2.c
++++ b/src/apu/apu_xaudio2.c
+@@ -116,6 +116,15 @@ int xa2_init(void)
+         goto fail;
+     }
+ 
++    {
++        /* RECOMP_AUDIO_SILENT=1: play at zero volume (automated tests on a PC
++         * someone is using); timing, pacing and the WAV tap are unchanged. */
++        const char *e = getenv("RECOMP_AUDIO_SILENT");
++        if (e && e[0] == '1') {
++            IXAudio2MasteringVoice_SetVolume(g_xa2_master, 0.0f, XAUDIO2_COMMIT_NOW);
++            fprintf(stderr, "[XA2] silent (RECOMP_AUDIO_SILENT)\n");
++        }
++    }
+     hr = IXAudio2SourceVoice_Start(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
+     if (FAILED(hr)) {
+         fprintf(stderr, "[XA2] Start failed: 0x%08lX\n", hr);
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
 index 2991d89..bffc8d7 100644
 --- a/src/kernel/kernel_file.c
@@ -199,7 +648,7 @@ index 3c719cf..af0d405 100644
           * the join above leaves a trailing separator -- which CreateFileW
           * rejects even with FILE_FLAG_BACKUP_SEMANTICS, turning an existing
 diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
-index 87788ed..cad3b9a 100644
+index 87788ed..624b417 100644
 --- a/src/kernel/nv2a_backend.h
 +++ b/src/kernel/nv2a_backend.h
 @@ -29,6 +29,8 @@
@@ -254,7 +703,7 @@ index 87788ed..cad3b9a 100644
  } Nv2aRenderState;
  
  typedef struct {
-@@ -87,8 +110,64 @@ typedef struct {
+@@ -87,8 +110,69 @@ typedef struct {
      uint32_t           count;
      const Nv2aTexture *texture;     /* NULL: untextured */
      const Nv2aRenderState *state;
@@ -314,12 +763,17 @@ index 87788ed..cad3b9a 100644
 +    uint32_t        near_z;
 +    uint32_t        fog_enable, fog_mode;
 +    float           fog_param[2];
++    /* The vertex inputs, packed (attrs is NULL then): 64 floats holding all
++     * 16 inputs as per-draw values, then for each vertex only the inputs named
++     * in packed_mask (bit n = input n, lowest first), 4 floats each. */
++    const float    *packed;
++    uint32_t        packed_mask;
 +} Nv2aProgramDraw;
 +
  typedef struct {
      /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
       * zstencil: SET_ZSTENCIL_CLEAR_VALUE (depth in the top 24 bits for Z24S8). */
-@@ -96,6 +175,12 @@ typedef struct {
+@@ -96,6 +180,12 @@ typedef struct {
                    uint32_t flags, uint32_t argb, uint32_t zstencil);
      void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
      void (*flip)(void);
@@ -332,7 +786,7 @@ index 87788ed..cad3b9a 100644
  } Nv2aBackend;
  
  /* Register (or, with NULL, remove) the back end. Call before the title starts
-@@ -117,6 +202,11 @@ void nv2a_backend_register_with_present_sync(const Nv2aBackend *backend,
+@@ -117,6 +207,11 @@ void nv2a_backend_register_with_present_sync(const Nv2aBackend *backend,
   * Returns 0 if the format is not supported. */
  int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
  
@@ -345,7 +799,7 @@ index 87788ed..cad3b9a 100644
   * of the semaphore the title reads GPU progress from (for XDK D3D, the
   * pointer at device+0x30). The executor writes each release there once it
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a5ea9cc..33f5827 100644
+index a5ea9cc..932072f 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -448,6 +448,13 @@ static void dump_texture_bmp(uint32_t seq);
@@ -371,7 +825,7 @@ index a5ea9cc..33f5827 100644
      const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
      int drawn = s_gpu.drawn_offset != 0;
      uint32_t offset = drawn ? s_gpu.drawn_offset : s_gpu.color_offset;
-@@ -839,6 +846,7 @@ static void current_render_state(Nv2aRenderState *r)
+@@ -839,16 +846,108 @@ static void current_render_state(Nv2aRenderState *r)
      r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
      r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
      r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
@@ -379,7 +833,108 @@ index a5ea9cc..33f5827 100644
  }
  
  static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
-@@ -856,7 +864,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+ 
++static int decode_swizzled_fast(const Nv2aTexture *tex, uint32_t *argb_out);
++
++/* One DXT1/3/5 block to 16 texels (0xAARRGGBB, row-major), as
++ * d3d8_dxt_decode_texel gives them one at a time. */
++static void dxt_decode_block(const uint8_t *b, uint32_t fmt, uint32_t px[16])
++{
++    uint32_t alpha[16], c[4], c0, c1, i, bits, wide = fmt != 0x0C;
++
++    if (fmt == 0x0E) {                          /* DXT3: 4 bits per texel */
++        for (i = 0; i < 16; i++) {
++            uint32_t nib = b[i >> 1];
++            alpha[i] = ((i & 1u) ? (nib >> 4) : (nib & 0x0Fu)) * 17u;
++        }
++    } else if (fmt == 0x0F) {                   /* DXT5: two endpoints + 3-bit index */
++        uint32_t a0 = b[0], a1 = b[1], a[8];
++        uint64_t sel = 0;
++        for (i = 0; i < 6; i++)
++            sel |= (uint64_t)b[2 + i] << (8 * i);
++        a[0] = a0; a[1] = a1;
++        if (a0 > a1) {
++            for (i = 1; i < 7; i++)
++                a[i + 1] = ((7 - i) * a0 + i * a1) / 7;
++        } else {
++            for (i = 1; i < 5; i++)
++                a[i + 1] = ((5 - i) * a0 + i * a1) / 5;
++            a[6] = 0; a[7] = 255;
++        }
++        for (i = 0; i < 16; i++)
++            alpha[i] = a[(uint32_t)((sel >> (3 * i)) & 7u)];
++    } else {
++        for (i = 0; i < 16; i++)
++            alpha[i] = 255u;
++    }
++    if (wide)
++        b += 8;
++    c0 = (uint32_t)b[0] | ((uint32_t)b[1] << 8);
++    c1 = (uint32_t)b[2] | ((uint32_t)b[3] << 8);
++    for (i = 0; i < 2; i++) {
++        uint32_t rgb = i ? c1 : c0;
++        c[i] = (d3d8_expand_channel((rgb >> 11) & 0x1Fu, 5) << 16)
++             | (d3d8_expand_channel((rgb >>  5) & 0x3Fu, 6) <<  8)
++             |  d3d8_expand_channel( rgb        & 0x1Fu, 5);
++    }
++    c[2] = c[3] = 0;
++    if (c0 > c1 || wide) {
++        for (i = 0; i < 3; i++) {
++            uint32_t sh = i * 8, m0 = (c[0] >> sh) & 0xFFu, m1 = (c[1] >> sh) & 0xFFu;
++            c[2] |= ((2 * m0 + m1) / 3) << sh;
++            c[3] |= ((m0 + 2 * m1) / 3) << sh;
++        }
++    } else {
++        for (i = 0; i < 3; i++) {
++            uint32_t sh = i * 8, m0 = (c[0] >> sh) & 0xFFu, m1 = (c[1] >> sh) & 0xFFu;
++            c[2] |= ((m0 + m1) / 2) << sh;
++        }
++    }
++    bits = (uint32_t)b[4] | ((uint32_t)b[5] << 8) | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
++    for (i = 0; i < 16; i++) {
++        uint32_t k = (bits >> (2 * i)) & 3u, a = alpha[i];
++        if (!wide && c0 <= c1 && k == 3)
++            a = 0;                              /* DXT1's one bit of alpha */
++        px[i] = (a << 24) | c[k];
++    }
++}
++
+ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+ {
+     Texture saved = s_gpu.texs[0];
+     uint32_t x, y;
+     int ok = 1;
+ 
++    /* DXT: a block at a time. Going through the sampler decoded every block
++     * sixteen times over, and a 512x512 texture took about 150 ms: the bulk
++     * of a level load on a back end, and a hitch whenever an effect's
++     * texture was first used. */
++    if (decode_swizzled_fast(tex, argb_out))
++        return 1;
++    if (d3d8_format_dxt_block_bytes(tex->color) && tex->width && tex->height) {
++        uint32_t bb = d3d8_format_dxt_block_bytes(tex->color);
++        uint32_t bw = (tex->width + 3u) >> 2, bh = (tex->height + 3u) >> 2, bx, by, i;
++        const uint8_t *src = (const uint8_t *)xbox_GetMemoryOffset() + tex->offset;
++        uint32_t px[16];
++
++        if (!guest_span_ok(tex->offset, bw * bh * bb))
++            return 0;
++        for (by = 0; by < bh; by++)
++            for (bx = 0; bx < bw; bx++) {
++                dxt_decode_block(src + ((size_t)by * bw + bx) * bb, tex->color, px);
++                for (i = 0; i < 16; i++) {
++                    x = bx * 4 + (i & 3u); y = by * 4 + (i >> 2);
++                    if (x < tex->width && y < tex->height)
++                        argb_out[(size_t)y * tex->width + x] = px[i];
++                }
++            }
++        return 1;
++    }
++
+     s_gpu.texs[0].offset = tex->offset;
+     s_gpu.texs[0].width  = tex->width;
+     s_gpu.texs[0].height = tex->height;
+@@ -856,7 +955,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
      s_gpu.texs[0].color  = tex->color;
      s_gpu.texs[0].addr_u = 3;
      s_gpu.texs[0].addr_v = 3;
@@ -388,7 +943,7 @@ index a5ea9cc..33f5827 100644
      s_gpu.texs[0].levels = 1;
      s_gpu.texs[0].filter = 0;
      s_gpu.texs[0].cube   = 0;
-@@ -871,6 +879,16 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+@@ -871,6 +970,16 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
      return ok;
  }
  
@@ -405,7 +960,7 @@ index a5ea9cc..33f5827 100644
  /* Swizzled colour surfaces (SURFACE_FORMAT type 2, log2 width/height in bits
   * 16-19/24-27): render-to-texture. The pixel at (x, y) lives at the same
   * Morton offset a swizzled texture of that size uses, so the texture sampler
-@@ -1238,6 +1256,14 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+@@ -1238,6 +1347,14 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          *argb = ((const uint32_t *)(mem + t->palette))[p[u]];
          return 1;
  
@@ -420,7 +975,51 @@ index a5ea9cc..33f5827 100644
      /* 32-bit, other channel orders. The name gives the byte order from the
       * top of the dword down, so each is a permutation of the same four. */
      case 0x3F: {                                    /* LIN_A8B8G8R8 */
-@@ -1359,7 +1385,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+@@ -1344,6 +1461,43 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+     return sample_tex(&s_gpu.texs[0], 0, u, v, argb);
+ }
+ 
++/* The common swizzled formats, a whole texture in one loop (the values are
++ * sample_tex's). A title that animates small textures on the CPU has them
++ * decoded again every few frames. Returns 0 for any other format. */
++static int decode_swizzled_fast(const Nv2aTexture *tex, uint32_t *argb_out)
++{
++    const uint8_t *p = (const uint8_t *)xbox_GetMemoryOffset() + tex->offset;
++    uint32_t w = tex->width, h = tex->height, x, y, fmt = tex->color, bpp;
++
++    switch (fmt) {
++    case 0x00: case 0x01: case 0x19: bpp = 1; break;    /* L8, AY8, A8 */
++    case 0x04:                       bpp = 2; break;    /* A4R4G4B4 */
++    case 0x06: case 0x07:            bpp = 4; break;    /* A8R8G8B8, X8R8G8B8 */
++    default: return 0;
++    }
++    if (!w || !h || !guest_span_ok(tex->offset, w * h * bpp))
++        return 0;
++    for (y = 0; y < h; y++) {
++        uint32_t *o = argb_out + (size_t)y * w;
++        for (x = 0; x < w; x++) {
++            uint32_t i = swizzle_offset(x, y, w, h), t;
++            switch (fmt) {
++            case 0x00: t = p[i]; o[x] = 0xFF000000u | (t << 16) | (t << 8) | t; break;
++            case 0x01: t = p[i]; o[x] = (t << 24) | (t << 16) | (t << 8) | t; break;
++            case 0x19: o[x] = ((uint32_t)p[i] << 24) | 0x00FFFFFFu; break;
++            case 0x04:
++                t = ((const uint16_t *)p)[i];
++                o[x] = (expand((t >> 12) & 0x0F, 4) << 24) | (expand((t >> 8) & 0x0F, 4) << 16)
++                     | (expand((t >> 4) & 0x0F, 4) << 8) | expand(t & 0x0F, 4);
++                break;
++            case 0x06: o[x] = ((const uint32_t *)p)[i]; break;
++            default:   o[x] = ((const uint32_t *)p)[i] | 0xFF000000u; break;
++            }
++        }
++    }
++    return 1;
++}
++
+ /* Write a bound texture out as a BMP, through the sampler rather than around it.
+  *
+  * "Which texture is this" is not answerable from an address and a format, and
+@@ -1359,7 +1513,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
   */
  static void dump_texture_bmp(uint32_t seq)
  {
@@ -429,7 +1028,7 @@ index a5ea9cc..33f5827 100644
      uint32_t w = s_gpu.texs[0].width, h = s_gpu.texs[0].height, x, y;
      uint32_t row_bytes, pad, filesz;
      uint8_t hdr[54];
-@@ -2168,9 +2194,12 @@ static Nv2aVertex *backend_slot(void)
+@@ -2168,9 +2322,12 @@ static Nv2aVertex *backend_slot(void)
      return &s_bverts[s_bcount];
  }
  
@@ -442,7 +1041,7 @@ index a5ea9cc..33f5827 100644
  
      if (tex_size_from_format(s_gpu.texs[0].color)) {
          su = (float)s_gpu.texs[0].width;
-@@ -2183,37 +2212,67 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+@@ -2183,37 +2340,67 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
      o->diffuse = pack_color(v->d0);
      o->u = v->tex[0][0] * su;
      o->v = v->tex[0][1] * sv;
@@ -520,7 +1119,7 @@ index a5ea9cc..33f5827 100644
      s_backend->draw(&surf, &batch);
      s_gpu.tris_drawn += s_bcount / 3;
      s_bcount = 0;
-@@ -2258,6 +2317,13 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+@@ -2258,6 +2445,13 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
              o[k].diffuse = vertex_color(ix[k]);
              o[k].u = textured ? uv[k][0] : 0.0f;
              o[k].v = textured ? uv[k][1] : 0.0f;
@@ -534,7 +1133,7 @@ index a5ea9cc..33f5827 100644
          }
          s_bcount += 3;
          return;
-@@ -3321,15 +3387,207 @@ static void xf_set_viewport(void)
+@@ -3321,15 +3515,342 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -548,8 +1147,10 @@ index a5ea9cc..33f5827 100644
 +static int gpu_program_draw(void)
 +{
 +    static int off = -1, near_z = -1;
-+    static float (*attrs)[16][4];
-+    static uint32_t *slot_of, *tris, *vc_idx, *vc_gen, *vc_slot, gen;
++    static float *packed;
++    uint32_t packed_mask = 0;
++    static uint32_t *slot_of, *tris, *vc_idx, *vc_gen, *vc_slot, *uniq, gen;
++    uint32_t idx_min = 0xFFFFFFFFu, idx_max = 0, a;
 +    static uint32_t prog[NV2A_VSH_SLOTS][8];
 +    Nv2aProgramDraw p;
 +    Nv2aSurface surf;
@@ -570,14 +1171,15 @@ index a5ea9cc..33f5827 100644
 +    memset(&p, 0, sizeof p);
 +    if (!nv2a_vsh_export_program(prog, &p.ninstr, &p.program_rev))
 +        return 0;
-+    if (!attrs) {
-+        attrs   = (float (*)[16][4])malloc((size_t)NV_MAX_INDICES * sizeof *attrs);
++    if (!packed) {
++        packed  = (float *)malloc(((size_t)NV_MAX_INDICES + 1) * 16 * 4 * sizeof *packed);
 +        slot_of = (uint32_t *)malloc((size_t)NV_MAX_INDICES * sizeof *slot_of);
 +        tris    = (uint32_t *)malloc((size_t)NV_MAX_INDICES * 6 * sizeof *tris);
 +        vc_idx  = (uint32_t *)calloc(65536, sizeof *vc_idx);
 +        vc_gen  = (uint32_t *)calloc(65536, sizeof *vc_gen);
 +        vc_slot = (uint32_t *)calloc(65536, sizeof *vc_slot);
-+        if (!attrs || !slot_of || !tris || !vc_idx || !vc_gen || !vc_slot) {
++        uniq    = (uint32_t *)malloc((size_t)NV_MAX_INDICES * sizeof *uniq);
++        if (!packed || !slot_of || !tris || !vc_idx || !vc_gen || !vc_slot || !uniq) {
 +            off = 1;
 +            return 0;
 +        }
@@ -586,24 +1188,36 @@ index a5ea9cc..33f5827 100644
 +        memset(vc_gen, 0, 65536 * sizeof *vc_gen);
 +        gen = 1;
 +    }
-+    /* Unique vertices, in first-use order, and each batch position's slot. */
 +    for (i = 0; i < n; i++) {
-+        uint32_t idx = s_gpu.idx[i], h = idx & 0xFFFFu, a;
-+        s_vc_total++;
-+        if (vc_gen[h] == gen && vc_idx[h] == idx) {
-+            slot_of[i] = vc_slot[h];
-+            s_vc_hits++;
-+            continue;
-+        }
-+        for (a = 0; a < NV2A_VSH_INPUTS; a++) {
-+            if (!s_gpu.attr[a].size && a < NV_VERTEX_ATTRS)
-+                memcpy(attrs[nv][a], s_gpu.imm_attr[a], sizeof attrs[nv][a]);
-+            else
-+                fetch_attr(&s_gpu.attr[a], idx, attrs[nv][a]);
-+        }
-+        vc_gen[h] = gen; vc_idx[h] = idx; vc_slot[h] = nv;
-+        slot_of[i] = nv++;
++        uint32_t idx = s_gpu.idx[i];
++        if (idx < idx_min) idx_min = idx;
++        if (idx > idx_max) idx_max = idx;
 +    }
++    if (n && idx_max - idx_min < n && idx_max - idx_min < NV_MAX_INDICES) {
++        /* The indices cover a range no longer than the batch itself (a mesh
++         * drawn from its own stretch of the vertex buffer, the usual case):
++         * take the range whole and in order. No look-up per index, and the
++         * vertex data is read front to back. */
++        nv = idx_max - idx_min + 1;
++        for (i = 0; i < n; i++)
++            slot_of[i] = s_gpu.idx[i] - idx_min;
++        for (i = 0; i < nv; i++)
++            uniq[i] = idx_min + i;
++    } else {
++        /* Unique vertices, in first-use order, and each batch position's slot. */
++        for (i = 0; i < n; i++) {
++            uint32_t idx = s_gpu.idx[i], h = idx & 0xFFFFu;
++            if (vc_gen[h] == gen && vc_idx[h] == idx) {
++                slot_of[i] = vc_slot[h];
++                continue;
++            }
++            uniq[nv] = idx;
++            vc_gen[h] = gen; vc_idx[h] = idx; vc_slot[h] = nv;
++            slot_of[i] = nv++;
++        }
++    }
++    s_vc_total += n;
++    s_vc_hits += n - nv;
 +#define TRI(x, y, z) (tris[nt++] = slot_of[x], tris[nt++] = slot_of[y], tris[nt++] = slot_of[z])
 +    switch (s_gpu.prim) {
 +    case NV_PRIM_TRIANGLES:
@@ -647,6 +1261,66 @@ index a5ea9cc..33f5827 100644
 +        if (!s_gpu.depth_test && (int)nv < cpu_max)
 +            return 0;
 +    }
++    /* Inputs of the unique vertices, packed: first all 16 inputs as per-draw
++     * values (immediate values, defaults), then per vertex only the inputs
++     * that come from arrays. The common layouts (floats and D3DCOLOR in guest
++     * memory, the whole index range checked once) are copied directly;
++     * anything else goes through fetch_attr. Expanding every vertex to all
++     * 16 inputs (256 bytes) was the executor's largest cost. */
++    {
++        struct { const uint8_t *base; uint32_t stride, type, cnt, slow; } src[NV2A_VSH_INPUTS];
++        uint32_t nsrc = 0, v, k;
++        float (*tmpl)[4] = (float (*)[4])packed, *o = packed + 64;
++        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
++
++        for (a = 0; a < NV2A_VSH_INPUTS; a++) {
++            const VertexAttr *at = &s_gpu.attr[a];
++            tmpl[a][0] = tmpl[a][1] = tmpl[a][2] = 0.0f; tmpl[a][3] = 1.0f;
++            if (!at->size && a < NV_VERTEX_ATTRS) {
++                memcpy(tmpl[a], s_gpu.imm_attr[a], sizeof tmpl[a]);
++                continue;
++            }
++            if (!at->size || !at->stride)
++                continue;                       /* fetch_attr: 0,0,0,1 */
++            packed_mask |= 1u << a;
++            src[nsrc].slow = a + 1;
++            if (!s_gpu.inline_active && at->offset && (at->type == 2 || at->type == 0)
++                && guest_span_ok((uint64_t)at->offset + (uint64_t)idx_min * at->stride, attr_elem_bytes(at))
++                && guest_span_ok((uint64_t)at->offset + (uint64_t)idx_max * at->stride, attr_elem_bytes(at))) {
++                src[nsrc].slow = 0;
++                src[nsrc].base = mem + at->offset;
++                src[nsrc].stride = at->stride;
++                src[nsrc].type = at->type;
++                src[nsrc].cnt = at->size < 4 ? at->size : 4;
++            }
++            nsrc++;
++        }
++        for (v = 0; v < nv; v++) {
++            uint32_t idx = uniq[v];
++            for (k = 0; k < nsrc; k++, o += 4) {
++                const uint8_t *q;
++                if (src[k].slow) {
++                    fetch_attr(&s_gpu.attr[src[k].slow - 1], idx, o);
++                    continue;
++                }
++                q = src[k].base + (size_t)idx * src[k].stride;
++                if (src[k].type == 2) {
++                    const float *f = (const float *)q;
++                    switch (src[k].cnt) {
++                    case 4:  o[0] = f[0]; o[1] = f[1]; o[2] = f[2]; o[3] = f[3]; break;
++                    case 3:  o[0] = f[0]; o[1] = f[1]; o[2] = f[2]; o[3] = 1.0f; break;
++                    case 2:  o[0] = f[0]; o[1] = f[1]; o[2] = 0.0f; o[3] = 1.0f; break;
++                    default: o[0] = f[0]; o[1] = 0.0f; o[2] = 0.0f; o[3] = 1.0f; break;
++                    }
++                } else {
++                    o[0] = (float)q[2] * (1.0f / 255.0f);
++                    o[1] = (float)q[1] * (1.0f / 255.0f);
++                    o[2] = (float)q[0] * (1.0f / 255.0f);
++                    o[3] = (float)q[3] * (1.0f / 255.0f);
++                }
++            }
++        }
++    }
 +    s_gpu.batches_program++;
 +    s_gpu.verts_program += n;
 +    if (!nt)
@@ -654,7 +1328,67 @@ index a5ea9cc..33f5827 100644
 +    if (s_bcount)
 +        backend_flush(1);
 +
-+    p.attrs = (const float (*)[16][4])attrs;
++    p.attrs = NULL;
++    p.packed = packed;
++    p.packed_mask = packed_mask;
++    {
++        /* RECOMP_VB_DYN_LOG=1: does the title rewrite vertex data in place?
++         * Each array-fed batch is keyed by where its vertices come from; the
++         * same key arriving with different contents is a buffer rewritten
++         * between draws. A title that does that depends on the GPU having
++         * read the old contents first (the fence waits it makes). */
++        static int on = -1;
++        static struct { uint32_t off, lo, nv, hash, seen, changed; } tab[8192];
++        static uint32_t draws, changed_draws, inline_draws;
++        if (on < 0) on = getenv("RECOMP_VB_DYN_LOG") != NULL;
++        if (on) {
++            draws++;
++            if (s_gpu.inline_active) inline_draws++;
++            else if (nv) {
++                /* each array-fed input on its own: where it lies in guest
++                 * memory, and what the bytes of this batch's vertices are */
++                const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
++                uint32_t ai, any = 0;
++                for (ai = 0; ai < NV_VERTEX_ATTRS; ai++) {
++                    const VertexAttr *at = &s_gpu.attr[ai];
++                    uint32_t off = at->offset, hsh = 2166136261u, k, slot, eb;
++                    if (!at->size || !at->stride || !off) continue;
++                    eb = attr_elem_bytes(at) & ~3u;
++                    if (!eb || !guest_span_ok((uint64_t)off + (uint64_t)idx_max * at->stride, eb)) continue;
++                    for (k = 0; k < nv; k++) {
++                        const uint32_t *w = (const uint32_t *)(gm + off + (size_t)uniq[k] * at->stride);
++                        uint32_t q;
++                        for (q = 0; q < eb / 4; q++) hsh = (hsh ^ w[q]) * 16777619u;
++                    }
++                    slot = (off * 2654435761u ^ idx_min * 40503u ^ nv ^ (ai << 9)) & 8191u;
++                    if (tab[slot].seen && tab[slot].off == off && tab[slot].lo == idx_min && tab[slot].nv == nv) {
++                        if (tab[slot].hash != hsh) {
++                            any = 1;
++                            if (tab[slot].changed++ < 2)
++                                fprintf(stderr, "[VBDYN] input %u at %08X +%u x%u rewritten in place\n", ai, off, idx_min, nv);
++                        }
++                    } else {
++                        tab[slot].off = off; tab[slot].lo = idx_min; tab[slot].nv = nv; tab[slot].seen = 1; tab[slot].changed = 0;
++                    }
++                    tab[slot].hash = hsh;
++                }
++                changed_draws += any;
++            }
++            if (draws >= 200000) {
++                fprintf(stderr, "[VBDYN] %u program draws: %u from inline data, %u from arrays rewritten in place\n",
++                        draws, inline_draws, changed_draws);
++                draws = changed_draws = inline_draws = 0;
++                {
++                    uint32_t q;
++                    for (q = 0; q < 8192; q++) {
++                        if (tab[q].changed >= 20)
++                            fprintf(stderr, "[VBDYN]   %08X +%u x%u: %u times\n", tab[q].off, tab[q].lo, tab[q].nv, tab[q].changed);
++                        tab[q].changed = 0;
++                    }
++                }
++            }
++        }
++    }
 +    p.nverts = nv;
 +    p.indices = tris;
 +    p.nindices = nt;
@@ -745,7 +1479,16 @@ index a5ea9cc..33f5827 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -3687,7 +3945,8 @@ static void draw_primitive(void)
+@@ -3615,8 +4136,6 @@ static void draw_primitive(void)
+     if (!s_gpu.prim || !s_gpu.idx_count)
+         return;
+     s_gpu.draws++;
+-    if ((s_gpu.draws % 200) == 0)
+-        fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
+     s_gpu.verts += s_gpu.idx_count;
+ 
+     /* How many batches carry coordinates at all, and what range they span.
+@@ -3687,7 +4206,8 @@ static void draw_primitive(void)
          }
      }
  
@@ -755,7 +1498,37 @@ index a5ea9cc..33f5827 100644
          static int shown;
          if (shown++ < 6) {
              fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
-@@ -4346,7 +4605,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4173,6 +4693,29 @@ int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
+     return 1;
+ }
+ 
++/* ARRAY_ELEMENT16/32 (index data), the other bulk of a frame's words, also
++ * without the general dispatch. Returns 0 for anything else. */
++int nv2a_pb_exec_index_word(uint32_t method, uint32_t param)
++{
++    if (!s_exec_inited || s_ftrace == 2)
++        return 0;
++    if (method == NV097_ARRAY_ELEMENT16) {
++        s_reg[0x1800 / 4] = param;
++        if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
++            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
++            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
++        }
++        return 1;
++    }
++    if (method == 0x1808) {
++        s_reg[0x1808 / 4] = param;
++        if (s_gpu.prim && s_gpu.idx_count < NV_MAX_INDICES)
++            s_gpu.idx[s_gpu.idx_count++] = param;
++        return 1;
++    }
++    return 0;
++}
++
+ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+ {
+     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
+@@ -4346,7 +4889,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x033C: s_gpu.alpha_func = param; break;
      case 0x0340: s_gpu.alpha_ref = param; break;
      case 0x02A4: s_gpu.fog_enable = param; break;
@@ -769,7 +1542,7 @@ index a5ea9cc..33f5827 100644
      case 0x029C: s_gpu.fog_mode = param; break;
      case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
      case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
-@@ -4792,7 +5056,7 @@ static void find_nan_matrices(void)
+@@ -4792,7 +5340,7 @@ static void find_nan_matrices(void)
   * pointer or a number", and guessing wrong costs a run. */
  static void peek_addresses(void)
  {
@@ -778,7 +1551,7 @@ index a5ea9cc..33f5827 100644
      const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
      char buf[256];
      char *tok, *ctx = NULL;
-@@ -4823,7 +5087,7 @@ static void peek_addresses(void)
+@@ -4823,7 +5371,7 @@ static void peek_addresses(void)
   */
  static void peek_chain(void)
  {
@@ -787,7 +1560,7 @@ index a5ea9cc..33f5827 100644
      const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
      char buf[256], *tok, *ctx = NULL;
      uint32_t cur = 0;
-@@ -4861,13 +5125,15 @@ void nv2a_pb_exec_report(void)
+@@ -4861,13 +5409,15 @@ void nv2a_pb_exec_report(void)
  {
      peek_addresses();
      peek_chain();
@@ -805,7 +1578,7 @@ index a5ea9cc..33f5827 100644
          static int done;
          if (!done) { done = 1; find_quad_vertices(); }
      }
-@@ -4885,6 +5151,12 @@ void nv2a_pb_exec_report(void)
+@@ -4885,6 +5435,12 @@ void nv2a_pb_exec_report(void)
          last_flips = s_gpu.flips;
          last_ms = now;
      }
@@ -818,6 +1591,48 @@ index a5ea9cc..33f5827 100644
      flip_hold_report();
      fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
                      " clears %u | %u unhandled methods (%d distinct)\n",
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index 5fab4c3..3f83d87 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -44,6 +44,7 @@ static uint32_t s_tot_calls;
+  * the executor writes to guest memory. */
+ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+ extern int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param);
++extern int nv2a_pb_exec_index_word(uint32_t method, uint32_t param);
+ extern void nv2a_pb_exec_report(void);
+ 
+ /* One word to the executor. SET_TRANSFORM_CONSTANT words, the bulk of a
+@@ -54,6 +55,9 @@ static void exec_word(uint32_t subch, uint32_t method, uint32_t param)
+     if (subch == 0 && method >= 0x0B80u && method < 0x0C00u
+             && nv2a_pb_exec_constant_word(method, param))
+         return;
++    if (subch == 0 && (method == 0x1800u || method == 0x1808u)
++            && nv2a_pb_exec_index_word(method, param))
++        return;
+     nv2a_pb_exec_method(subch, method, param);
+ }
+ static int s_exec_enabled = -1;
+@@ -84,7 +88,18 @@ static uint16_t s_seen_slot[8][0x2000 / 4];
+ 
+ static void note(uint32_t subch, uint32_t method)
+ {
+-    uint16_t *slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
++    /* RECOMP_PB_INVENTORY=0: no method inventory. It is a bring-up aid, and
++     * counting every pushbuffer word was 6% of the executor at 240 fps. */
++    static int on = -1;
++    uint16_t *slot;
++
++    if (on < 0) {
++        const char *e = getenv("RECOMP_PB_INVENTORY");
++        on = !(e && e[0] == '0');
++    }
++    if (!on)
++        return;
++    slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
+ 
+     if (*slot) {
+         s_seen[*slot - 1].count++;
 diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
 index c7fd25d..63673f2 100644
 --- a/src/kernel/nv2a_vsh_interp.c
@@ -954,3 +1769,78 @@ index 8acb0af..2ac7552 100644
 +const float (*nv2a_vsh_export_constants(uint32_t *rev))[4];
 +
  #endif
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 7ade793..d643492 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -4491,6 +4491,35 @@ static void heap_forget_ram_names(int m)
+         g_phys_ram_named[p] = 0;
+ }
+ 
++/* Whether `pa` lies inside a live (allocated) heap block. */
++int xbox_HeapLiveAt(uint32_t pa)
++{
++    int i, live;
++    if (pa < XBOX_HEAP_BASE || pa >= XBOX_HEAP_TOP)
++        return 0;
++    AcquireSRWLockShared(&g_heap_lock);
++    i = heap_block_at(pa);
++    live = i >= 0 && !g_heap_blocks[i].free;
++    ReleaseSRWLockShared(&g_heap_lock);
++    return live;
++}
++
++/* Diagnostics: the heap block holding pa (live or free). 0 when none. */
++int xbox_HeapBlockInfo(uint32_t pa, uint32_t *addr, uint32_t *size, int *is_free, int *named)
++{
++    int i;
++    if (pa < XBOX_HEAP_BASE || pa >= XBOX_HEAP_TOP)
++        return 0;
++    AcquireSRWLockShared(&g_heap_lock);
++    i = heap_block_at(pa);
++    if (i >= 0) {
++        *addr = g_heap_blocks[i].addr; *size = g_heap_blocks[i].size;
++        *is_free = g_heap_blocks[i].free; *named = g_heap_blocks[i].named;
++    }
++    ReleaseSRWLockShared(&g_heap_lock);
++    return i >= 0;
++}
++
+ const volatile uint8_t *xbox_PhysRamNameMap(void)
+ {
+     return g_phys_ram_named;
+@@ -4688,14 +4717,16 @@ void xbox_HeapFree(uint32_t xbox_va)
+             if (n < g_heap_block_count && g_heap_blocks[n].free &&
+                 g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[n].addr) {
+                 g_heap_blocks[i].size += g_heap_blocks[n].size;
+-                g_heap_blocks[n].size = 0;
+-                g_heap_blocks[n].addr = 0;
++                g_heap_blocks[n].size = 0;   /* empty; keeps its address so index order stays
++                                                * address order (heap_block_at binary-searches it;
++                                                * zeroing it sent lookups to the wrong block) */
+             }
+             if (p >= 0 && g_heap_blocks[p].free &&
+                 g_heap_blocks[p].addr + g_heap_blocks[p].size == g_heap_blocks[i].addr) {
+                 g_heap_blocks[p].size += g_heap_blocks[i].size;
+-                g_heap_blocks[i].size = 0;
+-                g_heap_blocks[i].addr = 0;
++                g_heap_blocks[i].size = 0;   /* empty; keeps its address so index order stays
++                                                * address order (heap_block_at binary-searches it;
++                                                * zeroing it sent lookups to the wrong block) */
+                 m = p;
+             }
+             /* After the merge, so a page this block shared with a neighbour
+diff --git a/src/kernel/xbox_memory_layout.h b/src/kernel/xbox_memory_layout.h
+index da4c155..f1e7c85 100644
+--- a/src/kernel/xbox_memory_layout.h
++++ b/src/kernel/xbox_memory_layout.h
+@@ -221,6 +221,9 @@ const volatile uint8_t *xbox_PhysRamNameMap(void);
+ /* Whether physical byte `pa` lies in a live heap block the title named:
+  * the page map refined to the block (see xbox_PhysRamNamedAt). */
+ int xbox_PhysRamNamedAt(uint32_t pa);
++/* Whether a physical number below 64 MB lies inside a live heap block. */
++int xbox_HeapLiveAt(uint32_t pa);
++int xbox_HeapBlockInfo(uint32_t pa, uint32_t *addr, uint32_t *size, int *is_free, int *named);
+ uint32_t xbox_ContiguousInUseBytes(void);
+ 
+ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,

@@ -9,5 +9,6 @@ py -3 -m tools.func_id game_files/default.xbe > $L/regen_funcid.log 2>&1
 py -3 -m tools.abi_analysis game_files/default.xbe > $L/regen_abi.log 2>&1
 py -3 -m tools.recomp game_files/default.xbe --all --split 250 --gen-dir "$P/src/recomp/gen" --exclude-manual "$P/src/recomp_manual.c" > $L/regen_lift.log 2>&1
 cd $P
+py -3 recomp_config/tools/fast_mmio.py src/recomp/gen > $L/regen_fastmmio.log 2>&1
 "$CM" --build build --config Release --parallel > $L/regen_build.log 2>&1
 echo "regen ok"

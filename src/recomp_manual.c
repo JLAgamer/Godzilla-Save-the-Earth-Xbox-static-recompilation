@@ -148,11 +148,83 @@ extern void sub_002237F0_gen(void);
 #define GZ_NV2A_USER_PUT 0xFD800040u
 #define GZ_NV2A_USER_GET 0xFD800044u
 
+/* -- Sound-chip register access without the trap --
+ *
+ * DSOUND commits a 3D voice's HRTF filter and volumes (about 20 and 7
+ * register accesses per voice) every time the game moves a voice or the
+ * listener: every 3D voice, every frame. Each access faulted into the APU
+ * model; at 240 fps that was a tenth to a fifth of the game thread.
+ * recomp_config/tools/fast_mmio.py rewrites those two lifted functions to call
+ * these for addresses in the APU window: the same model calls the fault
+ * handler ends in, without the exception. */
+extern void *g_apu_state;
+extern uint64_t mcpx_apu_mmio_read(void *d, uint64_t addr, unsigned int size);
+extern void mcpx_apu_mmio_write(void *d, uint64_t addr, uint64_t val, unsigned int size);
+void gz_apu_w32(uint32_t addr, uint32_t value)
+{
+    mcpx_apu_mmio_write(g_apu_state, addr - 0xFE800000u, value, 4);
+}
+uint32_t gz_apu_r32(uint32_t addr)
+{
+    return (uint32_t)mcpx_apu_mmio_read(g_apu_state, addr - 0xFE800000u, 4);
+}
+
+/* The renderer's begin-frame (sub_000A8510) inserts a fence and blocks on it
+ * at once: the game waits until the GPU has finished the whole previous
+ * frame before it starts the next, so the game thread and the pushbuffer
+ * executor take turns instead of overlapping. Here that wait is for the
+ * fence of the begin-frame before: the executor may run up to one frame
+ * behind, and both threads work at the same time. D3D still blocks on its
+ * own fences wherever it locks a resource the GPU has yet to use, so buffers
+ * are not rewritten early. GZ_GPU_LAG=0 restores the original wait. */
+static double gz_fence_wait_s;      /* time blocked on the GPU, for the hitch log */
+static double gz_fence_wait_max;
+static uint32_t gz_fence_wait_ra[4];
+static uint32_t gz_lag_fence(uint32_t fence)
+{
+    static int on = -1;
+    static uint32_t prev, have;
+    uint32_t use = fence;
+    if (on < 0) { const char *e = getenv("GZ_GPU_LAG"); on = !(e && *e == '0'); }
+    if (!on) return fence;
+    if (have) use = prev;
+    prev = fence; have = 1;
+    return use;
+}
+
 void sub_002237F0(void)
 {
     uint32_t fence = GZ_MEM32(g_esp + 4);
     uint32_t dev = GZ_MEM32(GZ_D3D_DEVICE_PTR);
     uint32_t sem_va = dev ? GZ_MEM32(dev + 0x30) : 0;
+
+    {
+        /* GZ_FENCE_LOG=1: who blocks on fences, per 2000 calls. */
+        static int flog = -1;
+        static unsigned n, begin, swap, other, other_ra[4], other_n[4];
+        if (flog < 0) flog = getenv("GZ_FENCE_LOG") != NULL;
+        if (flog) {
+            uint32_t r0 = GZ_MEM32(g_esp), r1 = GZ_MEM32(g_esp + 12);
+            int k;
+            if (r0 == 0x0021ED7Cu && r1 == 0x000A853Bu) begin++;
+            else if (r0 == 0x00223B10u) swap++;
+            else {
+                uint32_t key = r0 == 0x0021ED7Cu ? r1 : r0;
+                other++;
+                for (k = 0; k < 4; k++) if (other_ra[k] == key || !other_ra[k]) { other_ra[k] = key; other_n[k]++; break; }
+            }
+            if (++n >= 2000) {
+                fprintf(stderr, "[FENCE] 2000 waits: begin-frame %u, swap %u, other %u (%08X x%u, %08X x%u, %08X x%u, %08X x%u)\n",
+                        begin, swap, other, other_ra[0], other_n[0], other_ra[1], other_n[1], other_ra[2], other_n[2], other_ra[3], other_n[3]);
+                n = begin = swap = other = 0; memset(other_ra, 0, sizeof other_ra); memset(other_n, 0, sizeof other_n);
+            }
+        }
+    }
+    /* Called as BlockOnFence (return 0x0021ED7C) from begin-frame (0x000A853B). */
+    if (GZ_MEM32(g_esp) == 0x0021ED7Cu && GZ_MEM32(g_esp + 12) == 0x000A853Bu) {
+        fence = gz_lag_fence(fence);
+        GZ_MEM32(g_esp + 4) = fence;
+    }
 
     if (sem_va) {
         gz_register_semaphore();
@@ -177,6 +249,8 @@ void sub_002237F0(void)
                 DWORD t0 = GetTickCount();
                 uint32_t get0 = GZ_MEM32(GZ_NV2A_USER_GET);
                 int drained = 0;
+                LARGE_INTEGER qa, qb, qf2;
+                QueryPerformanceCounter(&qa);
                 while (!GZ_FENCE_DONE()) {
                     uint32_t get = GZ_MEM32(GZ_NV2A_USER_GET);
                     DWORD dt;
@@ -185,6 +259,16 @@ void sub_002237F0(void)
                     drained = GZ_MEM32(GZ_NV2A_USER_PUT) == get;
                     if ((drained && dt >= GZ_FENCE_WAIT_MS) || dt >= 30000u) break;
                     Sleep(0);
+                }
+                QueryPerformanceCounter(&qb); QueryPerformanceFrequency(&qf2);
+                {
+                    double w = (double)(qb.QuadPart - qa.QuadPart) / (double)qf2.QuadPart;
+                    gz_fence_wait_s += w;
+                    if (w > gz_fence_wait_max) {
+                        gz_fence_wait_max = w;
+                        gz_fence_wait_ra[0] = GZ_MEM32(g_esp); gz_fence_wait_ra[1] = GZ_MEM32(g_esp + 12);
+                        gz_fence_wait_ra[2] = GZ_MEM32(g_esp + 16); gz_fence_wait_ra[3] = GZ_MEM32(g_esp + 20);
+                    }
                 }
                 if (!GZ_FENCE_DONE()) {
                     static int s_forced;
@@ -253,10 +337,42 @@ int  gz_movie_update(uint32_t obj, uint8_t *dst);
 void gz_movie_tick(void);
 extern void sub_001F0650_gen(void);
 
+/* Skipped movies (no host playback): the title's own movie player still
+ * puts a soundtrack on a DirectSound stream (16-bit PCM, 44.1 kHz), and what
+ * it queues here is broken - noise, a stuck full-scale value - over the
+ * skipped intro movies and the menu's idle movie. That PCM stream is kept out
+ * of the mix from the movie's Open until a second after the movie is done.
+ * The music is an ADPCM stream and is not affected. GZ_MOVIE_MUTE=0: off. */
+extern volatile long g_apu_mute_pcm_streams;
+static volatile DWORD gz_movie_unmute_at;   /* GetTickCount() to unmute at; 0 = none pending */
+static int gz_movie_mute_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("GZ_MOVIE_MUTE"); on = !(e && *e == '0'); }
+    return on;
+}
+
+/* Once per game frame (the limiter): end the mute a second after the last
+ * skipped movie finished. */
+static void gz_movie_mute_tick(void)
+{
+    DWORD at = gz_movie_unmute_at;
+    if (at && (LONG)(GetTickCount() - at) >= 0) {
+        gz_movie_unmute_at = 0;
+        g_apu_mute_pcm_streams = 0;
+        fprintf(stderr, "[MOVIE] movie soundtrack unmuted\n");
+    }
+}
+
 /* Open(this, const char *file, ...): thiscall, ret 20. */
 void sub_001F0650(void)
 {
     uint32_t movie = g_ecx, name = GZ_MEM32(g_esp + 4);
+    if (!gz_movie_enabled() && !gz_play_movies() && gz_movie_mute_on()) {
+        if (!g_apu_mute_pcm_streams) fprintf(stderr, "[MOVIE] movie soundtrack muted while skipped\n");
+        g_apu_mute_pcm_streams = 1;
+        gz_movie_unmute_at = 0;
+    }
     sub_001F0650_gen();
     if (name && gz_movie_enabled())
         gz_movie_open(movie, (const char *)((uintptr_t)name + g_xbox_mem_offset));
@@ -303,6 +419,7 @@ void sub_001F05B0(void)
                 gz_movies_skipped++;
                 fprintf(stderr, "[MOVIE] skipped movie object 0x%08X after %d frames\n",
                         movie, s_count);
+                if (g_apu_mute_pcm_streams) gz_movie_unmute_at = GetTickCount() + 1000u;
             }
         }
     }
@@ -1226,25 +1343,36 @@ static void gz_camera_tick(void)
     }
 }
 
-/* -- Widescreen: a 16:9 camera ---------------------------------------------
+/* -- Widescreen ------------------------------------------------------------
+ *
+ * The game's cameras are left exactly as the game sets them (4:3), so
+ * everything the game works out from a camera - where a 3D point lands on
+ * the HUD, how to frame both monsters - stays consistent. The picture is
+ * widened at two points only:
+ *
+ *  - sub_000A6820(this = renderer 0x004322D0, type, matrix), the renderer's
+ *    set-transform (type 2 = projection): a perspective projection at 4:3
+ *    gets its x scale x 3/4, in a copy below the stack. A third more is
+ *    drawn on each side into the 640x480 frame the back end shows at 16:9
+ *    (and the back end squeezes 2D by the same 3/4, so it keeps its shape
+ *    and its place over the 3D scene).
+ *
+ *  - sub_00030840(this = frustum, camera, ...) (ret 12) and sub_00031470(this
+ *    = frustum, camera) (ret 4) build the planes objects are culled against
+ *    from the camera: position, axes and the projection scales +0x130
+ *    (across) and +0x134 (up; across = up x aspect, aspect +0x148 = 3/4).
+ *    While they run, a 4:3 camera's across scale is x 3/4 as well, so the
+ *    frustum matches what is drawn.
  *
  * sub_0001F740(this = camera, fov, a2, a3, aspect) is the camera's
- * set-perspective (ret 16). fov is vertical; aspect 0 means "from the
- * viewport": (+0x160 / +0x164, 640 / 480) x the float at 0x0043239C. The
- * fight camera passes an explicit aspect (1); the HUD and menu cameras pass
- * 0 and are not widened (the game places the HUD through them). From
- * those it stores the half-extents of the view at +0x130 (across) and +0x134
- * (up), the projection at +0x60, and hands the projection to the renderer.
- * With widescreen on the camera is given a 4/3 wider aspect here, so the
- * view, the matrix AND the game's culling (which reads the camera, not the
- * renderer) all widen together: the same view up and down, a third more to
- * the sides, drawn into the 640x480 frame the back end shows at 16:9.
- *
- * sub_000A6820(this = renderer 0x004322D0, type, matrix) is the renderer's
- * set-transform (type 2 = projection, kept at renderer + 0x1160). A
- * projection that still arrives at 4:3 (one not built by the camera above:
- * menus, cut scenes) gets its x scale x 3/4 there instead, in a copy below
- * the stack. */
+ * set-perspective (ret 16; aspect is height / width, 0 = "from the
+ * viewport"). An earlier version widened the camera there instead. The game
+ * hands a camera's stored aspect back to it, that code took the widened value
+ * for a fresh one and undid it, and fights ended up with a 4:3 camera - 4:3
+ * culling - under a 16:9 picture: scenery vanished in the outer sixths of the
+ * screen. Menu cameras were never widened, which is how the main menu's
+ * Godzilla head disappeared as the camera swung to the monster select.
+ * GZ_WIDE_CULL=0: no frustum change (to compare). */
 extern void sub_0001F740_gen(void);
 
 /* A fight is on screen when a match (heap) camera was set up more recently
@@ -1262,64 +1390,56 @@ void sub_0001F740(void)
     if (g_ecx >= 0x01000000u) gz_fight_cam_seq = ++gz_cam_seq;
     else gz_shell_cam_seq = ++gz_cam_seq;
     if (gz_opt_wide()) {
-        uint32_t ab = GZ_MEM32(g_esp + 16), pb = GZ_MEM32(0x0043239Cu);
-        float aspect, pix;
         static int nlog;
-        memcpy(&aspect, &ab, 4);
-        memcpy(&pix, &pb, 4);
         if (getenv("GZ_WIDE_LOG") && nlog++ < 40) {
-            uint32_t fb = GZ_MEM32(g_esp + 4); float fov; memcpy(&fov, &fb, 4);
-            fprintf(stderr, "[WIDE] camera %08X fov %.4g aspect arg %.4g pix %.4g viewport %ux%u\n", g_ecx, fov, aspect, pix,
+            uint32_t fb = GZ_MEM32(g_esp + 4), ab = GZ_MEM32(g_esp + 16);
+            float fov, aspect;
+            memcpy(&fov, &fb, 4); memcpy(&aspect, &ab, 4);
+            fprintf(stderr, "[WIDE] camera %08X fov %.4g aspect arg %.4g viewport %ux%u\n", g_ecx, fov, aspect,
                     GZ_MEM32(g_ecx + 0x160), GZ_MEM32(g_ecx + 0x164));
         }
-        if (aspect != 0.0f && g_ecx >= 0x01000000u) {
-            /* The shell's cameras are static objects (0x0042xxxx) and lay out
-             * menus and 2D; the fight camera is created with the match, on
-             * the heap. Its aspect varies (1, 0.75 seen), so it is widened
-             * whatever it is - once: see the table below. */
-            /* Some cameras are handed back the aspect they were last given;
-             * widening that again would compound frame after frame. So each
-             * camera's last widened value is remembered and passed through. */
-            static uint32_t cams[32], outs[32];
-            int k, slot = -1;
-            for (k = 0; k < 32; k++) if (cams[k] == g_ecx) { slot = k; break; }
-            if (slot < 0) for (k = 0; k < 32; k++) if (!cams[k]) { slot = k; cams[k] = g_ecx; outs[k] = 0; break; }
-            if (slot < 0) { slot = (int)(g_ecx >> 4) & 31; cams[slot] = g_ecx; outs[slot] = 0; }
-            if (ab != outs[slot]) {
-                aspect *= 4.0f / 3.0f;
-                memcpy(&outs[slot], &aspect, 4);
-            }
-            memcpy(&ab, &aspect, 4);
-            GZ_MEM32(g_esp + 16) = ab;
-            sub_0001F740_gen();
-        } else if (aspect == 0.0f && g_ecx >= 0x01000000u && pix > 0.1f && pix < 10.0f) {
-            /* aspect 0 = "from the screen". The HUD's and menus' cameras all
-             * use a field of view of 0.7181 and are left alone (the game lays
-             * the HUD out through them; the back end keeps 2D in shape). A
-             * 3D game camera can also ask for aspect 0 - the attract-mode
-             * demo's (fov 0.7854) - and must be widened, or the game culls
-             * at 4:3: the screen multiplier at 0x0043239C is scaled for this
-             * one call. */
-            uint32_t fb = GZ_MEM32(g_esp + 4);
-            float fov;
-            memcpy(&fov, &fb, 4);
-            if (fov < 0.71f || fov > 0.725f) {
-                /* this multiplier divides the width: 3/4 of it is a 4/3 wider view */
-                float wide = pix * 0.75f;
-                uint32_t wb;
-                memcpy(&wb, &wide, 4);
-                GZ_MEM32(0x0043239Cu) = wb;
-                sub_0001F740_gen();
-                GZ_MEM32(0x0043239Cu) = pb;
-            } else
-                sub_0001F740_gen();
-        } else {
-            sub_0001F740_gen();
-        }
-        return;
     }
     sub_0001F740_gen();
 }
+
+extern void sub_00030840_gen(void);
+extern void sub_00031470_gen(void);
+static void gz_frustum_build(void (*gen)(void))
+{
+    static int on = -1, nlog;
+    uint32_t cam = GZ_MEM32(g_esp + 4), old = 0;
+    int widen = 0;
+    if (on < 0) { const char *e = getenv("GZ_WIDE_CULL"); on = !(e && *e == '0'); }
+    if (on && cam >= 0x00010000u && gz_opt_wide()) {
+        uint32_t vb = GZ_MEM32(cam + 0x134u);
+        float h, v, r;
+        old = GZ_MEM32(cam + 0x130u);
+        memcpy(&h, &old, 4); memcpy(&v, &vb, 4);
+        r = v != 0.0f ? h / v : 0.0f;
+        /* the cameras whose projection sub_000A6820 widens: 4:3 ones */
+        widen = r > 0.743f && r < 0.758f;
+        if (nlog < 16 && getenv("GZ_WIDE_LOG")) {
+            static uint32_t seen[16];
+            int q, known = 0;
+            for (q = 0; q < nlog; q++) if (seen[q] == (cam ^ (uint32_t)widen)) known = 1;
+            if (!known) {
+                seen[nlog++] = cam ^ (uint32_t)widen;
+                fprintf(stderr, "[WIDE] frustum from camera %08X: across %.4g up %.4g (aspect %.4f) -> %s\n",
+                        cam, h, v, r, widen ? "built 4/3 wider" : "as it is");
+            }
+        }
+        if (widen) {
+            uint32_t hb;
+            h *= 0.75f;
+            memcpy(&hb, &h, 4);
+            GZ_MEM32(cam + 0x130u) = hb;
+        }
+    }
+    gen();
+    if (widen) GZ_MEM32(cam + 0x130u) = old;
+}
+void sub_00030840(void) { gz_frustum_build(sub_00030840_gen); }
+void sub_00031470(void) { gz_frustum_build(sub_00031470_gen); }
 
 extern void sub_000A6820_gen(void);
 
@@ -1382,6 +1502,49 @@ void sub_000B2A00(void)
  * a request under 10 us), so frames run as fast as they render. */
 extern void sub_00012240_gen(void);
 extern GZ_TLS double g_fp_stack[8];
+
+/* GZ_PACE_LOG: a watchdog thread that, when a frame has run 7 ms past its
+ * start, logs the guest return addresses on the game thread's stack: what
+ * the game was doing in a slow frame. */
+static volatile LONGLONG gz_slow_frame_start;      /* QPC ticks; 0 = not armed */
+static uint32_t *volatile gz_slow_esp;
+static DWORD WINAPI gz_slow_thread(LPVOID arg)
+{
+    LARGE_INTEGER f, q;
+    LONGLONG reported = 0;
+    int shown = 0;
+    (void)arg;
+    QueryPerformanceFrequency(&f);
+    for (;;) {
+        LONGLONG st = gz_slow_frame_start;
+        Sleep(1);
+        if (!st || st == reported || !gz_slow_esp || shown > 400) continue;
+        QueryPerformanceCounter(&q);
+        if ((q.QuadPart - st) * 1000 / f.QuadPart >= 7 && st == gz_slow_frame_start) {
+            uint32_t esp = *gz_slow_esp, k, n = 0;
+            reported = st; shown++;
+            fprintf(stderr, "[SLOW] +%lld ms esp %08X:", (long long)((q.QuadPart - st) * 1000 / f.QuadPart), esp);
+            for (k = 0; k < 400 && n < 14; k++) {
+                uint32_t v = GZ_MEM32(esp + k * 4);
+                if (v >= 0x00011000u && v < 0x002E0000u) { fprintf(stderr, " %08X", v); n++; }
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+}
+static void gz_slow_watch(double now)
+{
+    static int started;
+    LARGE_INTEGER q;
+    (void)now;
+    if (!started) {
+        started = 1;
+        gz_slow_esp = &g_esp;
+        CreateThread(NULL, 0, gz_slow_thread, NULL, 0, NULL);
+    }
+    QueryPerformanceCounter(&q);
+    gz_slow_frame_start = q.QuadPart;
+}
 extern GZ_TLS int g_fp_top;
 
 void sub_00012240(void)
@@ -1401,6 +1564,7 @@ void sub_00012240(void)
     gz_camera_tick();
     gz_biollante_slot_tick();
     gz_movie_tick();
+    gz_movie_mute_tick();
     {
         /* GZ_RATE=<n>: the game derives its frame period as 1 / (unsigned)
          * MEM32(0x4323A0) (sub_00012590). Overriding that rate is how to run
@@ -1492,6 +1656,35 @@ void sub_00012240(void)
                     float f;
                     uint32_t fb;
                     prev_wake = now;
+                    {
+                        /* GZ_PACE_LOG=1: once a second, how the pacing went. */
+                        static int plog = -1;
+                        static double t0, worst;
+                        static unsigned frames, late, waited;
+                        if (plog < 0) plog = getenv("GZ_PACE_LOG") != NULL;
+                        if (plog) gz_slow_watch(now);
+                        if (plog) {
+                            extern volatile LONG gz_stat_decode_us, gz_stat_decode_n, gz_stat_decode_px;
+                            LONG du = InterlockedExchange(&gz_stat_decode_us, 0), dn = InterlockedExchange(&gz_stat_decode_n, 0);
+                            LONG dp = InterlockedExchange(&gz_stat_decode_px, 0);
+                            double fw = gz_fence_wait_s; gz_fence_wait_s = 0.0;
+                            static double fw_sec, slept_sec;
+                            fw_sec += fw; slept_sec += now - start;
+                            if (step > 0.010)
+                                fprintf(stderr, "[HITCH] %.1f ms: fence waits %.1f ms (longest %.1f from %08X %08X %08X %08X), texture decodes %ld (%ld px) %.1f ms\n",
+                                        step * 1000.0, fw * 1000.0, gz_fence_wait_max * 1000.0, gz_fence_wait_ra[0], gz_fence_wait_ra[1],
+                                        gz_fence_wait_ra[2], gz_fence_wait_ra[3], (long)dn, (long)dp, du / 1000.0);
+                            gz_fence_wait_max = 0.0;
+                            frames++;
+                            if (now - start > 0.00005) waited++; else late++;
+                            if (step > worst) worst = step;
+                            if (now - t0 >= 1.0) {
+                                fprintf(stderr, "[PACE] %u frames, %u waited, %u late, longest %.2f ms, waiting on GPU thread %.0f ms, idle in limiter %.0f ms\n", frames, waited, late, worst * 1000.0, fw_sec * 1000.0, slept_sec * 1000.0);
+                                fw_sec = slept_sec = 0.0;
+                                t0 = now; frames = late = waited = 0; worst = 0.0;
+                            }
+                        }
+                    }
                     if (step < (double)period) step = (double)period;
                     if (step > 0.05) step = 0.05;           /* a hitch: at most 1/20 s at once */
                     f = (float)step;

@@ -16,6 +16,7 @@ gz_quickfight.bin
 
 # ---- Build output ----
 /build/
+/build_t/
 
 # ---- Per-user state, logs and captures ----
 gz_settings.ini
@@ -35,3 +36,4 @@ xbox_kernel.log
 Thumbs.db
 .DS_Store
 __pycache__/
+/shader_cache/

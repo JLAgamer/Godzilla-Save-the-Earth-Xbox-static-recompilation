@@ -780,6 +780,19 @@ int gz_launch_init(void)
         if (GetFullPathNameW(game, MAX_PATH, full, NULL)) game = full;
         SetCurrentDirectoryW(s_exe_dir);
         rc = prepare_copy(game);
+        /* Started by Play.bat or a shortcut, a copy it can't use would
+         * otherwise close without a word (RecompLauncher shows its own
+         * message for these exit codes). */
+        if (rc && !prepare && !getenv("RECOMPLAUNCHER")) {
+            const WCHAR *why =
+                rc == GZ_EXIT_WRONG_XBE ? L"Your copy's default.xbe is a different version from the one this build was "
+                                          L"made from. It needs Godzilla: Save the Earth for Xbox, USA/Europe release."
+              : rc == GZ_EXIT_NO_WRITE  ? L"The game couldn't unpack your disc next to the program. Put the game's folder "
+                                          L"somewhere you can write to (not Program Files) with about 1 GB free."
+              :                           L"Your copy couldn't be read, or it isn't Godzilla: Save the Earth for Xbox. "
+                                          L"Use the disc image (.iso / .xiso.iso) or the extracted folder with default.xbe.";
+            MessageBoxW(NULL, why, L"Godzilla: Save the Earth", MB_ICONWARNING);
+        }
         if (prepare || rc) {
             LocalFree(argv);
             return rc;

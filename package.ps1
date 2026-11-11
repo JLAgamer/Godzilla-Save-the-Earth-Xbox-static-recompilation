@@ -44,16 +44,26 @@ $playBat = @'
 rem Godzilla: Save the Earth recomp. The first time, drag your disc image
 rem (.iso / .xiso.iso) or extracted game folder onto this file; it is
 rem remembered in game_path.txt, so afterwards just double-click.
+rem The dropped path is only used through !delayed! expansion, so names with
+rem ( ) and & in them, like "... (USA, Europe).xiso.iso", work.
+setlocal DisableDelayedExpansion
 cd /d "%~dp0"
-if not "%~1"=="" (echo %~1> game_path.txt)
-if not exist game_path.txt (
-    echo Drag your Godzilla: Save the Earth disc image or game folder onto Play.bat.
-    pause
-    exit /b 1
-)
-set /p GAME=<game_path.txt
+if "%~1"=="" goto have_path
+set "NEWGAME=%~1"
+setlocal EnableDelayedExpansion
+>"game_path.txt" echo(!NEWGAME!
+endlocal
+:have_path
+if exist "game_path.txt" goto start_game
+echo Drag your Godzilla: Save the Earth disc image or game folder onto Play.bat.
+pause
+exit /b 1
+:start_game
+set /p GAME=<"game_path.txt"
 echo Starting... the first start unpacks the disc next to this file (about 800 MB).
-start "" godzilla_ste_recomp.exe --game "%GAME%" --log "%~dp0logs\godzilla.log"
+setlocal EnableDelayedExpansion
+start "" "%~dp0godzilla_ste_recomp.exe" --game "!GAME!" --log "%~dp0logs\godzilla.log"
+endlocal
 '@
 Set-Content -Path (Join-Path $Stage "Play.bat") -Value ($playBat -replace "`r?`n", "`r`n") -Encoding ascii -NoNewline
 

@@ -1,8 +1,8 @@
 # Godzilla: Save the Earth — Xbox static recompilation
 
 ![Overall progress](https://img.shields.io/badge/overall-82%25-green)
-![Boot and menus](https://img.shields.io/badge/Boot_and_menus-95%25-brightgreen) ![Versus fights](https://img.shields.io/badge/Versus_fights-95%25-brightgreen) ![Other modes](https://img.shields.io/badge/Other_modes-20%25-red) ![Stages](https://img.shields.io/badge/Stages-75%25-green) ![Graphics](https://img.shields.io/badge/Graphics-90%25-brightgreen)
-![Audio](https://img.shields.io/badge/Audio-90%25-brightgreen) ![Movies](https://img.shields.io/badge/Movies-100%25-brightgreen) ![Widescreen](https://img.shields.io/badge/Widescreen-95%25-brightgreen) ![High frame rate](https://img.shields.io/badge/High_frame_rate-95%25-brightgreen) ![Online (System Link)](https://img.shields.io/badge/Online_%28System_Link%29-60%25-yellow)
+![Boot and menus](https://img.shields.io/badge/Boot_and_menus-95%25-brightgreen) ![Versus fights](https://img.shields.io/badge/Versus_fights-95%25-brightgreen) ![Other modes](https://img.shields.io/badge/Other_modes-20%25-red) ![Stages](https://img.shields.io/badge/Stages-80%25-green) ![Graphics](https://img.shields.io/badge/Graphics-90%25-brightgreen)
+![Audio](https://img.shields.io/badge/Audio-95%25-brightgreen) ![Movies](https://img.shields.io/badge/Movies-100%25-brightgreen) ![Widescreen](https://img.shields.io/badge/Widescreen-95%25-brightgreen) ![High frame rate](https://img.shields.io/badge/High_frame_rate-95%25-brightgreen) ![Online (System Link)](https://img.shields.io/badge/Online_%28System_Link%29-60%25-yellow)
 
 A native Windows port of the Xbox version of *Godzilla: Save the Earth* (2004), made by statically
 recompiling the game's `default.xbe` into C with the [xboxrecomp](https://github.com/sp00nznet/xboxrecomp)
@@ -33,9 +33,9 @@ Estimates from what has been checked in game so far. Overall is the average of t
 | Boot and menus | 95% | Every menu works, including the new Options entries and the Biollante cell; they stay after returning from a match |
 | Versus fights | 95% | Played on all ten city and arena stages: HUD, beams, destruction, win/lose |
 | Other modes | 20% | Action, Melee, Survival and Challenges have not been played through yet |
-| Stages | 75% | The ten city and arena stages are checked in fights; the Mothership loads but skips the fighters' intro; the challenge stages are not checked |
+| Stages | 80% | The ten city and arena stages and the Mothership are checked in fights; the challenge stages are not |
 | Graphics | 90% | Combiners, cube maps, water reflections, fog; rare effects may still be wrong |
-| Audio | 90% | Music, effects and voices; fixed: menu crackle, corrupted voice lines and UI sounds (memory and timing bugs in the sound emulation) |
+| Audio | 95% | Music, effects and voices sound right in play; fixed: menu crackle, corrupted voice lines and UI sounds (memory and timing bugs in the sound emulation) |
 | Movies | 100% | Intro, story and credits play through ffmpeg; skipping them (GZ_MOVIES=0) is silent |
 | Widescreen | 95% | Wider view with matching culling in fights and menus, HUD in the corners; the pause menu's dimming covers only the middle |
 | High frame rate | 95% | Up to 144 fps (higher rates were too unstable in play); game speed stays correct |

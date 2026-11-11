@@ -337,10 +337,42 @@ int  gz_movie_update(uint32_t obj, uint8_t *dst);
 void gz_movie_tick(void);
 extern void sub_001F0650_gen(void);
 
+/* Skipped movies (no host playback): the title's own movie player still
+ * puts a soundtrack on a DirectSound stream (16-bit PCM, 44.1 kHz), and what
+ * it queues here is broken - noise, a stuck full-scale value - over the
+ * skipped intro movies and the menu's idle movie. That PCM stream is kept out
+ * of the mix from the movie's Open until a second after the movie is done.
+ * The music is an ADPCM stream and is not affected. GZ_MOVIE_MUTE=0: off. */
+extern volatile long g_apu_mute_pcm_streams;
+static volatile DWORD gz_movie_unmute_at;   /* GetTickCount() to unmute at; 0 = none pending */
+static int gz_movie_mute_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("GZ_MOVIE_MUTE"); on = !(e && *e == '0'); }
+    return on;
+}
+
+/* Once per game frame (the limiter): end the mute a second after the last
+ * skipped movie finished. */
+static void gz_movie_mute_tick(void)
+{
+    DWORD at = gz_movie_unmute_at;
+    if (at && (LONG)(GetTickCount() - at) >= 0) {
+        gz_movie_unmute_at = 0;
+        g_apu_mute_pcm_streams = 0;
+        fprintf(stderr, "[MOVIE] movie soundtrack unmuted\n");
+    }
+}
+
 /* Open(this, const char *file, ...): thiscall, ret 20. */
 void sub_001F0650(void)
 {
     uint32_t movie = g_ecx, name = GZ_MEM32(g_esp + 4);
+    if (!gz_movie_enabled() && !gz_play_movies() && gz_movie_mute_on()) {
+        if (!g_apu_mute_pcm_streams) fprintf(stderr, "[MOVIE] movie soundtrack muted while skipped\n");
+        g_apu_mute_pcm_streams = 1;
+        gz_movie_unmute_at = 0;
+    }
     sub_001F0650_gen();
     if (name && gz_movie_enabled())
         gz_movie_open(movie, (const char *)((uintptr_t)name + g_xbox_mem_offset));
@@ -387,6 +419,7 @@ void sub_001F05B0(void)
                 gz_movies_skipped++;
                 fprintf(stderr, "[MOVIE] skipped movie object 0x%08X after %d frames\n",
                         movie, s_count);
+                if (g_apu_mute_pcm_streams) gz_movie_unmute_at = GetTickCount() + 1000u;
             }
         }
     }
@@ -1531,6 +1564,7 @@ void sub_00012240(void)
     gz_camera_tick();
     gz_biollante_slot_tick();
     gz_movie_tick();
+    gz_movie_mute_tick();
     {
         /* GZ_RATE=<n>: the game derives its frame period as 1 / (unsigned)
          * MEM32(0x4323A0) (sub_00012590). Overriding that rate is how to run

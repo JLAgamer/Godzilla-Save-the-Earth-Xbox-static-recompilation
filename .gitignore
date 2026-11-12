@@ -44,3 +44,4 @@ Thumbs.db
 __pycache__/
 /shader_cache/
 /dist/
+/rb_shots/

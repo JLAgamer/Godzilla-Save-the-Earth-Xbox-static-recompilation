@@ -1,5 +1,5 @@
 diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
-index a6a3657..00225ed 100644
+index a6a3657..eac015c 100644
 --- a/src/apu/apu_core.c
 +++ b/src/apu/apu_core.c
 @@ -139,6 +139,49 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
@@ -82,6 +82,108 @@ index a6a3657..00225ed 100644
      mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
  }
  
+@@ -1746,3 +1812,101 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
+     }
+     LeaveCriticalSection(&g_mixer_cs);
+ }
++
++/* ============================================================
++ * Rollback support (a game that puts guest memory back in time)
++ *
++ * The APU's guest-visible state that lives on the host: the register file
++ * (the front end's trap and its method/parameter, the interrupt status, the
++ * voice list heads), the GP and EP register blocks, the voices' SSL data and
++ * the sequencer's sample counter. The voices themselves are in guest memory
++ * and go back with it; this goes back beside them, or a trap raised for a
++ * voice the rollback removed is serviced afterwards against a voice table
++ * that no longer holds it (the DirectSound service routine read 0xFFFFFFBE).
++ *
++ * Save and load hold d->lock, which the frame thread keeps except between
++ * frames and while it delivers the interrupt; the caller holds the one-CPU
++ * gate, so a delivery is posted and runs only at the caller's release. The
++ * audio itself (resamplers, filters, the host queue) is not included: it
++ * plays on. */
++typedef struct {
++    uint32_t regs[0x20000];
++    uint32_t gp_regs[0x10000];
++    uint32_t ep_regs[0x10000];
++    MCPXAPUVPSSLData ssl[MCPX_HW_MAX_VOICES];
++    int ssl_base_page;
++    uint64_t sample_count;
++    int set_irq;
++} ApuSnapshot;
++
++/* Hold the APU between frames (recursive: save and load take it again). A
++ * caller that also takes a lock the frame thread can want while it holds
++ * this one (the rollback's page-fault logger) takes this one first. */
++void xbox_ApuLock(void)
++{
++    if (g_state)
++        qemu_mutex_lock(&g_state->lock);
++}
++
++void xbox_ApuUnlock(void)
++{
++    if (g_state)
++        qemu_mutex_unlock(&g_state->lock);
++}
++
++size_t xbox_ApuStateSize(void)
++{
++    return sizeof(ApuSnapshot);
++}
++
++int xbox_ApuStateSave(void *buf)
++{
++    MCPXAPUState *d = g_state;
++    ApuSnapshot *s = (ApuSnapshot *)buf;
++    if (!d)
++        return 0;
++    qemu_mutex_lock(&d->lock);
++    memcpy(s->regs, (const void *)d->regs, sizeof s->regs);
++    memcpy(s->gp_regs, d->gp.regs, sizeof s->gp_regs);
++    memcpy(s->ep_regs, d->ep.regs, sizeof s->ep_regs);
++    memcpy(s->ssl, d->vp.ssl, sizeof s->ssl);
++    s->ssl_base_page = d->vp.ssl_base_page;
++    s->sample_count = d->sample_count;
++    s->set_irq = d->set_irq;
++    qemu_mutex_unlock(&d->lock);
++    return 1;
++}
++
++int xbox_ApuStateLoad(const void *buf)
++{
++    MCPXAPUState *d = g_state;
++    const ApuSnapshot *s = (const ApuSnapshot *)buf;
++    if (!d)
++        return 0;
++    qemu_mutex_lock(&d->lock);
++    memcpy((void *)d->regs, s->regs, sizeof s->regs);
++    memcpy(d->gp.regs, s->gp_regs, sizeof s->gp_regs);
++    memcpy(d->ep.regs, s->ep_regs, sizeof s->ep_regs);
++    memcpy(d->vp.ssl, s->ssl, sizeof s->ssl);
++    d->vp.ssl_base_page = s->ssl_base_page;
++    d->sample_count = s->sample_count;
++    d->set_irq = s->set_irq != 0;
++    update_irq(d);                      /* the line follows ISTS / IEN */
++    qemu_cond_broadcast(&d->cond);      /* FECTL may have changed */
++    qemu_mutex_unlock(&d->lock);
++    return 1;
++}
++
++/* The registers a stall report wants (the rollback's watchdog). */
++void xbox_ApuDump(void)
++{
++    MCPXAPUState *d = g_state;
++    if (!d)
++        return;
++    fprintf(stderr, "  [APU] ISTS=%08X IEN=%08X FECTL=%08X FEDECMETH=%08X FEDECPARAM=%08X"
++            " SECTL=%08X line=%ld idle=%d pause=%d\n",
++            d->regs[NV_PAPU_ISTS], d->regs[NV_PAPU_IEN], d->regs[NV_PAPU_FECTL],
++            d->regs[NV_PAPU_FEDECMETH], d->regs[NV_PAPU_FEDECPARAM],
++            d->regs[NV_PAPU_SECTL], (long)s_irq_line, d->is_idle, d->pause_requested);
++    fflush(stderr);
++}
 diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
 index bd36f2a..6dda6d1 100644
 --- a/src/apu/apu_dsp.c
@@ -2019,7 +2121,7 @@ index 8acb0af..166dcc7 100644
 +
  #endif
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 7ade793..4f7f5d0 100644
+index 7ade793..36dfc10 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
 @@ -1449,10 +1449,62 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
@@ -2085,7 +2187,7 @@ index 7ade793..4f7f5d0 100644
          /* A flip held for its vblank (nv2a_flip_hold.h): this pass walks
           * nothing, leaves DMA_GET where it is and acknowledges no PFB flush,
           * which is how the title feels the console's FLIP_STALL. Nothing is
-@@ -3904,6 +3956,20 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
+@@ -3904,6 +3956,36 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
  
  static int g_thread_stacks_used = 0;
  
@@ -2103,10 +2205,42 @@ index 7ade793..4f7f5d0 100644
 +    return n;
 +}
 +
++/* The spawned threads' TIBs with their TLS blocks (xbox_AllocThreadTib), for
++ * the same reason: fs:[0] is the thread's SEH chain head, and a rollback that
++ * put it back in time would hand the thread frames it has already left. They
++ * are small heap blocks sharing pages with other data, so a rollback keeps
++ * their bytes rather than leaving their pages alone. */
++#define XBOX_MAX_THREAD_TIBS 64
++static struct { uint32_t va, size; } g_thread_tib[XBOX_MAX_THREAD_TIBS];
++
++int xbox_ThreadTibs(uint32_t *va, uint32_t *size, int max)
++{
++    int k, n = 0;
++    for (k = 0; k < XBOX_MAX_THREAD_TIBS && n < max; k++)
++        if (g_thread_tib[k].va) { va[n] = g_thread_tib[k].va; size[n] = g_thread_tib[k].size; n++; }
++    return n;
++}
++
  /* A TIB and TLS block for a newly spawned guest thread.
   *
   * A TIB is per-thread on the console and was per-process here: one address,
-@@ -3978,6 +4044,11 @@ uint32_t xbox_AllocThreadStack(void)
+@@ -3948,6 +4030,15 @@ uint32_t xbox_AllocThreadTib(void)
+     *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
+     *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
+ 
++    {
++        int k;
++        for (k = 0; k < XBOX_MAX_THREAD_TIBS; k++)
++            if (!g_thread_tib[k].va) {
++                g_thread_tib[k].size = tib_size + total + g_tls_thread_size;
++                g_thread_tib[k].va = tib;
++                break;
++            }
++    }
+     return tib;
+     #undef TIB_VA
+ }
+@@ -3978,6 +4069,11 @@ uint32_t xbox_AllocThreadStack(void)
      if (!base)
          return 0;
      g_thread_stacks_used++;
@@ -2118,7 +2252,7 @@ index 7ade793..4f7f5d0 100644
  
      /* Top of the slice, 16-byte aligned, growing down. */
      return base + XBOX_THREAD_STACK_SIZE - 16;
-@@ -4001,6 +4072,11 @@ void xbox_FreeThreadStack(uint32_t stack_top)
+@@ -4001,6 +4097,11 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  {
      if (!stack_top)
          return;
@@ -2130,7 +2264,7 @@ index 7ade793..4f7f5d0 100644
      xbox_HeapFree(stack_top + 16 - XBOX_THREAD_STACK_SIZE);
      if (g_thread_stacks_used > 0)
          g_thread_stacks_used--;
-@@ -4082,6 +4158,51 @@ static uint32_t g_contig_peak_pages;
+@@ -4082,6 +4183,51 @@ static uint32_t g_contig_peak_pages;
  static DWORD    g_contig_t0;
  static volatile LONG g_contig_lock;
  
@@ -2182,7 +2316,7 @@ index 7ade793..4f7f5d0 100644
  static void contig_lock(void)
  {
      while (InterlockedCompareExchange(&g_contig_lock, 1, 0) != 0)
-@@ -4491,6 +4612,35 @@ static void heap_forget_ram_names(int m)
+@@ -4491,6 +4637,35 @@ static void heap_forget_ram_names(int m)
          g_phys_ram_named[p] = 0;
  }
  
@@ -2218,7 +2352,7 @@ index 7ade793..4f7f5d0 100644
  const volatile uint8_t *xbox_PhysRamNameMap(void)
  {
      return g_phys_ram_named;
-@@ -4688,14 +4838,16 @@ void xbox_HeapFree(uint32_t xbox_va)
+@@ -4688,14 +4863,16 @@ void xbox_HeapFree(uint32_t xbox_va)
              if (n < g_heap_block_count && g_heap_blocks[n].free &&
                  g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[n].addr) {
                  g_heap_blocks[i].size += g_heap_blocks[n].size;
@@ -2240,10 +2374,10 @@ index 7ade793..4f7f5d0 100644
              }
              /* After the merge, so a page this block shared with a neighbour
 diff --git a/src/kernel/xbox_memory_layout.h b/src/kernel/xbox_memory_layout.h
-index da4c155..4c7d3e2 100644
+index da4c155..46e2c29 100644
 --- a/src/kernel/xbox_memory_layout.h
 +++ b/src/kernel/xbox_memory_layout.h
-@@ -221,6 +221,18 @@ const volatile uint8_t *xbox_PhysRamNameMap(void);
+@@ -221,6 +221,19 @@ const volatile uint8_t *xbox_PhysRamNameMap(void);
  /* Whether physical byte `pa` lies in a live heap block the title named:
   * the page map refined to the block (see xbox_PhysRamNamedAt). */
  int xbox_PhysRamNamedAt(uint32_t pa);
@@ -2257,6 +2391,7 @@ index da4c155..4c7d3e2 100644
 +void *xbox_Nv2aRegs(uint32_t *size);
 +int  xbox_Nv2aPause(int want_idle);
 +int  xbox_ThreadStacks(uint32_t *bases, int max, uint32_t *size);
++int  xbox_ThreadTibs(uint32_t *va, uint32_t *size, int max);
 +void xbox_Nv2aResume(void);
 +int xbox_HeapBlockInfo(uint32_t pa, uint32_t *addr, uint32_t *size, int *is_free, int *named);
  uint32_t xbox_ContiguousInUseBytes(void);
@@ -2713,7 +2848,7 @@ index 9476517..0faa251 100644
              BRIDGE_MEM32(old_ptr) = (uint32_t)old;
          g_eax = 0;  /* STATUS_SUCCESS */
 diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
-index 45d548c..64b66af 100644
+index 45d548c..d75d5ae 100644
 --- a/src/kernel/kernel_hal.c
 +++ b/src/kernel/kernel_hal.c
 @@ -1774,12 +1774,33 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
@@ -2750,6 +2885,18 @@ index 45d548c..64b66af 100644
      if (freq.QuadPart == 0) {
          QueryPerformanceFrequency(&freq);
          QueryPerformanceCounter(&origin);
+@@ -1934,3 +1955,11 @@ void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
+         break;
+     }
+ }
++
++/* For a stall report (the rollback's watchdog). */
++void xbox_IrqDump(void)
++{
++    fprintf(stderr, "  [IRQ] pending lines 0x%lX, gate held by tid %ld\n",
++            (long)s_irq_pending, (long)s_gate_owner);
++    fflush(stderr);
++}
 diff --git a/src/usb/ohci.c b/src/usb/ohci.c
 index 5462e9a..27ff6ab 100644
 --- a/src/usb/ohci.c
@@ -2788,3 +2935,595 @@ index 5462e9a..27ff6ab 100644
          control = hc->reg[HcControl / 4];
          enable  = hc->reg[HcInterruptEnable / 4];
  
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index 9476517..52c9bb8 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -690,6 +690,316 @@ static uint32_t thobj_current(void)
+     return g_thread_obj_va;
+ }
+ 
++/* ── Lockstep workers (xbox_LockstepSet) ─────────────────────
++ *
++ * For a game that puts guest memory back in time (rollback netcode): the
++ * worker threads must not run on the host's schedule, or a rollback rewinds
++ * memory under a worker that is half way through changing it, and the replay
++ * of a tick does not see the same worker work as the first run did.
++ *
++ * While lockstep is on, a spawned guest thread parks at every sleep and wait
++ * (ordinals 99, 158, 159, 233, 234, 235) and runs only when the main thread
++ * grants it a turn (xbox_LockstepPump): one worker at a time, in the order
++ * they were spawned, each until it parks again. In a turn a sleep returns at
++ * once and a wait looks at its objects once (zero timeout); a wait that finds
++ * nothing signalled parks again (an INFINITE one) or returns STATUS_TIMEOUT
++ * (a finite one, so a polling loop goes round once per turn). Between turns
++ * every worker is parked at a kernel call, which is the state a game can save
++ * and restore guest memory in.
++ *
++ * The main thread's own waits look once and, when that finds nothing, pump
++ * the workers once before they block for real: a main thread waiting for a
++ * job a parked worker has not done would otherwise wait forever. */
++#define LS_MAX 32
++enum { LS_FREE, LS_RUNNING, LS_PARKED, LS_GRANTED, LS_BLOCKED };
++static CRITICAL_SECTION s_ls_lock;
++static CONDITION_VARIABLE s_ls_cv;
++static INIT_ONCE s_ls_once = INIT_ONCE_STATIC_INIT;
++static volatile LONG s_ls_on;
++static int s_ls_state[LS_MAX];
++static uint32_t s_ls_parks[LS_MAX], s_ls_where[LS_MAX];
++static RECOMP_TLS int g_ls_slot = -1;
++static RECOMP_TLS int g_is_main_guest = 0;
++static volatile uint32_t s_ls_main_ord, s_ls_main_ret, s_ls_main_in, s_ls_main_cs, s_ls_main_esp;
++static volatile LONG s_ls_main_waits;
++static volatile uint32_t s_ls_cur_ord[32], s_ls_cur_ret[32];
++
++static BOOL CALLBACK ls_init(PINIT_ONCE o, PVOID p, PVOID *c)
++{
++    (void)o; (void)p; (void)c;
++    InitializeCriticalSection(&s_ls_lock);
++    InitializeConditionVariable(&s_ls_cv);
++    return TRUE;
++}
++
++static void ls_register(void)
++{
++    int k;
++    InitOnceExecuteOnce(&s_ls_once, ls_init, NULL, NULL);
++    EnterCriticalSection(&s_ls_lock);
++    for (k = 0; k < LS_MAX; k++)
++        if (s_ls_state[k] == LS_FREE) {
++            s_ls_state[k] = LS_RUNNING;
++            g_ls_slot = k;
++            break;
++        }
++    LeaveCriticalSection(&s_ls_lock);
++}
++
++static void ls_unregister(void)
++{
++    if (g_ls_slot < 0)
++        return;
++    EnterCriticalSection(&s_ls_lock);
++    s_ls_state[g_ls_slot] = LS_FREE;
++    WakeAllConditionVariable(&s_ls_cv);
++    LeaveCriticalSection(&s_ls_lock);
++    g_ls_slot = -1;
++}
++
++/* A worker at a sleep or wait: 1 once it has been granted a turn, 0 at once
++ * when lockstep is off (or goes off while parked): wait the normal way. */
++static int ls_park(uint32_t ordinal)
++{
++    int k = g_ls_slot;
++    if (k < 0 || !s_ls_on)
++        return 0;
++    EnterCriticalSection(&s_ls_lock);
++    s_ls_state[k] = LS_PARKED;
++    s_ls_where[k] = ordinal;
++    s_ls_parks[k]++;
++    WakeAllConditionVariable(&s_ls_cv);
++    while (s_ls_state[k] == LS_PARKED && s_ls_on)
++        SleepConditionVariableCS(&s_ls_cv, &s_ls_lock, INFINITE);
++    s_ls_state[k] = LS_RUNNING;
++    LeaveCriticalSection(&s_ls_lock);
++    return s_ls_on != 0;
++}
++
++/* Wait (under s_ls_lock) until worker k is parked again after `parks`, or
++ * gone. 0 on timeout. */
++static int ls_await(int k, uint32_t parks, DWORD timeout_ms)
++{
++    ULONGLONG t0 = GetTickCount64();
++    while (s_ls_state[k] != LS_FREE && s_ls_state[k] != LS_BLOCKED
++           && !(s_ls_state[k] == LS_PARKED && s_ls_parks[k] != parks)) {
++        ULONGLONG used = GetTickCount64() - t0;
++        if (used >= timeout_ms)
++            return 0;
++        SleepConditionVariableCS(&s_ls_cv, &s_ls_lock, (DWORD)(timeout_ms - used));
++    }
++    return 1;
++}
++
++void xbox_LockstepSet(int on)
++{
++    InitOnceExecuteOnce(&s_ls_once, ls_init, NULL, NULL);
++    EnterCriticalSection(&s_ls_lock);
++    InterlockedExchange(&s_ls_on, on ? 1 : 0);
++    WakeAllConditionVariable(&s_ls_cv);
++    LeaveCriticalSection(&s_ls_lock);
++}
++
++int xbox_LockstepOn(void) { return s_ls_on != 0; }
++
++/* What the main thread and the workers are doing (a watchdog's report). */
++void xbox_LockstepDump(void)
++{
++    static const char *names[] = { "free", "running", "parked", "granted", "blocked" };
++    int k;
++    fprintf(stderr, "  [LOCKSTEP] main: %s ordinal %u (guest return 0x%08X), %ld"
++            " lockstep wait slices, %u critical-section pumps\n",
++            s_ls_main_in ? "in" : "last", s_ls_main_ord, s_ls_main_ret,
++            s_ls_main_waits, s_ls_main_cs);
++    if (s_ls_main_esp) {
++        /* code addresses on the main thread's guest stack, innermost first */
++        uint32_t i, n = 0;
++        fprintf(stderr, "  [LOCKSTEP] main guest stack from 0x%08X:", s_ls_main_esp);
++        for (i = 0; i < 256 && n < 24; i++) {
++            uint32_t v = BRIDGE_MEM32(s_ls_main_esp + i * 4);
++            if (v >= 0x00011000u && v < 0x002E0000u) {
++                fprintf(stderr, " %08X", v);
++                n++;
++            }
++        }
++        fprintf(stderr, "%c", 10);
++    }
++    for (k = 0; k < LS_MAX; k++)
++        if (s_ls_state[k] != LS_FREE)
++            fprintf(stderr, "  [LOCKSTEP] worker %d: %s, parked last at ordinal %u, %u parks;"
++                    " latest kernel call %u (guest return 0x%08X)\n", k,
++                    names[s_ls_state[k]], s_ls_where[k], s_ls_parks[k],
++                    s_ls_cur_ord[k], s_ls_cur_ret[k]);
++    fflush(stderr);
++}
++
++/* Until every worker is parked (lockstep just turned on: they park at their
++ * next sleep or wait). Returns how many are not, after timeout_ms. */
++int xbox_LockstepQuiesce(unsigned timeout_ms)
++{
++    int k, missed = 0;
++    InitOnceExecuteOnce(&s_ls_once, ls_init, NULL, NULL);
++    EnterCriticalSection(&s_ls_lock);
++    for (k = 0; k < LS_MAX; k++)
++        if (s_ls_state[k] == LS_RUNNING && !ls_await(k, s_ls_parks[k] - 1u, timeout_ms)) {
++            fprintf(stderr, "  [LOCKSTEP] worker %d does not park\n", k);
++            missed++;
++        }
++    LeaveCriticalSection(&s_ls_lock);
++    return missed;
++}
++
++/* Each parked worker, in spawn order, runs one turn: until it parks again.
++ * Returns how many did not come back within timeout_ms (they are then left
++ * running, and the caller should know its state is not exact). */
++int xbox_LockstepPump(unsigned timeout_ms)
++{
++    int k, missed = 0;
++    if (!s_ls_on)
++        return 0;
++    EnterCriticalSection(&s_ls_lock);
++    for (k = 0; k < LS_MAX; k++) {
++        uint32_t parks;
++        if (s_ls_state[k] == LS_FREE)
++            continue;
++        if (s_ls_state[k] != LS_PARKED && !ls_await(k, s_ls_parks[k] - 1u, timeout_ms)) {
++            missed++;
++            continue;
++        }
++        if (s_ls_state[k] != LS_PARKED)
++            continue;                           /* blocked in a wait, or gone */
++        parks = s_ls_parks[k];
++        s_ls_state[k] = LS_GRANTED;
++        WakeAllConditionVariable(&s_ls_cv);
++        if (!ls_await(k, parks, timeout_ms)) {
++            static int nlog;
++            if (nlog++ < 20)
++                fprintf(stderr, "  [LOCKSTEP] worker %d still running after %u ms"
++                        " (parked last at ordinal %u)\n", k, timeout_ms, s_ls_where[k]);
++            missed++;
++        }
++    }
++    LeaveCriticalSection(&s_ls_lock);
++    return missed;
++}
++
++/* The main thread blocked somewhere other than a wait (a critical section a
++ * parked worker holds): give the workers a turn. 1 if it did, 0 when
++ * lockstep is off or this is not the main thread (block the normal way). */
++int xbox_LockstepMainBlocked(void)
++{
++    if (!s_ls_on || !g_is_main_guest)
++        return 0;
++    s_ls_main_cs++;
++    xbox_LockstepPump(2000);
++    return 1;
++}
++
++typedef uint32_t (*ls_try_fn)(void *ctx, PLARGE_INTEGER timeout);
++
++/* A worker in a sleep or wait the normal way (lockstep off when it began):
++ * idle, so it counts as parked, but it must not run on from it while
++ * lockstep is on. */
++static void ls_set_blocked(int on)
++{
++    int k = g_ls_slot;
++    EnterCriticalSection(&s_ls_lock);
++    s_ls_state[k] = on ? LS_BLOCKED : LS_RUNNING;
++    WakeAllConditionVariable(&s_ls_cv);
++    LeaveCriticalSection(&s_ls_lock);
++}
++
++/* Every sleep and wait of a worker, and the main thread's waits while
++ * lockstep is on. 1 = handled, *status is the call's result; 0 = do the call
++ * the normal way. `sleep`: the call is a delay (try_fn performs it). */
++static int ls_wait(ls_try_fn try_fn, void *ctx, uint32_t timeout_ptr,
++                   uint32_t ordinal, int sleep, uint32_t *status)
++{
++    LARGE_INTEGER zero;
++    zero.QuadPart = 0;
++    if (g_ls_slot >= 0) {
++        for (;;) {
++            if (s_ls_on) {
++                if (!ls_park(ordinal))
++                    continue;                   /* went off while parked */
++                if (sleep) {                    /* the turn is the sleep's end */
++                    *status = 0;
++                    return 1;
++                }
++                *status = try_fn(ctx, &zero);
++                if (*status != 0x102u || timeout_ptr)   /* STATUS_TIMEOUT */
++                    return 1;
++                continue;
++            }
++            ls_set_blocked(1);
++            *status = try_fn(ctx, XBOX_TO_NATIVE(timeout_ptr));
++            ls_set_blocked(0);
++            if (s_ls_on)                        /* woken with lockstep on: */
++                ls_park(ordinal);               /* run on in a turn only */
++            return 1;
++        }
++    }
++    if (!s_ls_on)
++        return 0;
++    if (sleep) {
++        /* The main thread polling for a worker's result ("while (!done)
++         * Sleep(1)", the cache file copy mid-match): each pass is a turn for
++         * the workers, or they never finish. Then the sleep, as usual. */
++        if (g_is_main_guest)
++            xbox_LockstepPump(2000);
++        return 0;
++    }
++    if (g_is_main_guest) {
++        /* Look; then, until the wait is satisfied or its own timeout is up,
++         * give the workers a turn and wait a little on the host (a file read
++         * or a DPC may be what it waits for). A job can take a worker several
++         * turns: one pump and then a host wait left the main thread blocked
++         * on a job whose worker sat parked. */
++        LARGE_INTEGER slice;
++        int64_t left = -1;                      /* 100 ns units; -1 = INFINITE */
++        unsigned rounds = 0;
++        *status = try_fn(ctx, &zero);
++        if (*status != 0x102u)
++            return 1;
++        if (timeout_ptr) {
++            int64_t t = (int64_t)((uint64_t)BRIDGE_MEM32(timeout_ptr)
++                                  | ((uint64_t)BRIDGE_MEM32(timeout_ptr + 4) << 32));
++            if (t == 0)
++                return 1;                       /* it asked for a look only */
++            if (t > 0)
++                return 0;                       /* an absolute time: the normal way */
++            left = -t;
++        }
++        slice.QuadPart = -10000;                /* 1 ms */
++        for (;;) {
++            xbox_LockstepPump(2000);
++            *status = try_fn(ctx, &zero);
++            if (*status != 0x102u)
++                break;
++            if (left >= 0 && left <= 10000) {
++                LARGE_INTEGER rest;
++                rest.QuadPart = -left;
++                *status = try_fn(ctx, &rest);
++                break;
++            }
++            *status = try_fn(ctx, &slice);
++            if (*status != 0x102u)
++                break;
++            InterlockedIncrement(&s_ls_main_waits);
++            if (left > 0)
++                left -= 10000;
++            if (++rounds == 2000) {
++                static int nlog;
++                if (nlog++ < 10)
++                    fprintf(stderr, "  [LOCKSTEP] main thread still waiting at ordinal %u"
++                            " after 2000 worker turns\n", ordinal);
++            }
++        }
++        return 1;
++    }
++    return 0;
++}
++
+ static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
+                                      uint32_t ctx2)
+ {
+@@ -750,9 +1060,11 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
+      * neither. */
+     xbox_DpcMarkGuestThread();
+     xbox_GuestThreadPin("guest-worker");
++    ls_register();
+     guest_cpu_join();
+     bridge_run_thread_inline(fn, ctx1, ctx2);
+     guest_cpu_part();
++    ls_unregister();
+ 
+     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
+     fflush(stderr);
+@@ -885,6 +1197,7 @@ static void bridge_PsCreateSystemThreadEx(void)
+                 }
+                 xbox_DpcMarkGuestThread();
+                 xbox_GuestThreadPin("guest-main");
++                g_is_main_guest = 1;
+                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
+                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
+                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+@@ -2034,6 +2347,47 @@ static void bridge_KeSetEvent(void)
+         g_eax = 0;
+ }
+ 
++/* The waits' one look, for ls_wait (lockstep), and the sleep. */
++typedef struct { uint32_t mode, alertable; } LsDelay;
++static uint32_t ls_try_delay(void *c, PLARGE_INTEGER t)
++{
++    LsDelay *d = (LsDelay *)c;
++    return (uint32_t)xbox_KeDelayExecutionThread((KPROCESSOR_MODE)d->mode,
++        (BOOLEAN)d->alertable, t);
++}
++typedef struct { HANDLE h; uint32_t reason, mode, alertable; } LsKeWait;
++static uint32_t ls_try_ke_single(void *c, PLARGE_INTEGER t)
++{
++    LsKeWait *w = (LsKeWait *)c;
++    return (uint32_t)xbox_KeWaitForSingleObject(w->h, w->reason,
++        (KPROCESSOR_MODE)w->mode, (BOOLEAN)w->alertable, t);
++}
++typedef struct { HANDLE h; uint32_t mode, alertable; } LsNtWait;
++static uint32_t ls_try_nt_single(void *c, PLARGE_INTEGER t)
++{
++    LsNtWait *w = (LsNtWait *)c;
++    return (uint32_t)xbox_NtWaitForSingleObject(w->h, (BOOLEAN)w->alertable, t);
++}
++static uint32_t ls_try_nt_single_ex(void *c, PLARGE_INTEGER t)
++{
++    LsNtWait *w = (LsNtWait *)c;
++    return (uint32_t)xbox_NtWaitForSingleObjectEx(w->h, (KPROCESSOR_MODE)w->mode,
++        (BOOLEAN)w->alertable, t);
++}
++typedef struct { HANDLE *h; uint32_t count, type, reason, mode, alertable; void *blocks; } LsMulti;
++static uint32_t ls_try_nt_multi(void *c, PLARGE_INTEGER t)
++{
++    LsMulti *w = (LsMulti *)c;
++    return (uint32_t)xbox_NtWaitForMultipleObjectsEx(w->count, w->h, w->type,
++        (BOOLEAN)w->alertable, t);
++}
++static uint32_t ls_try_ke_multi(void *c, PLARGE_INTEGER t)
++{
++    LsMulti *w = (LsMulti *)c;
++    return (uint32_t)xbox_KeWaitForMultipleObjects(w->count, (PVOID *)w->h, w->type,
++        w->reason, (KPROCESSOR_MODE)w->mode, (BOOLEAN)w->alertable, t, w->blocks);
++}
++
+ /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
+ static void bridge_KeWaitForSingleObject(void)
+ {
+@@ -2050,9 +2404,14 @@ static void bridge_KeWaitForSingleObject(void)
+         int type;
+         HANDLE ge = ke_guest_event_prepare(object, &type);
+         if (ge) {
+-            g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+-                ge, wait_reason, wait_mode,
+-                (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
++            LsKeWait w = { ge, wait_reason, wait_mode, alertable };
++            uint32_t st;
++            if (ls_wait(ls_try_ke_single, &w, timeout_ptr, 159, 0, &st))
++                g_eax = st;
++            else
++                g_eax = (uint32_t)xbox_KeWaitForSingleObject(
++                    ge, wait_reason, wait_mode,
++                    (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+             if (g_eax == 0 && type == 1)               /* synchronization: consumed */
+                 BRIDGE_MEM32(object + 4) = 0;
+             return;
+@@ -2065,6 +2424,14 @@ static void bridge_KeWaitForSingleObject(void)
+     if (!h)
+         h = XBOX_TO_NATIVE(object);
+ 
++    {
++        LsKeWait w = { h, wait_reason, wait_mode, alertable };
++        uint32_t st;
++        if (ls_wait(ls_try_ke_single, &w, timeout_ptr, 159, 0, &st)) {
++            g_eax = st;
++            return;
++        }
++    }
+     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+         h, wait_reason, wait_mode,
+         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+@@ -2085,6 +2452,14 @@ static void bridge_NtWaitForSingleObject(void)
+ 
+     if (bridge_run_io_apcs(alertable, 1))
+         return;
++    {
++        LsNtWait w = { handle, 1, alertable };
++        uint32_t st;
++        if (ls_wait(ls_try_nt_single, &w, timeout_ptr, 233, 0, &st)) {
++            g_eax = st;
++            return;
++        }
++    }
+     g_eax = (uint32_t)xbox_NtWaitForSingleObject(
+         handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+ }
+@@ -2149,6 +2524,14 @@ static void bridge_NtWaitForSingleObjectEx(void)
+ 
+     if (bridge_run_io_apcs(alertable, wait_mode))
+         return;
++    {
++        LsNtWait w = { handle, wait_mode, alertable };
++        uint32_t st;
++        if (ls_wait(ls_try_nt_single_ex, &w, timeout_ptr, 234, 0, &st)) {
++            g_eax = st;
++            return;
++        }
++    }
+     g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
+         handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
+         XBOX_TO_NATIVE(timeout_ptr));
+@@ -2222,6 +2605,14 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
+ 
+     if (bridge_run_io_apcs(alertable, wait_mode))
+         return;
++    {
++        LsMulti w = { handles, count, wait_type, 0, wait_mode, alertable, NULL };
++        uint32_t st;
++        if (ls_wait(ls_try_nt_multi, &w, timeout_ptr, 235, 0, &st)) {
++            g_eax = st;
++            return;
++        }
++    }
+     g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
+         count, handles, wait_type, (BOOLEAN)alertable,
+         XBOX_TO_NATIVE(timeout_ptr));
+@@ -2332,6 +2723,14 @@ static void bridge_KeDelayExecutionThread(void)
+ 
+     if (bridge_run_io_apcs(alertable, wait_mode))
+         return;
++    {
++        uint32_t st;
++        LsDelay d = { wait_mode, alertable };
++        if (ls_wait(ls_try_delay, &d, interval_ptr, 99, 1, &st)) {
++            g_eax = st;
++            return;
++        }
++    }
+     g_eax = (uint32_t)xbox_KeDelayExecutionThread(
+         (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
+         XBOX_TO_NATIVE(interval_ptr));
+@@ -2480,6 +2879,7 @@ static void bridge_PsTerminateSystemThread(void)
+         g_thread_stack_top = 0;
+         thobj_exit(g_thread_obj_va, exit_status);
+         g_thread_obj_va = 0;
++        ls_unregister();
+         ExitThread(exit_status);
+     }
+ }
+@@ -5910,11 +6310,19 @@ static void bridge_KeWaitForMultipleObjects(void)
+         }
+     }
+ 
+-    g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
+-        count, (PVOID *)handles, wait_type,
+-        STACK_ARG(3), (KPROCESSOR_MODE)STACK_ARG(4),
+-        (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_va),
+-        XBOX_TO_NATIVE(STACK_ARG(7)));
++    {
++        LsMulti w = { handles, count, wait_type, STACK_ARG(3), STACK_ARG(4), alertable,
++                      XBOX_TO_NATIVE(STACK_ARG(7)) };
++        uint32_t st;
++        if (ls_wait(ls_try_ke_multi, &w, timeout_va, 158, 0, &st))
++            g_eax = st;
++        else
++            g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
++                count, (PVOID *)handles, wait_type,
++                STACK_ARG(3), (KPROCESSOR_MODE)STACK_ARG(4),
++                (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_va),
++                XBOX_TO_NATIVE(STACK_ARG(7)));
++    }
+ 
+     /* Only a successful wait consumes synchronization events. WaitAny's
+      * result selects one member; WaitAll consumes every signalled member. */
+@@ -9289,6 +9697,7 @@ static void bridge_PsCreateSystemThread(void)
+             if (is_first_call) {
+                 xbox_DpcMarkGuestThread();
+                 xbox_GuestThreadPin("guest-main");
++                g_is_main_guest = 1;
+                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
+                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
+                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+@@ -10864,10 +11273,21 @@ void guest_cpu_part(void)
+ static void kernel_thunk_dispatch(void)
+ {
+     int slot = g_kernel_dispatch_slot;
+-    int held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL,
+-                                    slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE
+-                                    ? g_slot_ordinals[slot] : 0);
++    uint32_t ord = slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE ? g_slot_ordinals[slot] : 0;
++    int held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, ord);
++    if (g_is_main_guest) {                  /* for xbox_LockstepDump */
++        s_ls_main_ord = ord;
++        s_ls_main_ret = BRIDGE_MEM32(g_esp);
++        s_ls_main_esp = g_esp;
++        s_ls_main_in = 1;
++    }
++    if (g_ls_slot >= 0) {
++        s_ls_cur_ord[g_ls_slot] = ord;
++        s_ls_cur_ret[g_ls_slot] = BRIDGE_MEM32(g_esp);
++    }
+     kernel_thunk_dispatch_body();
++    if (g_is_main_guest)
++        s_ls_main_in = 0;
+     if (held)
+         xbox_GuestCpuAcquire();
+ }
+diff --git a/src/kernel/kernel_rtl.c b/src/kernel/kernel_rtl.c
+index a9853dd..74a8357 100644
+--- a/src/kernel/kernel_rtl.c
++++ b/src/kernel/kernel_rtl.c
+@@ -579,6 +579,8 @@ static void xbox_cs_clear_owner(CRITICAL_SECTION* cs)
+     }
+ }
+ 
++int xbox_LockstepMainBlocked(void);     /* kernel_bridge.c */
++
+ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
+ {
+     if (g_cs_single_mode == 2) {           /* guest-struct mode */
+@@ -609,7 +611,13 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
+                 }
+                 HANDLE sem = xbox_cs_sem(gva, 1);
+                 if (sem) {
+-                    WaitForSingleObject(sem, INFINITE);
++                    /* lockstep: the holder may be a parked worker that
++                     * needs a turn to leave it (kernel_bridge.c) */
++                    while (WaitForSingleObject(sem, 1) == WAIT_TIMEOUT)
++                        if (!xbox_LockstepMainBlocked()) {
++                            WaitForSingleObject(sem, INFINITE);
++                            break;
++                        }
+                     *owner = me;
+                     *rec = 1;
+                 } else {
+@@ -685,7 +693,14 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
+     /* Contended: the holder is a guest thread that needs the CPU to leave
+      * it (RECOMP_GUEST_LOCK), so tell the waiters the CPU is free now. */
+     xbox_GuestCpuBlocked();
+-    EnterCriticalSection(cs);
++    /* lockstep: the holder may be a parked worker (kernel_bridge.c) */
++    while (!TryEnterCriticalSection(cs)) {
++        if (!xbox_LockstepMainBlocked()) {
++            EnterCriticalSection(cs);
++            break;
++        }
++        Sleep(1);
++    }
+     xbox_cs_note_owner(cs);
+     if (g_cs_contention_reports <= 16) {
+         fprintf(stderr, "  [CS] thread %lu acquired 0x%08X\n",

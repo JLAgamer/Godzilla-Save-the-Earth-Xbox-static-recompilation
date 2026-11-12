@@ -22,10 +22,25 @@
  * tick number), and the runtime's heap tables (xbox_HeapStateSave). The
  * graphics chip's poll thread is parked, caught up, at every boundary.
  *
- * Not covered yet: other guest threads (their stacks are in the windows and
- * do get put back), the sound chip, kernel objects, the back end's render
- * state (a restore can leave the picture's fog / blend stale until the game
- * sets it again).
+ * The worker threads (music, three job queues) run in lockstep while history
+ * is on (xbox_LockstepSet, kernel_bridge.c): each is parked at a sleep or wait
+ * except in the turns rb_pump() grants it at the end of a tick, so a boundary
+ * or a rollback never meets one half way through changing the heap, and a
+ * replayed tick sees the same worker work. Their stacks stay out of the
+ * history (their present), and their TIBs keep their bytes through a
+ * rollback (keep_tibs_*).
+ *
+ * The sound chip's host-side registers (its front end's trap, interrupt
+ * status, GP/EP blocks, SSL data) go into the same records in 4 KB chunks
+ * (apu_capture), taken with the chip held between frames.
+ *
+ * GZ_RB_VERIFY=1 (with the scripted match) checks every scripted rollback:
+ * a full copy at the target boundary, compared after the rollback.
+ *
+ * Not covered yet: the sound chip's audio output (resamplers, the host
+ * queue: rolled-back ticks are heard twice), host file positions, kernel
+ * objects, the back end's render state (a restore can leave the picture's
+ * fog / blend stale until the game sets it again).
  *
  *   GZ_RB_TEST=<seconds>  sync test, that long after the quick fight launches:
  *                         run GZ_RB_TICKS ticks (default 10), take a picture,
@@ -46,6 +61,15 @@ size_t xbox_HeapStateSave(void *buf);
 void xbox_HeapStateLoad(const void *buf);
 void *xbox_Nv2aRegs(uint32_t *size);
 int  xbox_ThreadStacks(uint32_t *bases, int max, uint32_t *size);
+int  xbox_ThreadTibs(uint32_t *va, uint32_t *size, int max);
+void   xbox_ApuLock(void);              /* apu_core.c: the sound chip between frames */
+void   xbox_ApuUnlock(void);
+size_t xbox_ApuStateSize(void);
+int    xbox_ApuStateSave(void *buf);
+int    xbox_ApuStateLoad(const void *buf);
+void xbox_LockstepSet(int on);           /* kernel_bridge.c: workers run only in turns */
+int  xbox_LockstepQuiesce(unsigned timeout_ms);
+int  xbox_LockstepPump(unsigned timeout_ms);
 void xbox_OhciPause(int on);
 void xbox_DispatchGateEnter(void);   /* kernel_hal.c: no DPC or interrupt handler runs while held */
 void xbox_DispatchGateLeave(void);
@@ -70,33 +94,56 @@ typedef struct {
     RecompXmm xmm[8];
 } RbRegs;
 
-/* One tick's record. Its pages follow each other in the arena from `first`. */
+/* One tick's record, in the ring of slots (each RB_ENTRY bytes): the heap
+ * tables at its boundary in s_heap_slots slots from `heap`, then its page
+ * entries one per slot from `first`. Slot numbers only grow; slot n lives at
+ * n % RB_SLOTS. */
 typedef struct {
     uint32_t tick;
     uint32_t vtick;
     RbRegs   regs;
-    uint64_t heap;              /* arena offset of the heap tables at this boundary */
-    uint64_t first;             /* arena offset of the first page entry */
+    uint64_t heap;              /* slot of the heap tables at this boundary */
+    uint64_t first;             /* slot of the first page entry */
     uint32_t npages;
 } RbFrame;
 
+/* The sound chip's host-side state (xbox_ApuStateSave) is kept in the same
+ * records as guest pages, in 4 KB chunks numbered from RB_NPAGES: a chunk is
+ * logged at the end of a tick it changed in (apu_capture). */
+#define RB_APU_MAX 512u
+
 #define RB_ENTRY  (8u + RB_PAGE)                /* page index (padded) + old contents */
 #define RB_FRAMES 1024u
-#define RB_ARENA  (1ull << 30)                  /* reserved; committed as it fills */
+/* The ring: 512 MB. When it is full the oldest ticks drop out of the
+ * history. It used to be a 1 GB arena that, once full in the middle of a
+ * tick, let the page that faulted go unlogged and unprotected for good: every
+ * later write to it escaped the log, and rollbacks from then on put back a
+ * mix of old and new memory (an object list in a cycle at tick ~1900, the
+ * sound routine reading freed voices). */
+#define RB_SLOTS  ((512ull << 20) / RB_ENTRY)
 
 static uint8_t   *s_base[3];                    /* host address of each window */
-static uint8_t    s_tracked[RB_NPAGES], s_dirty[RB_NPAGES];
+static uint8_t    s_tracked[RB_NPAGES], s_dirty[RB_NPAGES], s_excl[RB_NPAGES];
 static RbFrame    s_frames[RB_FRAMES];
 static uint32_t   s_cur;                        /* tick being logged */
 static uint32_t   s_oldest;                     /* oldest tick that can be gone back to */
-static uint8_t   *s_arena;
-static uint64_t   s_arena_used, s_arena_committed;
-static size_t     s_heap_max;
+static uint8_t   *s_arena;                     /* RB_SLOTS slots */
+static uint64_t   s_next;                       /* the next slot to fill */
+static int        s_open;                       /* the record of s_cur has its heap slots */
+static uint8_t   *s_heap_tmp;                   /* the heap tables, unwrapped */
+static uint32_t   s_heap_slots;
+/* Pages a tick could not log (the ring full of that tick alone): protected
+ * again at the boundary, and the history before it is gone. */
+static uint32_t   s_unlogged[4096], s_nunlogged;
+static int        s_lost;
 static SRWLOCK    s_lock = SRWLOCK_INIT;
 static volatile LONG s_tracking;
 static uint64_t   s_vbase;
 static uint32_t   s_vtick;
 static uint64_t   s_stat_faults, s_stat_pages_max;
+static int        s_ver_want;                   /* GZ_RB_VERIFY: copy at this boundary */
+static void verify_take(void);
+static void verify_check(void);
 
 int gz_rb_active(void) { return s_tracking; }
 
@@ -149,14 +196,33 @@ static double now_s(void)
     return (double)q.QuadPart / (double)f.QuadPart;
 }
 
-/* Room for n more bytes in the arena (under s_lock). 0 = full. */
-static int arena_room(uint64_t n)
+static uint8_t *slot_ptr(uint64_t n)
 {
-    if (s_arena_used + n > RB_ARENA) return 0;
-    while (s_arena_used + n > s_arena_committed) {
-        if (!VirtualAlloc(s_arena + s_arena_committed, 16u << 20, MEM_COMMIT, PAGE_READWRITE)) return 0;
-        s_arena_committed += 16u << 20;
+    return s_arena + (size_t)(n % RB_SLOTS) * RB_ENTRY;
+}
+
+/* Room for n more slots (under s_lock): the oldest ticks give theirs up.
+ * 0 when the open tick alone would not fit. */
+static int ring_claim(uint64_t n)
+{
+    for (;;) {
+        uint64_t floor = (s_oldest > s_cur || (s_oldest == s_cur && !s_open))
+                         ? s_next : s_frames[s_oldest % RB_FRAMES].heap;
+        if (s_next + n - floor <= RB_SLOTS) return 1;
+        if (s_oldest >= s_cur) return 0;
+        s_oldest++;
     }
+}
+
+/* Append a page entry to the open tick's record (under s_lock). */
+static int log_entry(RbFrame *f, uint32_t i, const uint8_t *old)
+{
+    uint8_t *e;
+    if (s_lost || !ring_claim(1)) return 0;
+    e = slot_ptr(s_next++);
+    memcpy(e, &i, 4);
+    memcpy(e + 8, old, RB_PAGE);
+    f->npages++;
     return 1;
 }
 
@@ -174,14 +240,11 @@ static LONG CALLBACK rb_veh(EXCEPTION_POINTERS *ep)
     if (!s_dirty[i]) {
         RbFrame *f = &s_frames[s_cur % RB_FRAMES];
         uint8_t *p = page_ptr((uint32_t)i);
-        if (arena_room(RB_ENTRY)) {
-            uint8_t *e = s_arena + s_arena_used;
-            memcpy(e, &i, 4);
-            memcpy(e + 8, p, RB_PAGE);
-            s_arena_used += RB_ENTRY;
-            f->npages++;
-        } else
-            s_oldest = s_cur + 1;                   /* history lost up to here */
+        if (!log_entry(f, (uint32_t)i, p)) {
+            s_lost = 1;                             /* history lost up to here */
+            if (s_nunlogged < sizeof s_unlogged / sizeof s_unlogged[0])
+                s_unlogged[s_nunlogged++] = (uint32_t)i;
+        }
         s_dirty[i] = 1;
         s_stat_faults++;
         VirtualProtect(p, RB_PAGE, PAGE_READWRITE, &old);
@@ -190,23 +253,63 @@ static LONG CALLBACK rb_veh(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+/* The sound chip's state: s_apu_shadow is what it was at the last boundary,
+ * s_apu_live a scratch copy of now. */
+static uint8_t *s_apu_shadow, *s_apu_live;
+static uint32_t s_apu_chunks;                  /* 0 = not kept */
+
+static void apu_init(void)
+{
+    size_t size = xbox_ApuStateSize();
+    uint32_t n = (uint32_t)((size + RB_PAGE - 1) / RB_PAGE);
+    s_apu_chunks = 0;
+    if (!size || n > RB_APU_MAX) return;
+    if (!s_apu_shadow) {
+        s_apu_shadow = (uint8_t *)VirtualAlloc(NULL, (size_t)n * RB_PAGE, MEM_COMMIT, PAGE_READWRITE);
+        s_apu_live = (uint8_t *)VirtualAlloc(NULL, (size_t)n * RB_PAGE, MEM_COMMIT, PAGE_READWRITE);
+    }
+    if (!s_apu_shadow || !s_apu_live || !xbox_ApuStateSave(s_apu_shadow)) return;
+    s_apu_chunks = n;
+}
+
+/* At the end of a tick: log into its record (at the arena's end) the old
+ * contents of each chunk that changed since the shadow, and bring the shadow
+ * up to date. Under the APU lock, then s_lock. */
+static void apu_capture(RbFrame *f)
+{
+    uint32_t k;
+    if (!s_apu_chunks || !xbox_ApuStateSave(s_apu_live)) return;
+    for (k = 0; k < s_apu_chunks; k++) {
+        uint8_t *now = s_apu_live + (size_t)k * RB_PAGE, *was = s_apu_shadow + (size_t)k * RB_PAGE;
+        if (!memcmp(now, was, RB_PAGE)) continue;
+        if (!log_entry(f, RB_NPAGES + k, was))
+            s_lost = 1;
+        memcpy(was, now, RB_PAGE);
+    }
+}
+
 /* Start a tick's record at the arena's end (under s_lock, at a boundary). */
 static void frame_begin(uint32_t tick)
 {
     RbFrame *f = &s_frames[tick % RB_FRAMES];
-    if (!arena_room(s_heap_max + 64u * RB_ENTRY)) {     /* arena full: start over */
-        s_arena_used = 0;
+    uint32_t j;
+    s_open = 0;
+    if (s_lost) {                               /* the tick before could not be logged */
         s_oldest = tick;
-        arena_room(s_heap_max);
+        s_lost = 0;
     }
+    if (tick - s_oldest >= RB_FRAMES - 1) s_oldest = tick - (RB_FRAMES - 2);
+    ring_claim(s_heap_slots);                   /* with nothing open, always room */
     f->tick = tick;
     f->vtick = s_vtick;
     regs_save(&f->regs);
-    f->heap = s_arena_used;
-    s_arena_used += (xbox_HeapStateSave(s_arena + s_arena_used) + 15u) & ~(size_t)15u;
-    f->first = s_arena_used;
+    xbox_HeapStateSave(s_heap_tmp);
+    f->heap = s_next;
+    for (j = 0; j < s_heap_slots; j++)
+        memcpy(slot_ptr(s_next++), s_heap_tmp + (size_t)j * RB_ENTRY, RB_ENTRY);
+    f->first = s_next;
     f->npages = 0;
-    if (tick - s_oldest >= RB_FRAMES - 1) s_oldest = tick - (RB_FRAMES - 2);
+    s_open = 1;
 }
 
 /* Protect again what the tick that just ended touched. */
@@ -216,15 +319,22 @@ static void reprotect(const RbFrame *f)
     DWORD old;
     for (k = 0; k < f->npages; k++) {
         uint32_t i;
-        memcpy(&i, s_arena + f->first + (uint64_t)k * RB_ENTRY, 4);
-        if (s_dirty[i]) {
+        memcpy(&i, slot_ptr(f->first + k), 4);
+        if (i < RB_NPAGES && s_dirty[i]) {
             VirtualProtect(page_ptr(i), RB_PAGE, PAGE_READONLY, &old);
             s_dirty[i] = 0;
         }
     }
+    for (k = 0; k < s_nunlogged; k++)           /* and what it could not log */
+        if (s_dirty[s_unlogged[k]]) {
+            VirtualProtect(page_ptr(s_unlogged[k]), RB_PAGE, PAGE_READONLY, &old);
+            s_dirty[s_unlogged[k]] = 0;
+        }
+    s_nunlogged = 0;
 }
 
-/* Write-protect a window, allocation by allocation, and note its pages. */
+/* Write-protect a window, allocation by allocation, and note its pages. Pages
+ * in s_excl stay out: never protected, so never in any record. */
 static void track_window(int w, uint32_t first, uint32_t pages)
 {
     uint8_t *base = s_base[w];
@@ -233,18 +343,113 @@ static void track_window(int w, uint32_t first, uint32_t pages)
     while (off < size) {
         MEMORY_BASIC_INFORMATION mbi;
         size_t end;
-        DWORD old;
         if (!VirtualQuery(base + off, &mbi, sizeof mbi)) break;
         end = (size_t)((uint8_t *)mbi.BaseAddress + mbi.RegionSize - base);
         if (end > size || end <= off) end = size;
         if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)) && !(mbi.Protect & PAGE_GUARD)) {
-            /* tracked first: another thread's write the instant after the
-             * protect must find the page known to rb_veh */
-            memset(s_tracked + first + off / RB_PAGE, 1, (end - off) / RB_PAGE);
-            if (!VirtualProtect(base + off, end - off, PAGE_READONLY, &old))
-                memset(s_tracked + first + off / RB_PAGE, 0, (end - off) / RB_PAGE);
+            uint32_t p = first + (uint32_t)(off / RB_PAGE), pend = first + (uint32_t)(end / RB_PAGE);
+            while (p < pend) {
+                uint32_t q;
+                DWORD old;
+                if (s_excl[p]) { p++; continue; }
+                for (q = p; q < pend && !s_excl[q]; q++) {}
+                /* tracked first: another thread's write the instant after the
+                 * protect must find the page known to rb_veh */
+                memset(s_tracked + p, 1, q - p);
+                if (!VirtualProtect(page_ptr(p), (size_t)(q - p) * RB_PAGE, PAGE_READONLY, &old))
+                    memset(s_tracked + p, 0, q - p);
+                p = q;
+            }
         }
         off = end;
+    }
+}
+
+/* Pages of the low window that hold threads' present rather than game state:
+ * the worker threads' stacks and the interrupt / DPC handlers' stacks. Marked
+ * before anything is protected. Excluding them afterwards raced the threads:
+ * a worker's write between the protect and the exclusion put its stack page in
+ * tick 0's record, and the next boundary protected that page again, untracked,
+ * so the worker's next push faulted for good. */
+static int exclude_thread_stacks(void)
+{
+    uint32_t bases[32], ssize = 0;
+    int k, ns = xbox_ThreadStacks(bases, 32, &ssize);
+    memset(s_excl, 0, sizeof s_excl);
+    for (k = 0; k < ns; k++) {
+        uint32_t p0 = bases[k] / RB_PAGE, p1 = (bases[k] + ssize + RB_PAGE - 1) / RB_PAGE;
+        if (p1 > RB_WPAGES) continue;
+        memset(s_excl + p0, 1, p1 - p0);
+    }
+    /* the handlers' stacks are at the bottom of the stack region (0x00780000
+     * up; the main thread's is at its top) */
+    memset(s_excl + 0x00780000u / RB_PAGE, 1, 0x00100000u / RB_PAGE);
+    return ns;
+}
+
+/* A host thread that reports, once, when the ticks stop for 3 s while history
+ * is on: what the main thread and each worker are doing. */
+void xbox_LockstepDump(void);
+void xbox_ApuDump(void);
+void xbox_IrqDump(void);
+static volatile LONG s_progress;
+static DWORD s_main_tid;
+
+/* The main thread's host call stack, as offsets in the program (map them
+ * with a /MAP link). x64 unwind data is there without a PDB. */
+static void dump_main_stack(void)
+{
+    HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, s_main_tid);
+    CONTEXT c;
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    int k;
+    if (!th) return;
+    for (k = 0; k < 3; k++) {                   /* three samples, 50 ms apart */
+        int f;
+        memset(&c, 0, sizeof c);
+        c.ContextFlags = CONTEXT_FULL;
+        SuspendThread(th);
+        if (!GetThreadContext(th, &c)) { ResumeThread(th); break; }
+        fprintf(stderr, "[RB] main host stack, sample %d:", k + 1);
+        for (f = 0; f < 16 && c.Rip; f++) {
+            DWORD64 img = 0;
+            PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &img, NULL);
+            fprintf(stderr, " %s+%llX", img == base ? "exe" : "?",
+                    (unsigned long long)(c.Rip - (img ? img : 0)));
+            if (!rf) {                          /* a leaf: return address on top */
+                c.Rip = *(DWORD64 *)c.Rsp;
+                c.Rsp += 8;
+            } else {
+                PVOID hd;
+                DWORD64 ef;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, img, c.Rip, rf, &c, &hd, &ef, NULL);
+            }
+        }
+        fprintf(stderr, "\n");
+        ResumeThread(th);
+        Sleep(50);
+    }
+    CloseHandle(th);
+}
+
+static DWORD WINAPI rb_watchdog(LPVOID p)
+{
+    LONG last = -1;
+    int still = 0, told = 0;
+    (void)p;
+    for (;;) {
+        LONG now;
+        Sleep(1000);
+        now = s_progress;
+        if (now != last) { last = now; still = 0; told = 0; continue; }
+        if (++still >= 3 && !told) {
+            fprintf(stderr, "[RB] no tick for %d s (tick %u, %ld boundaries):\n", still, s_cur, now);
+            xbox_LockstepDump();
+            xbox_ApuDump();
+            xbox_IrqDump();
+            dump_main_stack();
+            told = 1;
+        }
     }
 }
 
@@ -253,72 +458,135 @@ static void track_window(int w, uint32_t first, uint32_t pages)
 static int history_start(void)
 {
     uint32_t i, n = 0, gsize = 0;
+    int ns;
     if (s_tracking) return 1;
-    s_heap_max = (xbox_HeapStateSize() + 15u) & ~(size_t)15u;
-    if (!s_arena) s_arena = (uint8_t *)VirtualAlloc(NULL, RB_ARENA, MEM_RESERVE, PAGE_READWRITE);
-    if (!s_arena) return 0;
+    s_heap_slots = (uint32_t)((xbox_HeapStateSize() + RB_ENTRY - 1) / RB_ENTRY);
+    if (!s_arena) s_arena = (uint8_t *)VirtualAlloc(NULL, (size_t)RB_SLOTS * RB_ENTRY, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!s_heap_tmp) s_heap_tmp = (uint8_t *)VirtualAlloc(NULL, (size_t)s_heap_slots * RB_ENTRY, MEM_COMMIT, PAGE_READWRITE);
+    if (!s_arena || !s_heap_tmp) return 0;
     s_base[0] = (uint8_t *)((uintptr_t)0 + g_xbox_mem_offset);
     s_base[1] = (uint8_t *)((uintptr_t)0x80000000u + g_xbox_mem_offset);
     s_base[2] = (uint8_t *)xbox_Nv2aRegs(&gsize);
+    /* The worker threads (music, three job queues) run in turns from now on,
+     * granted at the end of every tick (rb_pump): each is parked at a sleep or
+     * wait whenever a boundary is recorded or a rollback runs. Running on the
+     * host's schedule they changed the heap and their queues under a
+     * rollback, and a replayed tick did not see the same worker work. */
+    xbox_LockstepSet(1);
+    if ((ns = xbox_LockstepQuiesce(2000)) != 0)
+        fprintf(stderr, "[RB] %d worker(s) did not park: their state is not exact\n", ns);
     AddVectoredExceptionHandler(1, rb_veh);
     /* The USB controller model stops: pads come through gz_rb_pad() now, and
      * the driver's queues in guest memory must not go back in time under a
      * controller that did not. */
     xbox_OhciPause(1);
     xbox_Nv2aPause(1);
+    xbox_ApuLock();
     AcquireSRWLockExclusive(&s_lock);
+    apu_init();                                 /* the sound chip at tick 0's boundary */
     memset(s_tracked, 0, sizeof s_tracked);
     memset(s_dirty, 0, sizeof s_dirty);
     s_cur = s_oldest = 0;
-    s_arena_used = 0;
+    s_next = 0;
+    s_open = 0;
+    s_lost = 0;
+    s_nunlogged = 0;
     s_vbase = xbox_ReadTimeStampCounter();
     s_vtick = 0;
     frame_begin(0);
     InterlockedExchange(&s_tracking, 1);        /* before protecting: a write now must reach rb_veh */
     ReleaseSRWLockExclusive(&s_lock);           /* (rb_veh takes the lock itself) */
+    xbox_ApuUnlock();
+    /* Worker threads' stacks stay out of the history: they are those threads'
+     * present, and putting one back in time under a running thread crashes it
+     * (the music thread did). */
+    ns = exclude_thread_stacks();
     track_window(0, 0, RB_WPAGES);
     track_window(1, RB_WPAGES, RB_WPAGES);
     if (s_base[2] && gsize >= RB_GPAGES * RB_PAGE) track_window(2, 2u * RB_WPAGES, RB_GPAGES);
-    {
-        /* Worker threads' stacks stay out of the history: they are those
-         * threads' present, and putting one back in time under a running
-         * thread crashes it (the music thread did). */
-        uint32_t bases[32], ssize = 0;
-        int k, ns = xbox_ThreadStacks(bases, 32, &ssize);
-        DWORD old;
-        for (k = 0; k < ns; k++) {
-            uint32_t p0 = bases[k] / RB_PAGE, p1 = (bases[k] + ssize + RB_PAGE - 1) / RB_PAGE;
-            if (p1 > RB_WPAGES) continue;
-            VirtualProtect(page_ptr(p0), (size_t)(p1 - p0) * RB_PAGE, PAGE_READWRITE, &old);
-            memset(s_tracked + p0, 0, p1 - p0);
-        }
-        /* and the interrupt / DPC handlers' stacks, at the bottom of the
-         * stack region (0x00780000 up; the main thread's is at its top) */
-        VirtualProtect(page_ptr(0x00780000u / RB_PAGE), 0x00100000u, PAGE_READWRITE, &old);
-        memset(s_tracked + 0x00780000u / RB_PAGE, 0, 0x00100000u / RB_PAGE);
-        fprintf(stderr, "[RB] %d worker stack(s) and the handler stacks left out\n", ns);
-    }
+    fprintf(stderr, "[RB] %d worker stack(s) and the handler stacks left out\n", ns);
     for (i = 0; i < RB_NPAGES; i++) n += s_tracked[i];
     xbox_Nv2aResume();
+    s_main_tid = GetCurrentThreadId();
+    CloseHandle(CreateThread(NULL, 0, rb_watchdog, NULL, 0, NULL));
     fprintf(stderr, "[RB] history on: %u pages (%.0f MB) write-protected\n", n, n * (double)RB_PAGE / 1048576.0);
     return 1;
+}
+
+/* The workers' turns for the tick that is ending (GZ_RB_PUMPS, default 2:
+ * the music thread sleeps 8 ms a pass, so two passes a tick keep its pace). */
+static void rb_pump(void)
+{
+    static int pumps = -1;
+    int k, missed = 0;
+    if (pumps < 0) {
+        const char *e = getenv("GZ_RB_PUMPS");
+        pumps = e && *e ? atoi(e) : 2;
+    }
+    for (k = 0; k < pumps; k++)
+        missed += xbox_LockstepPump(2000);
+    if (missed) {
+        static unsigned nlog;
+        if (nlog++ < 10) fprintf(stderr, "[RB] tick %u: %d worker turn(s) did not end\n", s_cur, missed);
+    }
 }
 
 /* A boundary: close the tick that ran, open the next. */
 static void boundary(void)
 {
     RbFrame *f = &s_frames[s_cur % RB_FRAMES];
+    InterlockedIncrement(&s_progress);
+    rb_pump();
     xbox_DispatchGateEnter();           /* sound and other device code: not in flight */
     xbox_Nv2aPause(1);
+    xbox_ApuLock();                     /* before s_lock: see xbox_ApuLock */
     AcquireSRWLockExclusive(&s_lock);
+    apu_capture(f);
     if (f->npages > s_stat_pages_max) s_stat_pages_max = f->npages;
     reprotect(f);
     s_cur++;
     s_vtick++;
     frame_begin(s_cur);
+    if (s_ver_want) { verify_take(); s_ver_want = 0; }
     ReleaseSRWLockExclusive(&s_lock);
+    xbox_ApuUnlock();
     xbox_Nv2aResume();
     xbox_DispatchGateLeave();
+}
+
+/* The worker threads' TIBs and TLS blocks keep their present bytes through a
+ * rollback (see xbox_ThreadTibs): copied out before the pages go back, written
+ * in after. Under s_lock; the write goes around the protection (rb_veh would
+ * want the lock), and stays out of the records, which is fine because every
+ * rollback does this again. */
+#define RB_TIBS 16
+static uint32_t s_tib_va[RB_TIBS], s_tib_size[RB_TIBS];
+static uint8_t  s_tib_keep[RB_TIBS][0x400];
+
+static int keep_tibs_save(void)
+{
+    int k, n = xbox_ThreadTibs(s_tib_va, s_tib_size, RB_TIBS);
+    for (k = 0; k < n; k++) {
+        if (s_tib_size[k] > sizeof s_tib_keep[k]) s_tib_size[k] = sizeof s_tib_keep[k];
+        memcpy(s_tib_keep[k], (uint8_t *)((uintptr_t)s_tib_va[k] + g_xbox_mem_offset), s_tib_size[k]);
+    }
+    return n;
+}
+
+static void keep_tibs_load(int n)
+{
+    int k;
+    for (k = 0; k < n; k++) {
+        uint8_t *p = (uint8_t *)((uintptr_t)s_tib_va[k] + g_xbox_mem_offset);
+        uint32_t i0 = (uint32_t)page_of(p), i1 = (uint32_t)page_of(p + s_tib_size[k] - 1), i;
+        DWORD old;
+        if ((int)i0 < 0 || (int)i1 < 0) continue;
+        for (i = i0; i <= i1; i++)
+            if (s_tracked[i] && !s_dirty[i]) VirtualProtect(page_ptr(i), RB_PAGE, PAGE_READWRITE, &old);
+        memcpy(p, s_tib_keep[k], s_tib_size[k]);
+        for (i = i0; i <= i1; i++)
+            if (s_tracked[i] && !s_dirty[i]) VirtualProtect(page_ptr(i), RB_PAGE, PAGE_READONLY, &old);
+    }
 }
 
 /* Back n ticks: the game is as it was at that boundary (this thread's
@@ -326,29 +594,38 @@ static void boundary(void)
  * just arrived there). Returns 0 if the history does not reach that far. */
 static int rollback(uint32_t n)
 {
-    uint32_t target = s_cur - n, t, pages = 0;
+    uint32_t target = s_cur - n, t, pages = 0, apu_chunks = 0;
+    int ntib;
     DWORD old;
     double t0 = now_s();
-    if (n > s_cur || target < s_oldest) return 0;
+    if (n > s_cur || target < s_oldest || s_lost) return 0;
     xbox_DispatchGateEnter();
     xbox_Nv2aPause(1);
+    xbox_ApuLock();
     AcquireSRWLockExclusive(&s_lock);
+    apu_capture(&s_frames[s_cur % RB_FRAMES]);  /* the sound chip's changes in this tick so far */
+    ntib = keep_tibs_save();
     /* Oldest tick first: a page's contents at the target boundary are in the
      * first record from there on that holds it (each record has a page once),
      * so every page is written back once. */
     {
-        static uint8_t done[RB_NPAGES];
+        static uint8_t done[RB_NPAGES + RB_APU_MAX];
         memset(done, 0, sizeof done);
         for (t = target; ; t++) {
             const RbFrame *f = &s_frames[t % RB_FRAMES];
             uint32_t k;
             for (k = 0; k < f->npages; k++) {
-                const uint8_t *e = s_arena + f->first + (uint64_t)k * RB_ENTRY;
+                const uint8_t *e = slot_ptr(f->first + k);
                 uint32_t i;
                 uint8_t *p;
                 memcpy(&i, e, 4);
                 if (done[i]) continue;
                 done[i] = 1;
+                if (i >= RB_NPAGES) {           /* a sound chip chunk */
+                    memcpy(s_apu_shadow + (size_t)(i - RB_NPAGES) * RB_PAGE, e + 8, RB_PAGE);
+                    apu_chunks++;
+                    continue;
+                }
                 p = page_ptr(i);
                 if (!s_dirty[i]) VirtualProtect(p, RB_PAGE, PAGE_READWRITE, &old);
                 memcpy(p, e + 8, RB_PAGE);
@@ -361,24 +638,97 @@ static int rollback(uint32_t n)
         /* pages only the current tick touched are in its record, handled above;
          * a page dirty now but in no record cannot exist (rb_veh logs first) */
     }
+    keep_tibs_load(ntib);
+    /* the shadow is now the sound chip at the target boundary */
+    if (s_apu_chunks) xbox_ApuStateLoad(s_apu_shadow);
+    s_cur = target;
+    verify_check();                         /* GZ_RB_VERIFY */
     {
         RbFrame *f = &s_frames[target % RB_FRAMES];
         regs_load(&f->regs);
         s_vtick = f->vtick;
-        xbox_HeapStateLoad(s_arena + f->heap);
-        s_arena_used = f->first;                /* the later records are gone */
+        {
+            uint32_t j;
+            for (j = 0; j < s_heap_slots; j++)
+                memcpy(s_heap_tmp + (size_t)j * RB_ENTRY, slot_ptr(f->heap + j), RB_ENTRY);
+            xbox_HeapStateLoad(s_heap_tmp);
+        }
+        s_next = f->first;                      /* the later records are gone */
         f->npages = 0;
         s_cur = target;
     }
     ReleaseSRWLockExclusive(&s_lock);
+    xbox_ApuUnlock();
     xbox_Nv2aResume();
     xbox_DispatchGateLeave();
     {
         static unsigned nlog;
         if (nlog++ < 12 || (nlog & 63u) == 0)
-            fprintf(stderr, "[RB] back %u ticks to %u: %u pages put back in %.2f ms\n", n, target, pages, (now_s() - t0) * 1000.0);
+            fprintf(stderr, "[RB] back %u ticks to %u: %u pages and %u sound chip chunks put back in %.2f ms\n",
+                    n, target, pages, apu_chunks, (now_s() - t0) * 1000.0);
     }
     return 1;
+}
+
+/* ── exactness check (GZ_RB_VERIFY=1, with GZ_RB_SCRIPT_RB) ────────────
+ *
+ * At the boundary a scripted rollback will go back to, a full copy of every
+ * tracked page and of the sound chip's state; right after that rollback, a
+ * comparison. Every page that did not come back as it was is a write the
+ * undo log missed (a mirror view, a host thread writing around the
+ * protection, ...), listed with its guest address. Slow: 140 MB copied and
+ * compared, once per scripted rollback. */
+static uint8_t *s_ver_mem, *s_ver_apu;
+static uint32_t s_ver_tick = 0xFFFFFFFFu;
+
+static uint32_t page_va(uint32_t i)
+{
+    if (i < RB_WPAGES) return i * RB_PAGE;
+    if (i < 2u * RB_WPAGES) return 0x80000000u + (i - RB_WPAGES) * RB_PAGE;
+    return 0xFD000000u + (i - 2u * RB_WPAGES) * RB_PAGE;     /* GPU registers */
+}
+
+static void verify_take(void)
+{
+    uint32_t i;
+    if (!s_ver_mem) s_ver_mem = (uint8_t *)VirtualAlloc(NULL, (size_t)RB_NPAGES * RB_PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!s_ver_apu && s_apu_chunks) s_ver_apu = (uint8_t *)VirtualAlloc(NULL, (size_t)s_apu_chunks * RB_PAGE, MEM_COMMIT, PAGE_READWRITE);
+    if (!s_ver_mem) return;
+    for (i = 0; i < RB_NPAGES; i++)
+        if (s_tracked[i]) memcpy(s_ver_mem + (size_t)i * RB_PAGE, page_ptr(i), RB_PAGE);
+    if (s_ver_apu) memcpy(s_ver_apu, s_apu_shadow, (size_t)s_apu_chunks * RB_PAGE);
+    s_ver_tick = s_cur;
+}
+
+static void verify_check(void)
+{
+    uint32_t i, bad = 0, k;
+    static unsigned rounds;
+    if (s_ver_tick != s_cur || !s_ver_mem) return;
+    for (i = 0; i < RB_NPAGES; i++) {
+        const uint8_t *a, *b;
+        if (!s_tracked[i]) continue;
+        a = s_ver_mem + (size_t)i * RB_PAGE;
+        b = page_ptr(i);
+        if (!memcmp(a, b, RB_PAGE)) continue;
+        if (bad++ < 24) {
+            uint32_t o = 0, n = 0;
+            while (a[o] == b[o]) o++;
+            for (k = 0; k < RB_PAGE; k++) n += a[k] != b[k];
+            fprintf(stderr, "[RB] verify: page 0x%08X differs (%u bytes, first at +0x%03X: was %02X now %02X)%s\n",
+                    page_va(i), n, o, a[o], b[o], s_dirty[i] ? " dirty" : "");
+        }
+    }
+    if (s_ver_apu)
+        for (k = 0; k < s_apu_chunks; k++)
+            if (memcmp(s_ver_apu + (size_t)k * RB_PAGE, s_apu_shadow + (size_t)k * RB_PAGE, RB_PAGE)) {
+                bad++;
+                fprintf(stderr, "[RB] verify: sound chip chunk %u differs\n", k);
+            }
+    if (bad || rounds < 3)
+        fprintf(stderr, "[RB] verify: rollback to tick %u: %u page(s) not as they were\n", s_cur, bad);
+    rounds++;
+    s_ver_tick = 0xFFFFFFFFu;
 }
 
 /* ── scripted match (GZ_RB_SCRIPT=1) ────────────────────────────────────
@@ -395,7 +745,7 @@ static int rollback(uint32_t n)
 #define RB_SHOT_TICKS 40
 static void shot_request(void);
 static int      s_script = -1, s_script_rb, s_marker;
-static uint32_t s_shot_at[8], s_nshot, s_last_rb = 0xFFFFFFFFu;
+static uint32_t s_shot_at[8], s_nshot, s_last_rb = 0xFFFFFFFFu, s_last_beat = 0xFFFFFFFFu, s_nrb;
 
 void gz_rb_fight_camera(void)
 {
@@ -445,8 +795,22 @@ static void script_tick(void)
         s_script_rb = r ? atoi(r) : 0;
         if (!history_start()) { s_script = 0; return; }
         fprintf(stderr, "[RB] scripted match: tick 0%s\n", s_script_rb ? ", with rollbacks" : "");
-    } else
+    } else {
+        static int verify = -1;
+        if (verify < 0) { const char *v = getenv("GZ_RB_VERIFY"); verify = v && *v == '1'; }
+        /* the boundary the next scripted rollback goes back to */
+        s_ver_want = verify && s_script_rb > 0 && (s_vtick + 1u + (uint32_t)s_script_rb) % 30u == 0;
         boundary();
+    }
+    if (s_vtick % 600u == 0 && s_vtick != s_last_beat) {
+        static double tb;
+        double now = now_s();
+        if (tb > 0.0)
+            fprintf(stderr, "[RB] tick %u: %.1f ticks/s real time, %u rollbacks so far\n",
+                    s_vtick, 600.0 / (now - tb), s_nrb);
+        tb = now;
+        s_last_beat = s_vtick;
+    }
     for (k = 0; k < s_nshot; k++) {
         if (s_vtick == s_shot_at[k]) shot_request();
         if (s_vtick == s_shot_at[k] + RB_SHOT_TICKS) {
@@ -462,7 +826,7 @@ static void script_tick(void)
     }
     if (s_script_rb > 0 && s_vtick && s_vtick % 30u == 0 && s_vtick != s_last_rb && s_cur >= (uint32_t)s_script_rb) {
         s_last_rb = s_vtick;                    /* once: the replay comes through here again */
-        rollback((uint32_t)s_script_rb);
+        if (rollback((uint32_t)s_script_rb)) s_nrb++;
     }
     xbox_VirtualTscSet(s_vbase + (uint64_t)s_vtick * (RB_TSC_HZ / 60ull));
 }

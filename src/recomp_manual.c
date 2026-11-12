@@ -60,6 +60,10 @@ extern GZ_TLS uint32_t g_eax;
 extern ptrdiff_t g_xbox_mem_offset;
 
 #define GZ_MEM32(va) (*(volatile uint32_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
+#define GZ_MEM8(va)  (*(volatile uint8_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
+/* GameInfo's player blocks (0xD8 bytes from GameInfo + 0x160): this byte is 1
+ * for a System Link player, one playing on another console. */
+#define GZ_PLAYER_REMOTE 0xA4u
 
 /* ── D3D GPU semaphore (Godzilla: Save the Earth, XDK 5849) ──
  *
@@ -946,6 +950,10 @@ void sub_0009AA20(void)
      * menus it has no profile, and its save at the end of the match (a save
      * with no name) never finishes. Not the attract demo's either (nobody has
      * touched a controller for 10 s): replayed, it goes back to the menu. */
+    /* Not a System Link match's either (a player on another console): it
+     * would replace the last local setup with one quick fight cannot play. */
+    for (i = 0; i < 4; i++)
+        if (GZ_MEM8(GZ_GAMEINFO + 0x160 + i * 0xD8 + GZ_PLAYER_REMOTE)) players = 0;
     if (!gz_qf_launching && players >= 2 && GZ_MEM32(GZ_GAMEINFO + 0x238) != 0
             && gz_pad_last_change && GetTickCount() - gz_pad_last_change < 10000) {
         FILE *f = fopen(gz_qf_file(), "wb");
@@ -1053,6 +1061,16 @@ static void gz_quick_fight_tick(void)
         }
         for (i = 0; i < sizeof blob; i++) gi[i] = blob[i];
         GZ_MEM32(GZ_GAMEINFO + 0x138) = GetTickCount();        /* random seed */
+        {
+            /* Quick fight is a local match. A player block's byte at +0xA4
+             * marks a System Link player (one on another console); a setup
+             * kept from a System Link match replayed with it set opens on the
+             * network "WAITING FOR PLAYER" screen, and the absent player is
+             * dropped from the game a few seconds later. */
+            uint32_t p;
+            for (p = 0; p < 4; p++)
+                GZ_MEM8(GZ_GAMEINFO + 0x160 + p * 0xD8 + GZ_PLAYER_REMOTE) = 0;
+        }
         if (p1 && *p1) { gz_qf_str(GZ_GAMEINFO + 0x160, p1, 0x1F); gz_qf_str(GZ_GAMEINFO + 0x17F, p1, 0x1F); }
         if (p2 && *p2) { gz_qf_str(GZ_GAMEINFO + 0x238, p2, 0x1F); gz_qf_str(GZ_GAMEINFO + 0x257, p2, 0x1F); }
         if (city && *city) gz_qf_str(GZ_GAMEINFO + 0xD0, city, 0x40);

@@ -28,6 +28,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -45,6 +46,7 @@ static uint32_t s_ip;                 /* network byte order */
 static int      s_ip_forced;
 static uint32_t s_peer[8];
 static int      s_npeer;
+static uint32_t s_bcast;              /* our network's broadcast address, or 0 */
 static int      s_lag_ms;             /* simulated delay, defined with its queue below */
 static void     lag_flush(void);
 
@@ -108,8 +110,31 @@ int gz_net_on(void)
             peer += n;
             while (*peer == ',' || *peer == ';' || *peer == ' ') peer++;
         }
-        fprintf(stderr, "[NET] System Link on real sockets: local %s, %d peer(s)%s\n",
-                ipstr(s_ip, b), s_npeer, s_npeer ? "" : " (LAN broadcast)");
+        /* Without peers, discovery is a broadcast. 255.255.255.255 leaves
+         * through one adapter of Windows' choosing: on a PC with a VPN,
+         * Hyper-V or VirtualBox adapter that was often not the network the
+         * other player is on, and neither side saw the other's game. The
+         * broadcast address of the adapter holding our own address
+         * (10.0.0.255 for 10.0.0.46/24) is routed out of that adapter. */
+        {
+            ULONG size = 0;
+            MIB_IPADDRTABLE *t = NULL;
+            DWORD k;
+            if (GetIpAddrTable(NULL, &size, FALSE) == ERROR_INSUFFICIENT_BUFFER
+                    && (t = (MIB_IPADDRTABLE *)malloc(size)) != NULL
+                    && GetIpAddrTable(t, &size, FALSE) == NO_ERROR)
+                for (k = 0; k < t->dwNumEntries; k++)
+                    if (t->table[k].dwAddr == s_ip && t->table[k].dwMask && t->table[k].dwMask != 0xFFFFFFFFu)
+                        s_bcast = s_ip | ~t->table[k].dwMask;
+            free(t);
+        }
+        if (s_npeer)
+            fprintf(stderr, "[NET] System Link on real sockets: local %s, %d peer(s)\n", ipstr(s_ip, b), s_npeer);
+        else {
+            char c[32];
+            fprintf(stderr, "[NET] System Link on real sockets: local %s, LAN broadcast to %s\n", ipstr(s_ip, b),
+                    s_bcast ? ipstr(s_bcast, c) : "255.255.255.255");
+        }
     }
     return s_on;
 }
@@ -304,6 +329,8 @@ uint32_t gz_net_sendto(uint32_t h, const void *buf, uint32_t len, uint32_t flags
         nlog("sendto(%X) %u bytes broadcast -> %d peer(s), port %u", h, len, s_npeer, ntohs(a.sin_port));
         return len;
     }
+    if (a.sin_addr.s_addr == INADDR_BROADCAST && s_bcast)
+        a.sin_addr.s_addr = s_bcast;              /* out of our own network's adapter (see gz_net_on) */
     if (lag_send(host(h), buf, (int)len, &a)) return len;
     n = sendto(host(h), (const char *)buf, (int)len, (int)flags, (struct sockaddr *)&a, sizeof a);
     if (n < 0) return fail();

@@ -106,6 +106,8 @@ while another program's window is in front (`RECOMP_PAD_BACKGROUND=1` reads them
 - **Online:** set `online=1` (and `online_peer=<other player's IP>` over the internet) in `gz_settings.ini`, or
   `GZ_NET` / `GZ_NET_PEER` in `play.bat`, on both PCs, forward UDP ports 1000–1002 or use a VPN such as Tailscale/ZeroTier, then Multi-Player > System Link.
   Online uses tournament mode so both sides have the same roster.
+  Network matches run at 60 fps (`online_60fps=1`); `online_60fps=0` gives the console's 30, which holds
+  full speed better over the internet with a high ping. Both players need the same frame rate settings.
 
 Logs go to `play.log` next to the launcher; include it when reporting a problem.
 

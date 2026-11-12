@@ -246,6 +246,28 @@
       }
     },
     {
+      "id": "online_fps",
+      "label": "Online frame rate",
+      "help": "60 is smoother on a home network. Over the internet with a high ping, 30 (the console's) keeps the match closer to full speed. Both players need the same.",
+      "choices": [
+        {
+          "label": "60",
+          "set": {
+            "online_60fps": "1"
+          }
+        },
+        {
+          "label": "30 (console)",
+          "set": {
+            "online_60fps": "0"
+          }
+        }
+      ],
+      "defaults": {
+        "online_60fps": "1"
+      }
+    },
+    {
       "id": "window",
       "label": "Window",
       "in": "args",

@@ -12,9 +12,12 @@
  *               treated as 144.
  *   turbo       1 = the game runs 1.2x faster (a player suggestion: the pace
  *               of the old high-frame-rate speed bug); never in System Link
- * Two more are only in the file (and in RecompLauncher's settings):
+ *               or rollback netplay
+ * More are only in the file (and in RecompLauncher's settings):
  *   online       1 = System Link over the network (GZ_NET)
  *   online_peer  the other players' IP addresses (GZ_NET_PEER)
+ *   online_60fps 1 = network matches at 60 frames a second (default), 0 = 30
+ *                as on the console (GZ_NET60 overrides)
  *
  * Button icons default to the controller that is plugged in the first time
  * the game starts (RECOMPLAUNCHER_PAD when RecompLauncher started it; an Xbox
@@ -58,6 +61,8 @@ static const char *const s_header[] = {
     "; online       1 = System Link over the network (Multi-Player > System Link)",
     "; online_peer  the other player's IP address (several: comma separated);",
     ";              empty on the same home network. UDP ports 1000-1002 must be open.",
+    "; online_60fps 1 = network matches at 60 frames a second, 0 = 30 as on the console;",
+    ";              both players need the same (otherwise joining says the versions differ)",
     NULL
 };
 
@@ -102,7 +107,7 @@ static void read_key(const char *want, char *out, size_t n)
 static void save(void)
 {
     char lines[64][512], net[8], peer[256], buf[512], *k, *v;
-    int n = 0, i, j, done[OPT_COUNT] = { 0 }, have_header = 0, have_net = 0, have_peer = 0;
+    int n = 0, i, j, done[OPT_COUNT] = { 0 }, have_header = 0, have_net = 0, have_peer = 0, have_n60 = 0;
     FILE *f = fopen(settings_path(), "r");
     if (f) {
         while (n < 64 && fgets(lines[n], sizeof lines[n], f)) {
@@ -128,6 +133,7 @@ static void save(void)
             if (i < OPT_COUNT) continue;
             if (!strcmp(k, "online")) have_net = 1;
             if (!strcmp(k, "online_peer")) have_peer = 1;
+            if (!strcmp(k, "online_60fps")) have_n60 = 1;
         }
         fprintf(f, "%s\n", lines[j]);
     }
@@ -138,6 +144,7 @@ static void save(void)
         snprintf(net, sizeof net, "%s", (e && *e == '1') ? "1" : "0");
         fprintf(f, "online=%s\n", net);
     }
+    if (!have_n60) fprintf(f, "online_60fps=1\n");
     if (!have_peer) {
         const char *e = getenv("GZ_NET_PEER");
         snprintf(peer, sizeof peer, "%s", e ? e : "");
@@ -166,9 +173,10 @@ static void load(void)
                 }
             if (!strcmp(k, "online")) have_all |= 1 << OPT_COUNT;
             if (!strcmp(k, "online_peer")) have_all |= 2 << OPT_COUNT;
+            if (!strcmp(k, "online_60fps")) have_all |= 4 << OPT_COUNT;
         }
         fclose(f);
-        need_write = !have_header || have_all != (1 << (OPT_COUNT + 2)) - 1;
+        need_write = !have_header || have_all != (1 << (OPT_COUNT + 3)) - 1;
     }
     /* Started from RecompLauncher before the player picked button icons: show
      * the controller that is plugged in. */
@@ -214,6 +222,20 @@ void gz_settings_apply_env(void)
         read_key("online_peer", v, sizeof v);
         if (v[0]) _putenv_s("GZ_NET_PEER", v);
     }
+}
+
+/* Network matches at 60 frames a second: online_60fps (default 1), GZ_NET60
+ * overrides. Read once. */
+int gz_opt_net60(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GZ_NET60");
+        char t[16];
+        if (e && (*e == '0' || *e == '1')) v = *e == '1';
+        else { read_key("online_60fps", t, sizeof t); v = t[0] ? t[0] == '1' : 1; }
+    }
+    return v;
 }
 
 int gz_opt_get(int which)

@@ -55,10 +55,21 @@ static void nlog(const char *fmt, ...)
     va_list ap;
     if (!s_log) return;
     va_start(ap, fmt);
-    fprintf(stderr, "[NET] ");
+    fprintf(stderr, "[NET] %lu ", (unsigned long)GetTickCount());
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
     va_end(ap);
+}
+
+/* GZ_NET_LOG=2: the first bytes of each packet, after its log line. */
+static void nhex(const void *buf, int n)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    int i;
+    if (s_log < 2 || n <= 0) return;
+    fprintf(stderr, "[NET]   ");
+    for (i = 0; i < n && i < 32; i++) fprintf(stderr, "%02X%s", p[i], (i & 3) == 3 ? " " : "");
+    fprintf(stderr, "\n");
 }
 
 static const char *ipstr(uint32_t ip_be, char *buf)
@@ -76,7 +87,7 @@ int gz_net_on(void)
         char b[32];
         s_on = e && *e == '1';
         if (!s_on) return 0;
-        s_log = getenv("GZ_NET_LOG") != NULL;
+        { const char *lg = getenv("GZ_NET_LOG"); s_log = lg ? (atoi(lg) > 1 ? 2 : 1) : 0; }
         if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) {
             fprintf(stderr, "[NET] WSAStartup failed; networking stays off\n");
             return s_on = 0;
@@ -270,6 +281,7 @@ uint32_t gz_net_recvfrom(uint32_t h, void *buf, uint32_t len, uint32_t flags, vo
     if (n < 0) return fail();
     if (from && fromlen && *fromlen >= sizeof a) { memcpy(from, &a, sizeof a); *fromlen = sizeof a; }
     nlog("recvfrom(%X) %d bytes from %s:%u", h, n, ipstr(a.sin_addr.s_addr, b), ntohs(a.sin_port));
+    nhex(buf, n);
     return (uint32_t)n;
 }
 
@@ -345,6 +357,7 @@ uint32_t gz_net_sendto(uint32_t h, const void *buf, uint32_t len, uint32_t flags
     n = sendto(host(h), (const char *)buf, (int)len, (int)flags, (struct sockaddr *)&a, sizeof a);
     if (n < 0) return fail();
     nlog("sendto(%X) %d bytes to %s:%u", h, n, ipstr(a.sin_addr.s_addr, b), ntohs(a.sin_port));
+    nhex(buf, n);
     return (uint32_t)n;
 }
 

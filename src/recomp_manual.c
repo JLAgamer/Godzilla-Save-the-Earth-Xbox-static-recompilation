@@ -337,6 +337,8 @@ int  gz_movie_update(uint32_t obj, uint8_t *dst);
 void gz_movie_tick(void);
 void gz_ach_frame(void);           /* gz_ach.c: achievements, once per frame */
 static void gz_pad_activity_tick(void);
+void gz_rb_tick(void);
+int gz_rb_active(void);
 extern void sub_001F0650_gen(void);
 
 /* Skipped movies (no host playback): the title's own movie player still
@@ -1065,6 +1067,7 @@ static void gz_quick_fight_tick(void)
         fprintf(stderr, "[QUICKFIGHT] launching %s vs %s in %s\n",
                 (const char *)(gi + 0x160), (const char *)(gi + 0x238), (const char *)(gi + 0xD0));
         g_esp -= 4; GZ_MEM32(g_esp) = 0x00012240u;             /* return address */
+        { extern void gz_rb_arm(void); gz_rb_arm(); }
         gz_qf_launching = 1;
         sub_0009AA20();                                         /* Shell::launchGame */
         gz_qf_launching = 0;
@@ -1546,6 +1549,7 @@ int gz_wide_fight_active(void)
 
 void sub_0001F740(void)
 {
+    if (g_ecx >= 0x01000000u) { extern void gz_rb_fight_camera(void); gz_rb_fight_camera(); }
     if (g_ecx >= 0x01000000u) gz_fight_cam_seq = ++gz_cam_seq;
     else gz_shell_cam_seq = ++gz_cam_seq;
     if (gz_opt_wide()) {
@@ -1628,6 +1632,38 @@ void sub_000A6820(void)
     sub_000A6820_gen();
 }
 
+/* -- Pad input override (rollback netplay, gz_rollback.c) -------------------
+ *
+ * The game polls every pad once a frame in sub_0001ECB0: a loop over the four
+ * ports (index in ebx) that calls XInputGetState, sub_002D8D7E(hDevice,
+ * pState) (ret 8), at 0x0001EE18. XINPUT_STATE is a packet number and the 18
+ * byte pad (buttons, 8 analog buttons, 4 stick axes). For two machines to run
+ * the same match tick for tick, a tick's input has to arrive exactly here,
+ * not through the emulated USB port whose timing varies: gz_rb_pad() may
+ * replace what the port read. */
+extern void sub_002D8D7E_gen(void);
+extern GZ_TLS uint32_t g_ebx;
+int gz_rb_pad(int port, uint8_t *pad18);
+
+void sub_002D8D7E(void)
+{
+    uint32_t ra = GZ_MEM32(g_esp), state = GZ_MEM32(g_esp + 8), port = g_ebx;
+    sub_002D8D7E_gen();
+    if (ra == 0x0001EE1Du && port < 4u && state) {
+        static uint8_t last[4][18];
+        static uint32_t packet[4];
+        uint8_t pad[18];
+        if (gz_rb_pad((int)port, pad)) {
+            volatile uint8_t *d = (volatile uint8_t *)((uintptr_t)state + g_xbox_mem_offset);
+            int k;
+            if (memcmp(last[port], pad, 18)) { memcpy(last[port], pad, 18); packet[port]++; }
+            GZ_MEM32(state) = packet[port];
+            for (k = 0; k < 18; k++) d[4 + k] = pad[k];
+            g_eax = 0;                              /* ERROR_SUCCESS: connected */
+        }
+    }
+}
+
 /* -- System Link timing -----------------------------------------------------
  *
  * A System Link match ticks once per frame in lockstep: the console runs it at
@@ -1638,14 +1674,38 @@ void sub_000A6820(void)
  * System Link socket open (its System Link screens and the match), all three
  * step aside and the game times itself as on the console. */
 int gz_net_active(void);
+/* online_60fps (default on, gz_settings.c): network matches at 60 frames a
+ * second. The match ticks by twice the base period (0x00442634): at 60 frames
+ * with the base period halved, a tick is 1/60 s and the match runs at real
+ * speed in lockstep. A PC ticking at 30 and one at 60 would desync, so 60
+ * changes the build string the lobby hashes into its version number
+ * ("Official Build (4.670)" at 0x00306A28, see DNetLobby, 0x000B4B07): the
+ * two then see "the version of the game does not match" instead. */
+int gz_opt_net60(void);
+static int gz_net60(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = gz_opt_net60();
+        if (on) {
+            volatile char *v = (volatile char *)((uintptr_t)0x00306A28u + g_xbox_mem_offset);
+            if (v[16] == '4' && v[20] == '0') v[20] = '6';     /* 4.670 -> 4.676 */
+            fprintf(stderr, "[RATE] network matches at 60 frames a second (online_60fps)\n");
+        }
+    }
+    return on;
+}
+
 static int gz_net_session(void)
 {
     static int was = -1;
     int now = gz_net_active();
+    (void)gz_net60();                         /* the version string, before any lobby */
     if (now != was) {
         if (was >= 0 || now)
             fprintf(stderr, "[RATE] System Link session %s\n",
-                    now ? "started: the game's own frame timing (60 Hz base)" : "ended: frame rate setting again");
+                    now ? (gz_net60() ? "started: 60 frames a second, 1/60 s ticks" : "started: the game's own frame timing (30 frames a second)")
+                        : "ended: frame rate setting again");
         was = now;
     }
     return now;
@@ -1667,7 +1727,7 @@ void sub_000B2A00(void)
 {
     static int half = -1;
     if (half < 0) half = getenv("GZ_HALF_RATE") && getenv("GZ_HALF_RATE")[0] == '1';
-    if (!half && !gz_net_session()) GZ_MEM32(g_esp + 4) = 1;
+    if (!half && (!gz_net_session() || gz_net60())) GZ_MEM32(g_esp + 4) = 1;
     sub_000B2A00_gen();
 }
 
@@ -1737,7 +1797,7 @@ extern GZ_TLS int g_fp_top;
 static double gz_turbo_scale(void)
 {
     static double scale;
-    if (!gz_opt_turbo() || gz_net_session()) return 1.0;
+    if (!gz_opt_turbo() || gz_net_session() || gz_rb_active()) return 1.0;
     if (scale <= 0.0) {
         const char *e = getenv("GZ_TURBO_SCALE");
         scale = (e && atof(e) >= 0.5 && atof(e) <= 3.0) ? atof(e) : 1.2;
@@ -1766,6 +1826,7 @@ void sub_00012240(void)
     gz_movie_mute_tick();
     gz_ach_frame();
     gz_pad_activity_tick();
+    if (ra == 0x0001D802u) gz_rb_tick();     /* gz_rollback.c: may put the game back a few ticks */
     {
         /* GZ_RATE=<n>: the game derives its frame period as 1 / (unsigned)
          * MEM32(0x4323A0) (sub_00012590). Overriding that rate is how to run
@@ -1822,7 +1883,7 @@ void sub_00012240(void)
             pace = !(e && e[0] == '0');
             QueryPerformanceFrequency(&qf);
         }
-        if (pace && ra == 0x0001D802u && !gz_net_session()) {
+        if (pace && ra == 0x0001D802u && (!gz_net_session() || gz_net60())) {
             LARGE_INTEGER q;
             float period = 1.0f / (float)(gz_opt_rate() > 0 ? gz_opt_rate() : 60);
             double now, start, target;
@@ -1899,10 +1960,21 @@ void sub_00012240(void)
                      * (the same PC at ~105-115 fps: 0.98x at 120, 0.85x at
                      * 144). */
                     step = (double)period * gz_turbo_scale();
+                    /* A 60 fps network match: fixed values, never measured ones.
+                     * The match ticks by twice the base period, and both machines
+                     * must tick by exactly the same amount every frame. */
+                    if ((gz_net60() && gz_net_active()) || gz_rb_active()) step = (double)period;
                     f = (float)step;
                     memcpy(&fb, &f, 4);
                     GZ_MEM32(0x00400F2Cu) = fb;
-                    GZ_MEM32(0x00442634u) = fb;   /* the render function copies this into the step */
+                    if (gz_net60() && gz_net_active()) {
+                        /* experiment: the network tick as twice the base period */
+                        float h = f * 0.5f;
+                        uint32_t hb;
+                        memcpy(&hb, &h, 4);
+                        GZ_MEM32(0x00442634u) = hb;
+                    } else
+                        GZ_MEM32(0x00442634u) = fb;   /* the render function copies this into the step */
                 }
                 g_fp_top = (g_fp_top + 7) & 7;
                 g_fp_stack[g_fp_top] = now - start;     /* time slept, seconds */

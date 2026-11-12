@@ -1577,6 +1577,29 @@ void sub_000A6820(void)
     sub_000A6820_gen();
 }
 
+/* -- System Link timing -----------------------------------------------------
+ *
+ * A System Link match ticks once per frame in lockstep: the console runs it at
+ * 30 frames a second (the game asks for frame interval 2) at the 60 Hz base,
+ * and both machines must step the same way. The frame rate setting, the
+ * precise pacing and the "no half-rate" override below all change that, and a
+ * network match then ran fast on both PCs and desynced. While the game has a
+ * System Link socket open (its System Link screens and the match), all three
+ * step aside and the game times itself as on the console. */
+int gz_net_active(void);
+static int gz_net_session(void)
+{
+    static int was = -1;
+    int now = gz_net_active();
+    if (now != was) {
+        if (was >= 0 || now)
+            fprintf(stderr, "[RATE] System Link session %s\n",
+                    now ? "started: the game's own frame timing (60 Hz base)" : "ended: frame rate setting again");
+        was = now;
+    }
+    return now;
+}
+
 /* -- No half-rate governor ------------------------------------------------
  *
  * The render function (sub_000B3A50) times each frame's GPU work and, when
@@ -1593,7 +1616,7 @@ void sub_000B2A00(void)
 {
     static int half = -1;
     if (half < 0) half = getenv("GZ_HALF_RATE") && getenv("GZ_HALF_RATE")[0] == '1';
-    if (!half) GZ_MEM32(g_esp + 4) = 1;
+    if (!half && !gz_net_session()) GZ_MEM32(g_esp + 4) = 1;
     sub_000B2A00_gen();
 }
 
@@ -1680,7 +1703,7 @@ void sub_00012240(void)
          * MEM32(0x4323A0) (sub_00012590). Overriding that rate is how to run
          * more frames per second at the game's own pace, if its logic steps
          * by that period. */
-        int rate = gz_opt_rate();       /* Options > frame rate, or GZ_RATE */
+        int rate = gz_net_session() ? 60 : gz_opt_rate();   /* Options > frame rate, or GZ_RATE */
         if (rate > 0) {
             /* The game turns the rate at 0x004323A0 into frame periods only
              * now and then, so a rate changed in the menu is written to them
@@ -1730,7 +1753,7 @@ void sub_00012240(void)
             pace = !(e && e[0] == '0');
             QueryPerformanceFrequency(&qf);
         }
-        if (pace && ra == 0x0001D802u) {
+        if (pace && ra == 0x0001D802u && !gz_net_session()) {
             LARGE_INTEGER q;
             float period = 1.0f / (float)(gz_opt_rate() > 0 ? gz_opt_rate() : 60);
             double now, start, target;

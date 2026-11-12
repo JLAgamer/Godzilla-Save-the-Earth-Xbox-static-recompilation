@@ -141,6 +141,16 @@ int gz_net_on(void)
 
 uint32_t gz_net_local_ip(void) { return s_ip; }
 
+/* 1 while the game has a System Link socket open (the System Link screens and
+ * a network match). */
+int gz_net_active(void)
+{
+    int i;
+    if (s_on <= 0) return 0;
+    for (i = 0; i < MAX_SOCK; i++) if (s_used[i]) return 1;
+    return 0;
+}
+
 static SOCKET host(uint32_t h)
 {
     uint32_t i = h - HANDLE_BASE;

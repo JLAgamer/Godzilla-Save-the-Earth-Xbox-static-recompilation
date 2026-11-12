@@ -578,10 +578,43 @@ index e725646..b7d41e0 100644
      if (FAILED(hr)) {
          fprintf(stderr, "[XA2] Start failed: 0x%08lX\n", hr);
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
-index 2991d89..bffc8d7 100644
+index 2991d89..0c14283 100644
 --- a/src/kernel/kernel_file.c
 +++ b/src/kernel/kernel_file.c
-@@ -877,7 +877,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+@@ -326,7 +326,14 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
+             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
+         DWORD access = xbox_access_to_win32(DesiredAccess);
++        /* A read-only open lets other readers in. The console's disc has one
++         * reader, so titles often ask for no sharing; on a PC two copies of
++         * a game (a System Link test on one machine) read the same files,
++         * and the second was refused one -- the title's "dirty disc" screen. */
++        DWORD share = xbox_share_to_win32(ShareAccess);
+         WIN32_FILE_ATTRIBUTE_DATA fad;
++        if (!(access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA)))
++            share |= FILE_SHARE_READ;
+         /* An overwrite of an existing non-empty file is deferred (see
+          * s_overwrite_pending). It needs write access to settle later. */
+         int defer = disposition_overwrites(CreateDisposition)
+@@ -336,7 +343,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+                  && (fad.nFileSizeHigh || fad.nFileSizeLow);
+         h = INVALID_HANDLE_VALUE;
+         if (defer) {
+-            h = CreateFileW(win_path, access, xbox_share_to_win32(ShareAccess),
++            h = CreateFileW(win_path, access, share,
+                 NULL, OPEN_EXISTING, flags_and_attrs, NULL);
+             if (h != INVALID_HANDLE_VALUE)
+                 overwrite_take(h);          /* a stale mark; see below */
+@@ -347,7 +354,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+         }
+         if (h == INVALID_HANDLE_VALUE) {    /* not deferred, or it vanished */
+             h = CreateFileW(win_path, access,
+-                xbox_share_to_win32(ShareAccess), NULL,
++                share, NULL,
+                 xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+             /* A HANDLE value is reused once closed, and a pending handle
+              * closed by DuplicateHandle(DUPLICATE_CLOSE_SOURCE) never went
+@@ -877,7 +884,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
          WCHAR* clean_path = dir_path;
          if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
              clean_path += 4;
@@ -594,7 +627,7 @@ index 2991d89..bffc8d7 100644
              WCHAR pattern_wide[MAX_PATH];
              MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
                                  pattern_wide, MAX_PATH);
-@@ -888,6 +892,9 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+@@ -888,6 +899,9 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
          }
          ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
          if (ctx->find_handle == INVALID_HANDLE_VALUE) {

@@ -350,6 +350,14 @@ static void gz_refresh_disk_cache(const char *save_dir)
         have[got] = 0;
         fclose(f);
     }
+    {
+        /* Rollback netplay (gz_rbnet.c): an empty cache on both PCs, every
+         * time. The game loads from its hard-disk cache when a file is there
+         * and from the disc when not, so two caches filled differently load
+         * the match differently, and the two memories no longer agree. */
+        const char *rn = getenv("GZ_RB_NET");
+        if (rn && *rn == '1') have[0] = '!';
+    }
     if (!strcmp(have, want)) return;
     {
         char pat[MAX_PATH];
@@ -480,6 +488,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
     printf("Initializing kernel bridge...\n");
     xbox_kernel_bridge_init();
+
+    {
+        /* Rollback netplay (gz_rbnet.c): the two PCs must reach the match in
+         * the same state, so the run is deterministic from here: worker
+         * threads in lockstep with this one, the guest's clock virtual. */
+        const char *rn = getenv("GZ_RB_NET");
+        if (rn && *rn == '1') {
+            extern void xbox_LockstepSet(int on);
+            extern void xbox_VirtualTscSet(uint64_t value);
+            extern uint64_t xbox_ReadTimeStampCounter(void);
+            xbox_LockstepSet(1);
+            xbox_VirtualTscSet(xbox_ReadTimeStampCounter());
+            printf("Rollback netplay: deterministic from boot (lockstep workers, virtual clock)\n");
+        }
+    }
 
     /* Step 6: Initialize stack */
     g_esp = XBOX_STACK_TOP;

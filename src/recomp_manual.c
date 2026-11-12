@@ -343,6 +343,8 @@ void gz_ach_frame(void);           /* gz_ach.c: achievements, once per frame */
 static void gz_pad_activity_tick(void);
 void gz_rb_tick(void);
 int gz_rb_active(void);
+int gz_rb_deterministic(void);
+int gz_rb_replaying(void);
 extern void sub_001F0650_gen(void);
 
 /* Skipped movies (no host playback): the title's own movie player still
@@ -1043,14 +1045,21 @@ static void gz_quick_fight_tick(void)
         unsigned char blob[GZ_GAMEINFO_SIZE];
         size_t i;
         FILE *f = fopen(gz_qf_file(), "rb");
-        if (!f || fread(blob, 1, sizeof blob, f) != sizeof blob) {
+        extern int gz_rbn_on(void), gz_rbn_local_port(void);
+        int net_client = gz_rbn_on() && gz_rbn_local_port() == 1;
+        if (net_client) {
+            /* rollback netplay, player 2: the host's setup replaces this one
+             * (gz_rbn_launch_sync), so none of its own is needed */
+            if (f) fclose(f);
+            for (i = 0; i < sizeof blob; i++) blob[i] = gi[i];
+        } else if (!f || fread(blob, 1, sizeof blob, f) != sizeof blob) {
             if (f) fclose(f);
             fprintf(stderr, "[QUICKFIGHT] %s not found: start one match from the menus first "
                     "(it is saved then), and quick fight will replay that setup\n", gz_qf_file());
             return;
-        }
-        fclose(f);
-        {
+        } else
+            fclose(f);
+        if (!net_client) {
             uint32_t players;
             memcpy(&players, blob + 0x118, 4);
             if (players < 2 || !blob[0x238]) {
@@ -1061,6 +1070,12 @@ static void gz_quick_fight_tick(void)
         }
         for (i = 0; i < sizeof blob; i++) gi[i] = blob[i];
         GZ_MEM32(GZ_GAMEINFO + 0x138) = GetTickCount();        /* random seed */
+        {
+            /* GZ_QF_SEED=<n>: the match's random seed, for a match that must
+             * play the same on every run (netplay passes the host's). */
+            const char *sd = getenv("GZ_QF_SEED");
+            if (sd && *sd) GZ_MEM32(GZ_GAMEINFO + 0x138) = (uint32_t)strtoul(sd, NULL, 0);
+        }
         {
             /* Quick fight is a local match. A player block's byte at +0xA4
              * marks a System Link player (one on another console); a setup
@@ -1084,6 +1099,14 @@ static void gz_quick_fight_tick(void)
         }
         fprintf(stderr, "[QUICKFIGHT] launching %s vs %s in %s\n",
                 (const char *)(gi + 0x160), (const char *)(gi + 0x238), (const char *)(gi + 0xD0));
+        {
+            /* Rollback netplay (gz_rbnet.c): the host's setup for both sides. */
+            extern int gz_rbn_launch_sync(uint8_t *gameinfo, uint32_t size);
+            uint8_t setup[GZ_GAMEINFO_SIZE];
+            for (i = 0; i < sizeof setup; i++) setup[i] = gi[i];
+            if (gz_rbn_launch_sync(setup, (uint32_t)sizeof setup))
+                for (i = 0; i < sizeof setup; i++) gi[i] = setup[i];
+        }
         g_esp -= 4; GZ_MEM32(g_esp) = 0x00012240u;             /* return address */
         { extern void gz_rb_arm(void); gz_rb_arm(); }
         gz_qf_launching = 1;
@@ -1271,7 +1294,16 @@ void sub_00097DE0(void)
     uint32_t junction = g_ecx, str = GZ_MEM32(g_esp + 4);
     uint32_t parent = junction ? GZ_MEM32(junction + 4) : 0;
     int is_main = str && !strcmp(gz_guest_cstr(GZ_MEM32(str + 0x1C)), "MainBox");
+    int is_sel = str && !strcmp(gz_guest_cstr(GZ_MEM32(str + 0x1C)), "Selector");
     sub_00097DE0_gen();
+    if (is_sel && parent) {
+        /* The Multi-Player menu's list: its Xbox Live entry ("online") is
+         * Rollback Netplay now (see sub_0009B0C0). */
+        uint32_t eax = g_eax, ecx = g_ecx, edx = g_edx;
+        uint32_t obj = gz_call_str(sub_0007B5A0, parent, "online");
+        if (obj) gz_call_str(sub_00078F20, obj, "ROLLBACK NETPLAY");
+        g_eax = eax; g_ecx = ecx; g_edx = edx;
+    }
     if (is_main && parent) {
         uint32_t eax = g_eax, ecx = g_ecx, edx = g_edx;
         int i;
@@ -1288,11 +1320,35 @@ void sub_0009B0C0(void)
     uint32_t junction = g_ecx;
     uint32_t obj = junction ? GZ_MEM32(junction + 4) : 0;
     uint32_t name = obj ? GZ_MEM32(obj + 0x3C) : 0;
-    int i, which = -1;
+    int i, which = -1, rollback = 0;
     if (name)
         for (i = 0; i < GZ_OPT_N; i++)
             if (!strcmp(gz_guest_cstr(name), gz_opt_names[i])) which = i;
-    sub_0009B0C0_gen();
+    if (name && !strcmp(gz_guest_cstr(name), "online")) {
+        /* Rollback Netplay in place of Xbox Live: the Multi-Player script
+         * hears a name it does not know (so it never starts the Live
+         * sign-in), and A on it opens the netplay prompt instead. */
+        volatile char *s = (volatile char *)((uintptr_t)name + g_xbox_mem_offset);
+        s[0] = 'g'; s[1] = 'z'; s[2] = 'r'; s[3] = 'b';
+        sub_0009B0C0_gen();
+        s[0] = 'o'; s[1] = 'n'; s[2] = 'l'; s[3] = 'i';
+        rollback = 1;
+    } else
+        sub_0009B0C0_gen();
+    if (rollback) {
+        DWORD now = GetTickCount();
+        if (getenv("GZ_OPT_LOG"))
+            fprintf(stderr, "[OPTIONS] getName online (armed %d, A %d)\n", gz_opt_armed, gz_opt_a_held());
+        if (gz_opt_armed && gz_opt_a_held() && now - gz_opt_last > 150u) {
+            extern void gz_rbn_menu_pick(void);
+            uint32_t eax = g_eax, ecx = g_ecx, edx = g_edx;
+            gz_opt_last = now;
+            gz_opt_armed = 0;
+            gz_rbn_menu_pick();
+            g_eax = eax; g_ecx = ecx; g_edx = edx;
+        }
+        return;
+    }
     if (which >= 0) {
         DWORD now = GetTickCount();
         if (getenv("GZ_OPT_LOG")) fprintf(stderr, "[OPTIONS] getName %s\n", gz_opt_names[which]);
@@ -1909,7 +1965,10 @@ void sub_00012240(void)
                 QueryPerformanceCounter(&q);
                 start = now = (double)q.QuadPart / (double)qf.QuadPart;
                 target = last + (double)period;
-                if (now >= target || target - now > 2.0 * (double)period) {
+                if (gz_rb_replaying()) {
+                    /* a rollback's replay (gz_rollback.c): no wait */
+                    last = now;
+                } else if (now >= target || target - now > 2.0 * (double)period) {
                     /* late, or no schedule yet: no wait */
                     last = (now - target < (double)period) ? target : now;
                     if (target - now > 2.0 * (double)period) last = now;
@@ -1981,7 +2040,7 @@ void sub_00012240(void)
                     /* A 60 fps network match: fixed values, never measured ones.
                      * The match ticks by twice the base period, and both machines
                      * must tick by exactly the same amount every frame. */
-                    if ((gz_net60() && gz_net_active()) || gz_rb_active()) step = (double)period;
+                    if ((gz_net60() && gz_net_active()) || gz_rb_deterministic()) step = (double)period;
                     f = (float)step;
                     memcpy(&fb, &f, 4);
                     GZ_MEM32(0x00400F2Cu) = fb;

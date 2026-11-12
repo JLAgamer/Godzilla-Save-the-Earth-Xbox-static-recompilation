@@ -80,7 +80,8 @@ set(GAME_SOURCES
     src/gz_launch.c          # --game / --prepare / --log for launchers (recomplauncher.json)
     src/gz_controls.c        # controller remapping and deadzones (gz_controls.ini)
     src/gz_ach.c             # Recomp Achievements events (match results)
-    src/gz_rollback.c        # rollback groundwork: snapshot / restore sync test (GZ_RB_TEST)
+    src/gz_rollback.c        # rollback: state history, lockstep workers, sync tests (GZ_RB_TEST / GZ_RB_SCRIPT)
+    src/gz_rbnet.c           # rollback netplay for two players (GZ_RB_NET=1)
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c

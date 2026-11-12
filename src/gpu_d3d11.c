@@ -2564,7 +2564,14 @@ static void be_flip(void)
         {
             static int hlog = -1;
             LONGLONG p0 = stat_qpc_us(), p1;
-            IDXGISwapChain_Present(s_swap, (UINT)s_vsync, (!s_vsync && s_tearing) ? GZ_PRESENT_ALLOW_TEARING : 0);
+            /* A rollback's replayed frames are not shown (gz_rollback.c
+             * counts them; the flip comes a frame or two after the tick). */
+            extern volatile LONG gz_rb_skip_presents;
+            LONG skip = InterlockedCompareExchange(&gz_rb_skip_presents, 0, 0);
+            if (skip > 0 && InterlockedCompareExchange(&gz_rb_skip_presents, skip - 1, skip) == skip)
+                ;
+            else
+                IDXGISwapChain_Present(s_swap, (UINT)s_vsync, (!s_vsync && s_tearing) ? GZ_PRESENT_ALLOW_TEARING : 0);
             p1 = stat_qpc_us();
             s_h_present = p1 - p0;
             if (hlog < 0) hlog = getenv("GZ_PACE_LOG") != NULL;

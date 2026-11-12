@@ -138,10 +138,11 @@ static uint32_t   s_unlogged[4096], s_nunlogged;
 static int        s_lost;
 static SRWLOCK    s_lock = SRWLOCK_INIT;
 static volatile LONG s_tracking;
-static uint64_t   s_vbase;
+static uint64_t   s_vbase, s_vbase_load;
 static uint32_t   s_vtick;
 static uint64_t   s_stat_faults, s_stat_pages_max;
 static int        s_ver_want;                   /* GZ_RB_VERIFY: copy at this boundary */
+static uint32_t   s_replay_until;               /* netplay: replaying ticks up to this one */
 static void verify_take(void);
 static void verify_check(void);
 
@@ -365,6 +366,20 @@ static void track_window(int w, uint32_t first, uint32_t pages)
     }
 }
 
+/* The worker threads' stacks and TIBs go back in time with everything else
+ * (GZ_RB_WORKER_STACKS=0: they keep their present, as before). With lockstep
+ * they are parked at the same sleep or wait at every boundary, the same call
+ * chain each time, so their stacks are as much a part of the tick's state as
+ * the heap. Left out, a replay's worker turns did not repeat the first run's:
+ * two netplay copies with rollbacks drifted 56 pages further apart than two
+ * without (the game's small-allocation pool), and with them in, 12. */
+static int rb_worker_stacks_tracked(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("GZ_RB_WORKER_STACKS"); on = !(e && *e == '0'); }
+    return on;
+}
+
 /* Pages of the low window that hold threads' present rather than game state:
  * the worker threads' stacks and the interrupt / DPC handlers' stacks. Marked
  * before anything is protected. Excluding them afterwards raced the threads:
@@ -376,6 +391,7 @@ static int exclude_thread_stacks(void)
     uint32_t bases[32], ssize = 0;
     int k, ns = xbox_ThreadStacks(bases, 32, &ssize);
     memset(s_excl, 0, sizeof s_excl);
+    if (rb_worker_stacks_tracked()) ns = 0;     /* experiment: they go back too */
     for (k = 0; k < ns; k++) {
         uint32_t p0 = bases[k] / RB_PAGE, p1 = (bases[k] + ssize + RB_PAGE - 1) / RB_PAGE;
         if (p1 > RB_WPAGES) continue;
@@ -491,7 +507,9 @@ static int history_start(void)
     s_open = 0;
     s_lost = 0;
     s_nunlogged = 0;
-    s_vbase = xbox_ReadTimeStampCounter();
+    /* the clock at tick 0: this machine's, or the one whose memory it took
+     * (the game keeps time stamps from before tick 0) */
+    s_vbase = s_vbase_load ? s_vbase_load : xbox_ReadTimeStampCounter();
     s_vtick = 0;
     frame_begin(0);
     InterlockedExchange(&s_tracking, 1);        /* before protecting: a write now must reach rb_veh */
@@ -604,7 +622,7 @@ static int rollback(uint32_t n)
     xbox_ApuLock();
     AcquireSRWLockExclusive(&s_lock);
     apu_capture(&s_frames[s_cur % RB_FRAMES]);  /* the sound chip's changes in this tick so far */
-    ntib = keep_tibs_save();
+    ntib = rb_worker_stacks_tracked() ? 0 : keep_tibs_save();
     /* Oldest tick first: a page's contents at the target boundary are in the
      * first record from there on that holds it (each record has a page once),
      * so every page is written back once. */
@@ -670,6 +688,41 @@ static int rollback(uint32_t n)
     return 1;
 }
 
+/* Guest pages that are this machine's own and never go to or come from
+ * another: Direct3D's push buffer ring and frame bookkeeping (its pointers
+ * follow this machine's GPU), besides the threads' stacks (s_excl). */
+static int rb_local_page(uint32_t i)
+{
+    uint32_t va = i * RB_PAGE;
+    return i >= RB_WPAGES || (va >= 0x0022E000u && va < 0x00232000u);
+}
+
+/* Tick 0 from another run's low window (GZ_RB_LOAD), before history starts:
+ * every page but this machine's own. */
+static void rb_load_dump(const char *path)
+{
+    FILE *h = fopen(path, "rb");
+    uint8_t *base = (uint8_t *)((uintptr_t)0 + g_xbox_mem_offset);
+    static uint8_t buf[RB_PAGE];
+    uint32_t i, n = 0;
+    if (!h) { fprintf(stderr, "[RB] %s: cannot open\n", path); return; }
+    xbox_LockstepSet(1);                        /* the workers parked first */
+    xbox_LockstepQuiesce(2000);
+    exclude_thread_stacks();
+    for (i = 0; i < RB_WPAGES && fread(buf, 1, RB_PAGE, h) == RB_PAGE; i++) {
+        MEMORY_BASIC_INFORMATION mbi;
+        uint8_t *p = base + (size_t)i * RB_PAGE;
+        if (s_excl[i] || rb_local_page(i) || !memcmp(p, buf, RB_PAGE)) continue;
+        if (!VirtualQuery(p, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT
+            || !(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY))) continue;
+        memcpy(p, buf, RB_PAGE);
+        n++;
+    }
+    if (fread(&s_vbase_load, 1, 8, h) != 8) s_vbase_load = 0;
+    fclose(h);
+    fprintf(stderr, "[RB] tick 0 from %s: %u pages taken\n", path, n);
+}
+
 /* ── exactness check (GZ_RB_VERIFY=1, with GZ_RB_SCRIPT_RB) ────────────
  *
  * At the boundary a scripted rollback will go back to, a full copy of every
@@ -731,6 +784,61 @@ static void verify_check(void)
     s_ver_tick = 0xFFFFFFFFu;
 }
 
+/* ── memory dumps (comparing two runs) ─────────────────────────────────── */
+
+/* The low 64 MB window to <GZ_SHOT_FILE><suffix>.bin: the pages history
+ * tracks (or, before history, every committed writable page), zeros for the
+ * rest, then the clock at tick 0. */
+static void rb_dump_file(const char *suffix)
+{
+    const char *f = getenv("GZ_SHOT_FILE");
+    char path[600];
+    FILE *h;
+    snprintf(path, sizeof path, "%s%s.bin", f && *f ? f : "rb", suffix);
+    if ((h = fopen(path, "wb")) != NULL) {
+        static const uint8_t zero[RB_PAGE];
+        uint32_t i;
+        for (i = 0; i < RB_WPAGES; i++) {
+            const uint8_t *p = NULL;
+            if (s_tracking) { if (s_tracked[i] || s_excl[i]) p = page_ptr(i); }
+            else {
+                MEMORY_BASIC_INFORMATION mbi;
+                uint8_t *q = (uint8_t *)((uintptr_t)0 + g_xbox_mem_offset) + (size_t)i * RB_PAGE;
+                if (VirtualQuery(q, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT
+                    && (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)) && !(mbi.Protect & PAGE_GUARD)) p = q;
+            }
+            fwrite(p ? p : zero, 1, RB_PAGE, h);
+        }
+        fwrite(&s_vbase, 1, 8, h);
+        fclose(h);
+        fprintf(stderr, "[RB] tick %u: memory written to %s\n", s_vtick, path);
+    }
+}
+
+/* GZ_RB_DUMP_AT="0 300": the window at those ticks (<GZ_SHOT_FILE>_m<tick>).
+ * Written again each time the tick is played (a netplay rollback across it
+ * replays it), so the file ends as the confirmed one. */
+static void rb_dump_at_ticks(void)
+{
+    static uint32_t at[8], nat;
+    static int init;
+    uint32_t k;
+    if (!init) {
+        const char *e = getenv("GZ_RB_DUMP_AT");
+        init = 1;
+        while (e && *e && nat < 8) {
+            at[nat++] = (uint32_t)strtoul(e, (char **)&e, 10);
+            while (*e == ' ' || *e == ',') e++;
+        }
+    }
+    for (k = 0; k < nat; k++)
+        if (s_vtick == at[k]) {
+            char sfx[32];
+            snprintf(sfx, sizeof sfx, "_m%u", s_vtick);
+            rb_dump_file(sfx);
+        }
+}
+
 /* ── scripted match (GZ_RB_SCRIPT=1) ────────────────────────────────────
  *
  * The two-machine question, asked on one PC: do two copies of the game, given
@@ -761,14 +869,27 @@ static uint32_t mix(uint32_t x)
 
 /* The pad for a port this tick, or 0 to leave what the port read (called from
  * the game's pad poll, see "Pad input override" in recomp_manual.c). */
+int gz_rbn_on(void);                            /* gz_rbnet.c */
+int gz_rbn_pad(int port, uint32_t tick, uint8_t *pad18);
+
+int gz_rb_script_pad(int port, uint32_t tick, uint8_t *pad18);
+
 int gz_rb_pad(int port, uint8_t *pad18)
+{
+    if (!s_tracking || port > 1) return 0;
+    if (gz_rbn_on()) return gz_rbn_pad(port, s_cur, pad18);
+    if (s_script <= 0) return 0;
+    return gz_rb_script_pad(port, s_vtick, pad18);
+}
+
+/* The scripted pad of a port at a tick. */
+int gz_rb_script_pad(int port, uint32_t tick, uint8_t *pad18)
 {
     uint32_t r;
     int16_t x, y;
-    if (s_script <= 0 || !s_tracking || port > 1) return 0;
     /* a new decision every 12 ticks: walk somewhere, press one or two of the
      * attack buttons (never Start or Back) */
-    r = mix((s_vtick / 12u) * 2u + (uint32_t)port + 0x9E3779B9u);
+    r = mix((tick / 12u) * 2u + (uint32_t)port + 0x9E3779B9u);
     memset(pad18, 0, 18);
     x = (r & 3u) == 0 ? 0 : (int16_t)((int)((r >> 2) & 0xFFFFu) - 32768);
     y = (r & 3u) == 0 ? 0 : (int16_t)((int)((r >> 14) & 0xFFFFu) - 32768);
@@ -793,6 +914,13 @@ static void script_tick(void)
             while (*e == ' ' || *e == ',') e++;
         }
         s_script_rb = r ? atoi(r) : 0;
+        {
+            /* GZ_RB_LOAD=<dump>: start tick 0 from another run's memory (a
+             * GZ_RB_DUMP_AT=0 dump), the state transfer netplay does from the
+             * host, tested on one PC. */
+            const char *ld = getenv("GZ_RB_LOAD");
+            if (ld && *ld) rb_load_dump(ld);
+        }
         if (!history_start()) { s_script = 0; return; }
         fprintf(stderr, "[RB] scripted match: tick 0%s\n", s_script_rb ? ", with rollbacks" : "");
     } else {
@@ -802,6 +930,7 @@ static void script_tick(void)
         s_ver_want = verify && s_script_rb > 0 && (s_vtick + 1u + (uint32_t)s_script_rb) % 30u == 0;
         boundary();
     }
+    rb_dump_at_ticks();
     if (s_vtick % 600u == 0 && s_vtick != s_last_beat) {
         static double tb;
         double now = now_s();
@@ -836,7 +965,164 @@ static int    s_state = -1, s_count, s_round, s_armed;
 static int    s_ticks = 10, s_rounds = 3;
 static double s_at;
 
-void gz_rb_arm(void) { s_armed = 1; }       /* the quick fight launched */
+/* The quick fight launched. In a netplay match the level must load the same
+ * on both PCs: the workers that read and copy its files run in lockstep, and
+ * the clock is the virtual one, from here on. Loading on the host's schedule
+ * put the level's 20 MB of data at different heap addresses on the two
+ * machines, which no page transfer at tick 0 can reconcile. */
+void gz_rb_arm(void)
+{
+    s_armed = 1;
+    if (gz_rbn_on()) {
+        xbox_LockstepSet(1);
+        xbox_LockstepQuiesce(2000);
+        xbox_VirtualTscSet(xbox_ReadTimeStampCounter());
+        fprintf(stderr, "[RBN] quick fight launched: workers in lockstep, virtual clock\n");
+    }
+}
+
+/* 1 from the quick fight's launch when the match must play the same on every
+ * run (scripted match, netplay): the game steps by the fixed period from
+ * there, not only from tick 0. Frames measured on the host before tick 0 put
+ * the fighters' intro a few frames apart from one run to the next. */
+int gz_rb_deterministic(void)
+{
+    if (s_tracking) return 1;
+    if (gz_rbn_on()) return 1;                  /* netplay: from boot */
+    if (!s_armed) return 0;
+    if (s_script < 0) { const char *e = getenv("GZ_RB_SCRIPT"); s_script = e && *e == '1'; }
+    return s_script > 0;
+}
+
+/* ── rollback netplay (gz_rbnet.c) ──────────────────────────────────────
+ *
+ * The netplay module asks for rollbacks; this side carries them out. A
+ * rollback to tick t from tick c makes the game play t..c-1 again: those
+ * ticks are a replay, run without the frame limiter's wait and with their
+ * frames not shown (gz_rb_skip_presents, read where the GPU presents). */
+uint32_t gz_rbn_tick(uint32_t cur);
+int      gz_rbn_tick0_sync(void);
+void     gz_rbn_off(void);
+volatile LONG gz_rb_skip_presents;
+
+int gz_rb_replaying(void) { return s_replay_until && s_cur < s_replay_until; }
+uint32_t gz_rb_cur_tick(void) { return s_cur; }
+int gz_rb_page_count(void) { return (int)RB_WPAGES; }
+void gz_rb_set_vbase(uint64_t v) { s_vbase_load = v; }
+
+/* The host's clock at tick 0, fixed now so what it sends is what it uses. */
+uint64_t gz_rb_tick0_clock(void)
+{
+    s_vbase_load = xbox_ReadTimeStampCounter();
+    return s_vbase_load;
+}
+
+/* Workers parked and their stacks known, before pages change hands. */
+void gz_rb_park_workers(void)
+{
+    xbox_LockstepSet(1);
+    xbox_LockstepQuiesce(2000);
+    exclude_thread_stacks();
+}
+
+/* A low-memory page both machines hold the same of (not a stack, not this
+ * machine's own Direct3D bookkeeping), committed and writable; NULL if not.
+ * Before history starts, so nothing is protected. */
+uint8_t *gz_rb_page_for_write(int i)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    uint8_t *p = (uint8_t *)((uintptr_t)0 + g_xbox_mem_offset) + (size_t)i * RB_PAGE;
+    if (i < 0 || (uint32_t)i >= RB_WPAGES || s_excl[i] || rb_local_page((uint32_t)i)) return NULL;
+    if (!VirtualQuery(p, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT
+        || !(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)) || (mbi.Protect & PAGE_GUARD)) return NULL;
+    return p;
+}
+
+const uint8_t *gz_rb_shareable_page(int i) { return gz_rb_page_for_write(i); }
+
+/* A frame of a netplay run before its match's tick 0: deterministic from
+ * boot (main.c), so the workers get their turns every frame and the clock is
+ * a function of the frame. */
+static void net_pre_match_frame(void)
+{
+    static uint64_t base;
+    static uint32_t frames;
+    if (!base) base = xbox_ReadTimeStampCounter();
+    rb_pump();
+    frames++;
+    xbox_VirtualTscSet(base + (uint64_t)frames * (RB_TSC_HZ / 60ull));
+}
+
+/* The boundary that opens a tick, in a netplay match. */
+static void net_tick(void)
+{
+    if (!s_tracking) {
+        if (!s_marker) { net_pre_match_frame(); return; }
+        {
+            /* GZ_RB_DUMP_AT with 0: this side's memory before the transfer too */
+            const char *d = getenv("GZ_RB_DUMP_AT");
+            if (d && (d[0] == '0' || strstr(d, " 0"))) { gz_rb_park_workers(); rb_dump_file("_pre0"); }
+        }
+        /* tick 0: the host's memory for both, then history */
+        {
+            int r = gz_rbn_tick0_sync();
+            if (r < 0) {                        /* refused: a local match */
+                gz_rbn_off();
+                xbox_LockstepSet(0);
+                return;
+            }
+            if (!r) fprintf(stderr, "[RBN] tick 0 could not be agreed: the two sides will not play the same match\n");
+        }
+        if (!history_start()) return;
+        fprintf(stderr, "[RBN] match on: tick 0\n");
+    } else
+        boundary();
+    if (gz_rb_replaying()) {
+        /* a replayed tick: nothing to send or read */
+    } else {
+        uint32_t back;
+        s_replay_until = 0;
+        back = gz_rbn_tick(s_cur);
+        if (back) {
+            uint32_t until = s_cur;
+            if (rollback(back)) {
+                s_replay_until = until;
+                InterlockedExchangeAdd(&gz_rb_skip_presents, (LONG)back);
+            } else
+                fprintf(stderr, "[RBN] tick %u: cannot go back %u ticks (history too short)\n", until, back);
+        }
+    }
+    rb_dump_at_ticks();
+    if (!gz_rb_replaying()) {
+        /* GZ_RB_SHOT_AT: pictures, as in the scripted match (the first time
+         * the tick is shown; a picture is ready RB_SHOT_TICKS later) */
+        static uint32_t at[8], nat, asked[8];
+        static int init;
+        uint32_t k;
+        if (!init) {
+            const char *e = getenv("GZ_RB_SHOT_AT");
+            init = 1;
+            while (e && *e && nat < 8) {
+                at[nat++] = (uint32_t)strtoul(e, (char **)&e, 10);
+                while (*e == ' ' || *e == ',') e++;
+            }
+        }
+        for (k = 0; k < nat; k++) {
+            if (s_vtick == at[k] && !asked[k]) { shot_request(); asked[k] = 1; }
+            if (s_vtick == at[k] + RB_SHOT_TICKS && asked[k] == 1) {
+                const char *f = getenv("GZ_SHOT_FILE");
+                char a[600], b[600];
+                asked[k] = 2;
+                if (f && *f) {
+                    snprintf(a, sizeof a, "%s.bmp", f);
+                    snprintf(b, sizeof b, "%s_t%u.bmp", f, at[k]);
+                    MoveFileExA(a, b, MOVEFILE_REPLACE_EXISTING);
+                }
+            }
+        }
+    }
+    xbox_VirtualTscSet(s_vbase + (uint64_t)s_vtick * (RB_TSC_HZ / 60ull));
+}
 
 static void shot_request(void)
 {
@@ -860,6 +1146,11 @@ void gz_rb_tick(void)
 {
     static double t0, tick_s;
     static unsigned tick_n;
+    if (gz_rbn_on()) {
+        if (s_armed) net_tick();
+        else net_pre_match_frame();
+        return;
+    }
     if (s_script < 0) { const char *e = getenv("GZ_RB_SCRIPT"); s_script = e && *e == '1'; }
     if (s_script > 0) { if (s_armed) script_tick(); return; }
     if (s_state == 9) return;

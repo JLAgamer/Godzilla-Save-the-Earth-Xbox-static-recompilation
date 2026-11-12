@@ -109,6 +109,25 @@ while another program's window is in front (`RECOMP_PAD_BACKGROUND=1` reads them
   Network matches run at 60 fps (`online_60fps=1`); `online_60fps=0` gives the console's 30, which holds
   full speed better over the internet with a high ping. Both players need the same frame rate settings.
 
+- **Rollback netplay (experimental, not in releases yet):** a Versus match between two PCs where your own
+  moves never wait for the network. In **Multi-Player**, Xbox Live is replaced by **Rollback Netplay**: one
+  player picks *Host a match*, the other types the host's IP and picks *Join*. Both games restart into the
+  match, set up from the host's last Versus match (its monsters, city and rules); play one Versus match from
+  the menus first on the hosting PC. The same can be started without the menus, on both PCs (the host's
+  monsters, city and seed are used on both):
+
+  | | Player 1 (host) | Player 2 |
+  |---|---|---|
+  | `GZ_RB_NET` | `1` | `1` |
+  | `GZ_RB_SIDE` | `1` | `2` |
+  | `GZ_RB_PEER` | | `<host's IP>:7790` |
+  | `GZ_QUICK_FIGHT`, `RECOMP_USB_PADS` | `1`, `2` | `1`, `2` |
+
+  The host needs TCP and UDP port 7790 reachable (`GZ_RB_PORT` changes it). `GZ_RB_DELAY` (default 2) is
+  the input delay in frames; more delay means fewer corrections on a slow connection. Each PC plays with its
+  first controller. `.\rb_net_test.ps1` plays a scripted match between two copies on one PC and compares
+  them; `.\rb_test.ps1` tests rollbacks in a single copy.
+
 Logs go to `play.log` next to the launcher; include it when reporting a problem.
 
 **Saves** are in `%LOCALAPPDATA%\GodzillaSTE`. Earlier versions used the toolkit's shared
@@ -141,6 +160,9 @@ next to the program, it keeps saves in the program's `saves\` folder too. `.\pac
   from the game's disk cache (`%LOCALAPPDATA%\GodzillaSTE\Cache`). The game rebuilds the cache itself.
 - Online play has been tested between two copies on one PC (including simulated lag and loss), not yet
   between two PCs over the internet.
+- Rollback netplay: tested between two copies on one PC (scripted input, 40 ms each way); some particle
+  effects can show as solid boxes after a rollback, rolled-back moments are heard twice, and there is no
+  in-game menu for it yet.
 
 ## How it works
 

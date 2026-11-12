@@ -2848,19 +2848,96 @@ index 9476517..0faa251 100644
              BRIDGE_MEM32(old_ptr) = (uint32_t)old;
          g_eax = 0;  /* STATUS_SUCCESS */
 diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
-index 45d548c..d75d5ae 100644
+index 45d548c..0beb45c 100644
 --- a/src/kernel/kernel_hal.c
 +++ b/src/kernel/kernel_hal.c
-@@ -1774,12 +1774,33 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
+@@ -1048,6 +1048,11 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
+ 
+ volatile ULONG xbox_KeTickCount = 0;
+ 
++int xbox_VirtualTimeHere(void);             /* the virtual clock, below */
++uint64_t xbox_VirtualSystemTime(void);
++static uint64_t vtsc_read(void);
++static uint64_t vtsc_in(uint64_t tsc, uint64_t hz);
++
+ /* Call this periodically or on-demand to update KeTickCount */
+ static void xbox_update_tick_count(void)
+ {
+@@ -1064,6 +1069,12 @@ static void xbox_update_tick_count(void)
+ LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
+ {
+     LARGE_INTEGER counter;
++    if (xbox_VirtualTimeHere()) {           /* the virtual clock (see there) */
++        LARGE_INTEGER f;
++        QueryPerformanceFrequency(&f);
++        counter.QuadPart = (LONGLONG)vtsc_in(vtsc_read(), (uint64_t)f.QuadPart);
++        return counter;
++    }
+     QueryPerformanceCounter(&counter);
+     return counter;
+ }
+@@ -1125,6 +1136,10 @@ VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
+ 
+     if (!CurrentTime)
+         return;
++    if (xbox_VirtualTimeHere()) {           /* the virtual clock (see there) */
++        CurrentTime->QuadPart = (LONGLONG)xbox_VirtualSystemTime();
++        return;
++    }
+ 
+     InitOnceExecuteOnce(&s_time_once, anchor_system_time, NULL, NULL);
+     QueryPerformanceCounter(&now);
+@@ -1774,12 +1789,74 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
   * ========================================================================= */
  #define XBOX_TSC_HZ 733333333ull
  
 +/* A virtual clock for one thread (a game's rollback / netplay code): while
 + * set, that thread's reads return the given value, a microsecond further on
 + * each read, instead of real time - so the same code run twice sees the same
-+ * clock. Other threads keep real time. */
++ * clock. With lockstep workers on (kernel_bridge.c), the workers share it:
++ * they run only in turns the main thread grants, so one counter stays
++ * deterministic. Every clock a guest thread can read follows it then: the
++ * time stamp counter, the performance counter, the system and interrupt
++ * times. Device-model and timer threads keep real time. */
 +static volatile LONG g_vtsc_thread;         /* thread id, 0 = off */
 +static uint64_t g_vtsc;
++int xbox_LockstepGuestThread(void);         /* kernel_bridge.c */
++
++/* This thread reads the virtual clock. */
++int xbox_VirtualTimeHere(void)
++{
++    if (!g_vtsc_thread)
++        return 0;
++    return (DWORD)g_vtsc_thread == GetCurrentThreadId() || xbox_LockstepGuestThread();
++}
++
++/* The virtual clock, a microsecond further on (a reader that waits for time
++ * to pass by polling still sees it pass). */
++static uint64_t vtsc_read(void)
++{
++    return g_vtsc += 733333333ull / 1000000ull;
++}
++
++/* The virtual clock in other units: ticks of `hz`, whole seconds and the
++ * remainder scaled apart so nothing overflows. */
++static uint64_t vtsc_in(uint64_t tsc, uint64_t hz)
++{
++    return (tsc / 733333333ull) * hz + (tsc % 733333333ull) * hz / 733333333ull;
++}
++
++/* 100 ns units since boot (KeInterruptTime), on the virtual clock. */
++uint64_t xbox_VirtualTime100ns(void)
++{
++    return vtsc_in(vtsc_read(), 10000000ull);
++}
++
++/* The system time on the virtual clock: a fixed date (2004-01-01) plus the
++ * clock, so two machines read the same. */
++#define VTIME_BASE_100NS 127174464000000000ull
++uint64_t xbox_VirtualSystemTime(void)
++{
++    return VTIME_BASE_100NS + vtsc_in(vtsc_read(), 10000000ull);
++}
 +
 +void xbox_VirtualTscSet(uint64_t value)
 +{
@@ -2879,13 +2956,13 @@ index 45d548c..d75d5ae 100644
      static LARGE_INTEGER origin;
      LARGE_INTEGER now;
  
-+    if (g_vtsc_thread && (DWORD)g_vtsc_thread == GetCurrentThreadId())
-+        return g_vtsc += XBOX_TSC_HZ / 1000000ull;
++    if (xbox_VirtualTimeHere())
++        return vtsc_read();
 +
      if (freq.QuadPart == 0) {
          QueryPerformanceFrequency(&freq);
          QueryPerformanceCounter(&origin);
-@@ -1934,3 +1955,11 @@ void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
+@@ -1934,3 +2011,11 @@ void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
          break;
      }
  }
@@ -2936,10 +3013,10 @@ index 5462e9a..27ff6ab 100644
          enable  = hc->reg[HcInterruptEnable / 4];
  
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 9476517..52c9bb8 100644
+index 9476517..d2b6ba7 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
-@@ -690,6 +690,316 @@ static uint32_t thobj_current(void)
+@@ -690,6 +690,323 @@ static uint32_t thobj_current(void)
      return g_thread_obj_va;
  }
  
@@ -3054,6 +3131,13 @@ index 9476517..52c9bb8 100644
 +}
 +
 +int xbox_LockstepOn(void) { return s_ls_on != 0; }
++
++/* The calling thread is a guest thread lockstep schedules: the main thread or
++ * a registered worker, while lockstep is on (kernel_hal.c's virtual clock). */
++int xbox_LockstepGuestThread(void)
++{
++    return s_ls_on && (g_ls_slot >= 0 || g_is_main_guest);
++}
 +
 +/* What the main thread and the workers are doing (a watchdog's report). */
 +void xbox_LockstepDump(void)
@@ -3256,11 +3340,15 @@ index 9476517..52c9bb8 100644
  static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
                                       uint32_t ctx2)
  {
-@@ -750,9 +1060,11 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
+@@ -750,9 +1067,15 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
       * neither. */
      xbox_DpcMarkGuestThread();
      xbox_GuestThreadPin("guest-worker");
 +    ls_register();
++    /* With lockstep on, a new worker waits for its first turn before it runs
++     * any guest code, rather than running beside the thread that made it. */
++    if (s_ls_on)
++        ls_park(0);
      guest_cpu_join();
      bridge_run_thread_inline(fn, ctx1, ctx2);
      guest_cpu_part();
@@ -3268,7 +3356,7 @@ index 9476517..52c9bb8 100644
  
      fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
      fflush(stderr);
-@@ -885,6 +1197,7 @@ static void bridge_PsCreateSystemThreadEx(void)
+@@ -885,6 +1208,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                  }
                  xbox_DpcMarkGuestThread();
                  xbox_GuestThreadPin("guest-main");
@@ -3276,7 +3364,7 @@ index 9476517..52c9bb8 100644
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-@@ -2034,6 +2347,47 @@ static void bridge_KeSetEvent(void)
+@@ -2034,6 +2358,47 @@ static void bridge_KeSetEvent(void)
          g_eax = 0;
  }
  
@@ -3324,7 +3412,7 @@ index 9476517..52c9bb8 100644
  /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
  static void bridge_KeWaitForSingleObject(void)
  {
-@@ -2050,9 +2404,14 @@ static void bridge_KeWaitForSingleObject(void)
+@@ -2050,9 +2415,14 @@ static void bridge_KeWaitForSingleObject(void)
          int type;
          HANDLE ge = ke_guest_event_prepare(object, &type);
          if (ge) {
@@ -3342,7 +3430,7 @@ index 9476517..52c9bb8 100644
              if (g_eax == 0 && type == 1)               /* synchronization: consumed */
                  BRIDGE_MEM32(object + 4) = 0;
              return;
-@@ -2065,6 +2424,14 @@ static void bridge_KeWaitForSingleObject(void)
+@@ -2065,6 +2435,14 @@ static void bridge_KeWaitForSingleObject(void)
      if (!h)
          h = XBOX_TO_NATIVE(object);
  
@@ -3357,7 +3445,7 @@ index 9476517..52c9bb8 100644
      g_eax = (uint32_t)xbox_KeWaitForSingleObject(
          h, wait_reason, wait_mode,
          (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
-@@ -2085,6 +2452,14 @@ static void bridge_NtWaitForSingleObject(void)
+@@ -2085,6 +2463,14 @@ static void bridge_NtWaitForSingleObject(void)
  
      if (bridge_run_io_apcs(alertable, 1))
          return;
@@ -3372,7 +3460,7 @@ index 9476517..52c9bb8 100644
      g_eax = (uint32_t)xbox_NtWaitForSingleObject(
          handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
  }
-@@ -2149,6 +2524,14 @@ static void bridge_NtWaitForSingleObjectEx(void)
+@@ -2149,6 +2535,14 @@ static void bridge_NtWaitForSingleObjectEx(void)
  
      if (bridge_run_io_apcs(alertable, wait_mode))
          return;
@@ -3387,7 +3475,7 @@ index 9476517..52c9bb8 100644
      g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
          handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
          XBOX_TO_NATIVE(timeout_ptr));
-@@ -2222,6 +2605,14 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
+@@ -2222,6 +2616,14 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
  
      if (bridge_run_io_apcs(alertable, wait_mode))
          return;
@@ -3402,7 +3490,7 @@ index 9476517..52c9bb8 100644
      g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
          count, handles, wait_type, (BOOLEAN)alertable,
          XBOX_TO_NATIVE(timeout_ptr));
-@@ -2332,6 +2723,14 @@ static void bridge_KeDelayExecutionThread(void)
+@@ -2332,6 +2734,14 @@ static void bridge_KeDelayExecutionThread(void)
  
      if (bridge_run_io_apcs(alertable, wait_mode))
          return;
@@ -3417,7 +3505,7 @@ index 9476517..52c9bb8 100644
      g_eax = (uint32_t)xbox_KeDelayExecutionThread(
          (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
          XBOX_TO_NATIVE(interval_ptr));
-@@ -2480,6 +2879,7 @@ static void bridge_PsTerminateSystemThread(void)
+@@ -2480,6 +2890,7 @@ static void bridge_PsTerminateSystemThread(void)
          g_thread_stack_top = 0;
          thobj_exit(g_thread_obj_va, exit_status);
          g_thread_obj_va = 0;
@@ -3425,7 +3513,7 @@ index 9476517..52c9bb8 100644
          ExitThread(exit_status);
      }
  }
-@@ -5910,11 +6310,19 @@ static void bridge_KeWaitForMultipleObjects(void)
+@@ -5910,11 +6321,19 @@ static void bridge_KeWaitForMultipleObjects(void)
          }
      }
  
@@ -3450,7 +3538,37 @@ index 9476517..52c9bb8 100644
  
      /* Only a successful wait consumes synchronization events. WaitAny's
       * result selects one member; WaitAll consumes every signalled member. */
-@@ -9289,6 +9697,7 @@ static void bridge_PsCreateSystemThread(void)
+@@ -7755,11 +8174,16 @@ static void bridge_MmGlobalData(void)
+     g_eax = XBOX_KERNEL_DATA_BASE + KDATA_MMGLOBAL;
+ }
+ 
++int xbox_VirtualTimeHere(void);             /* kernel_hal.c: the virtual clock */
++uint64_t xbox_VirtualTime100ns(void);
++uint64_t xbox_VirtualSystemTime(void);
++
+ /* --- KeInterruptTime (ordinal 120, 0 args) --- */
+ static void bridge_KeInterruptTime(void)
+ {
+     /* Refresh the 100ns-since-boot counter before handing out the pointer. */
+-    ULONGLONG t = (ULONGLONG)GetTickCount64() * 10000ull;
++    ULONGLONG t = xbox_VirtualTimeHere() ? xbox_VirtualTime100ns()
++                                         : (ULONGLONG)GetTickCount64() * 10000ull;
+     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 0) = (uint32_t)t;
+     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 4) = (uint32_t)(t >> 32);
+     g_eax = XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME;
+@@ -7771,6 +8195,11 @@ static void bridge_KeSystemTime(void)
+     /* Refresh the 100ns-since-1601 clock before handing out the pointer. */
+     FILETIME ft;
+     GetSystemTimeAsFileTime(&ft);
++    if (xbox_VirtualTimeHere()) {
++        ULONGLONG v = xbox_VirtualSystemTime();
++        ft.dwLowDateTime = (DWORD)v;
++        ft.dwHighDateTime = (DWORD)(v >> 32);
++    }
+     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = ft.dwLowDateTime;
+     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = ft.dwHighDateTime;
+     g_eax = XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME;
+@@ -9289,6 +9718,7 @@ static void bridge_PsCreateSystemThread(void)
              if (is_first_call) {
                  xbox_DpcMarkGuestThread();
                  xbox_GuestThreadPin("guest-main");
@@ -3458,7 +3576,7 @@ index 9476517..52c9bb8 100644
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-@@ -10864,10 +11273,21 @@ void guest_cpu_part(void)
+@@ -10864,10 +11294,21 @@ void guest_cpu_part(void)
  static void kernel_thunk_dispatch(void)
  {
      int slot = g_kernel_dispatch_slot;

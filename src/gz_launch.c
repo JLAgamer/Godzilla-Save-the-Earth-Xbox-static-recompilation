@@ -813,6 +813,12 @@ int gz_launch_init(void)
         set_env_default("RECOMP_AUDIO_BUF_COUNT", "4");
         set_env_default("RECOMP_AUDIO_HOST", "1");
         set_env_default("GZ_BIOLLANTE_SLOT", "1");
+        {
+            /* rollback netplay (gz_rbnet.c): both players' ports have a pad,
+             * or the game never polls the remote player's */
+            const char *rn = getenv("GZ_RB_NET");
+            if (rn && *rn == '1') set_env_default("RECOMP_USB_PADS", "2");
+        }
         set_env_default("GZ_MOVIES", "0");
         swprintf_s(w, MAX_PATH, L"%s\\mods\\biollante_slot", s_exe_dir);
         to_utf8(w, ov, sizeof ov);

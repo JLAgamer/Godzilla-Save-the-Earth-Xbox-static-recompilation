@@ -45,3 +45,4 @@ __pycache__/
 /shader_cache/
 /dist/
 /rb_shots/
+/gz_netplay.txt

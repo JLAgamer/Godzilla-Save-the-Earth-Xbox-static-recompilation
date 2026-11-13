@@ -80,8 +80,12 @@ def write_bmp(path, px):
     hdr[0:2] = b'BM'
     struct.pack_into('<I', hdr, 2, 54 + len(px))
     struct.pack_into('<I', hdr, 10, 54)
-    struct.pack_into('<IiiHH', hdr, 14, 40, N, -N, 1, 32)      # negative height: top-down rows
-    open(path, 'wb').write(bytes(hdr) + bytes(px))
+    # Bottom-up rows (positive height), as the game's own texture dumps are:
+    # the recomp shows top-down BMPs upside down.
+    struct.pack_into('<IiiHH', hdr, 14, 40, N, N, 1, 32)
+    row = N * 4
+    rows = [bytes(px[r * row:(r + 1) * row]) for r in range(N)]
+    open(path, 'wb').write(bytes(hdr) + b''.join(reversed(rows)))
 
 
 out_dir = sys.argv[1]

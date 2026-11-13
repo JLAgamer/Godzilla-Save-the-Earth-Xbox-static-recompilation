@@ -1780,10 +1780,9 @@ void sub_00012240(void)
                 {
                     /* The game advances its world by the step at 0x00400F2C each
                      * frame (normally the period, or 2 periods when it falls
-                     * behind). A PC that can't hold the chosen rate would run
-                     * the game slow (240 set, ~140 reached: 75% speed), so
-                     * the step is the time this frame really took, from one
-                     * wake to the next, at least one period and at most 1/20 s. */
+                     * behind); see below for why it stays the period. The
+                     * frame's real time (step, from one wake to the next) is
+                     * only for the pacing log. */
                     static double prev_wake;
                     double step = prev_wake > 0.0 ? now - prev_wake : (double)period;
                     float f;
@@ -1818,8 +1817,19 @@ void sub_00012240(void)
                             }
                         }
                     }
-                    if (step < (double)period) step = (double)period;
-                    if (step > 0.05) step = 0.05;           /* a hitch: at most 1/20 s at once */
+                    /* The step stays one period. The fight clock is not a sum
+                     * of steps: sub_000C4150 sets it to (frames + c) x the
+                     * period at 0x00442634, every frame. A step of the
+                     * frame's real time (at least a period) used to be
+                     * written here, and every late frame then rescaled the
+                     * whole fight so far: on a PC holding ~105 of 120 fps
+                     * the timer ran 1.23x real time, 1.31x at 144, and
+                     * jumped about. With the period the game keeps real time
+                     * at a rate the PC holds (60: 1.0x); one it cannot hold
+                     * plays slower, as the console did when it dropped frames
+                     * (the same PC at ~105-115 fps: 0.98x at 120, 0.85x at
+                     * 144). */
+                    step = (double)period;
                     f = (float)step;
                     memcpy(&fb, &f, 4);
                     GZ_MEM32(0x00400F2Cu) = fb;

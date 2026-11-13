@@ -1070,6 +1070,12 @@ static void gz_quick_fight_tick(void)
  * (script methods get/set/clearShellCheats; GameInfo + 0x4C0 = 0x003F0E18),
  * which the menu scripts read to decide what is selectable. Tournament mode
  * keeps the unlock bits set every frame, whatever the save profile holds.
+ * Only the unlock bits: the script enum ShellCheats (ShellData/rules.bsf)
+ * puts the gallery, monster, Monster Island, Mothership and city unlocks at
+ * bits 0-12 and the "unlock monsters / all" groups at 25-27; bits 13-24 are
+ * real cheats (micro monsters, black and white, technicolor, a dozen
+ * continues in Adventure, version and sound-log debug). Setting all 32 turned
+ * those on too.
  * GZ_SHELL_CHEATS=<hex> overrides the mask (for finding out what a bit does). */
 #define GZ_SHELL_CHEATS_VA (0x003F0958u + 0x4C0u)
 int  gz_opt_tournament(void);       /* gz_settings.c */
@@ -1090,7 +1096,7 @@ static int gz_tournament_on(void)
 static void gz_tournament_tick(void)
 {
     static int init, held;
-    static uint32_t mask = 0xFFFFFFFFu, before;
+    static uint32_t mask = 0x00001FFFu | 0x0E000000u, before;
     if (!init) {
         const char *m = getenv("GZ_SHELL_CHEATS");
         init = 1;

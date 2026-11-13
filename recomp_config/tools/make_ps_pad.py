@@ -10,6 +10,10 @@ src/gpu_d3d11.c).
 
 Usage: make_ps_pad.py <out dir>
 
+The pictures shipped in textures_ps/ are now made from a controller photo by
+make_ps_pad_photo.py (recomp_config/art/ps_pad_photo.png); this script is the
+unbranded alternative.
+
   F1482F1F  256x224  controller picture on Options > Controls
   9B4581E7  72x72    small controller icon (Profiles, Controllers panel)
 """
@@ -128,8 +132,12 @@ def write_bmp(path, w, h, px):
     hdr[0:2] = b'BM'
     struct.pack_into('<I', hdr, 2, 54 + len(px))
     struct.pack_into('<I', hdr, 10, 54)
-    struct.pack_into('<IiiHH', hdr, 14, 40, w, -h, 1, 32)       # negative height: top-down rows
-    open(path, 'wb').write(bytes(hdr) + bytes(px))
+    # Bottom-up rows (positive height), as the game's own texture dumps are:
+    # the recomp shows top-down BMPs upside down.
+    struct.pack_into('<IiiHH', hdr, 14, 40, w, h, 1, 32)
+    row = w * 4
+    rows = [bytes(px[r * row:(r + 1) * row]) for r in range(h)]
+    open(path, 'wb').write(bytes(hdr) + b''.join(reversed(rows)))
 
 
 out_dir = sys.argv[1]

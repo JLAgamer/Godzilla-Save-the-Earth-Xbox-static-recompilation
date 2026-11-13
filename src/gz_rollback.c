@@ -94,6 +94,10 @@ typedef struct {
     RecompXmm xmm[8];
 } RbRegs;
 
+#define RB_FILES 48
+int  xbox_FilePositions(void **h, int64_t *pos, int max);   /* kernel_file.c */
+void xbox_FileSetPosition(void *h, int64_t pos);
+
 /* One tick's record, in the ring of slots (each RB_ENTRY bytes): the heap
  * tables at its boundary in s_heap_slots slots from `heap`, then its page
  * entries one per slot from `first`. Slot numbers only grow; slot n lives at
@@ -105,6 +109,11 @@ typedef struct {
     uint64_t heap;              /* slot of the heap tables at this boundary */
     uint64_t first;             /* slot of the first page entry */
     uint32_t npages;
+    /* the open files' positions at this boundary (xbox_FilePositions): a
+     * replayed read must read the same bytes as the first one */
+    uint32_t nfiles;
+    void    *fh[RB_FILES];
+    int64_t  fpos[RB_FILES];
 } RbFrame;
 
 /* The sound chip's host-side state (xbox_ApuStateSave) is kept in the same
@@ -304,6 +313,7 @@ static void frame_begin(uint32_t tick)
     f->tick = tick;
     f->vtick = s_vtick;
     regs_save(&f->regs);
+    f->nfiles = (uint32_t)xbox_FilePositions(f->fh, f->fpos, RB_FILES);
     xbox_HeapStateSave(s_heap_tmp);
     f->heap = s_next;
     for (j = 0; j < s_heap_slots; j++)
@@ -663,6 +673,9 @@ static int rollback(uint32_t n)
     verify_check();                         /* GZ_RB_VERIFY */
     {
         RbFrame *f = &s_frames[target % RB_FRAMES];
+        uint32_t k;
+        for (k = 0; k < f->nfiles; k++)         /* the files where they were */
+            xbox_FileSetPosition(f->fh[k], f->fpos[k]);
         regs_load(&f->regs);
         s_vtick = f->vtick;
         {
@@ -855,10 +868,13 @@ static void shot_request(void);
 static int      s_script = -1, s_script_rb, s_marker;
 static uint32_t s_shot_at[8], s_nshot, s_last_rb = 0xFFFFFFFFu, s_last_beat = 0xFFFFFFFFu, s_nrb;
 
+void gz_rbn_set_fight(int on);                  /* gz_rbnet.c */
+
 void gz_rb_fight_camera(void)
 {
     if (!s_marker && s_script > 0) fprintf(stderr, "[RB] match camera set up: tick 0 at the next boundary\n");
     s_marker = 1;
+    gz_rbn_set_fight(1);                        /* a session: guesses again from here */
 }
 
 static uint32_t mix(uint32_t x)
@@ -870,6 +886,7 @@ static uint32_t mix(uint32_t x)
 /* The pad for a port this tick, or 0 to leave what the port read (called from
  * the game's pad poll, see "Pad input override" in recomp_manual.c). */
 int gz_rbn_on(void);                            /* gz_rbnet.c */
+int gz_rbn_session(void);
 int gz_rbn_pad(int port, uint32_t tick, uint8_t *pad18);
 
 int gz_rb_script_pad(int port, uint32_t tick, uint8_t *pad18);
@@ -1147,6 +1164,9 @@ void gz_rb_tick(void)
     static double t0, tick_s;
     static unsigned tick_n;
     if (gz_rbn_on()) {
+        /* A session (the Multi-Player menu) is one rollback "match" from its
+         * first frame: menus and fights alike run on the shared inputs. */
+        if (gz_rbn_session()) { s_armed = 1; s_marker = 1; }
         if (s_armed) net_tick();
         else net_pre_match_frame();
         return;

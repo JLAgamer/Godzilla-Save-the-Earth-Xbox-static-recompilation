@@ -680,10 +680,19 @@ index e725646..b7d41e0 100644
      if (FAILED(hr)) {
          fprintf(stderr, "[XA2] Start failed: 0x%08lX\n", hr);
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
-index 2991d89..d2da94c 100644
+index 2991d89..9e28cae 100644
 --- a/src/kernel/kernel_file.c
 +++ b/src/kernel/kernel_file.c
-@@ -326,7 +326,14 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+@@ -263,6 +263,8 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
+     return xbox_translate_path(xbox_path, win_path, buf_size);
+ }
+ 
++static void ft_add(HANDLE h);               /* open files, for a game's rollback (below) */
++
+ NTSTATUS __stdcall xbox_NtCreateFile(
+     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
+     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+@@ -326,7 +328,14 @@ NTSTATUS __stdcall xbox_NtCreateFile(
          if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
              flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
          DWORD access = xbox_access_to_win32(DesiredAccess);
@@ -698,7 +707,7 @@ index 2991d89..d2da94c 100644
          /* An overwrite of an existing non-empty file is deferred (see
           * s_overwrite_pending). It needs write access to settle later. */
          int defer = disposition_overwrites(CreateDisposition)
-@@ -336,7 +343,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+@@ -336,7 +345,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
                   && (fad.nFileSizeHigh || fad.nFileSizeLow);
          h = INVALID_HANDLE_VALUE;
          if (defer) {
@@ -707,7 +716,7 @@ index 2991d89..d2da94c 100644
                  NULL, OPEN_EXISTING, flags_and_attrs, NULL);
              if (h != INVALID_HANDLE_VALUE)
                  overwrite_take(h);          /* a stale mark; see below */
-@@ -347,7 +354,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+@@ -347,7 +356,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
          }
          if (h == INVALID_HANDLE_VALUE) {    /* not deferred, or it vanished */
              h = CreateFileW(win_path, access,
@@ -716,7 +725,15 @@ index 2991d89..d2da94c 100644
                  xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
              /* A HANDLE value is reused once closed, and a pending handle
               * closed by DuplicateHandle(DUPLICATE_CLOSE_SOURCE) never went
-@@ -404,10 +411,24 @@ NTSTATUS __stdcall xbox_NtReadFile(
+@@ -388,6 +397,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+     }
+ 
+     *FileHandle = h;
++    ft_add(h);                              /* xbox_FilePositions */
+     if (IoStatusBlock) {
+         IoStatusBlock->Status = STATUS_SUCCESS;
+         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
+@@ -404,10 +414,24 @@ NTSTATUS __stdcall xbox_NtReadFile(
      DWORD bytes_read = 0;
      BOOL result;
      OVERLAPPED ov;
@@ -741,7 +758,7 @@ index 2991d89..d2da94c 100644
  
      overwrite_settle(FileHandle);
      if (ByteOffset && ByteOffset->QuadPart >= 0) {
-@@ -418,6 +439,8 @@ NTSTATUS __stdcall xbox_NtReadFile(
+@@ -418,6 +442,8 @@ NTSTATUS __stdcall xbox_NtReadFile(
      } else {
          result = ReadFile(FileHandle, Buffer, Length, &bytes_read, NULL);
      }
@@ -750,7 +767,76 @@ index 2991d89..d2da94c 100644
  
      if (result || GetLastError() == ERROR_HANDLE_EOF) {
          IoStatusBlock->Information = bytes_read;
-@@ -877,7 +900,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+@@ -474,10 +500,68 @@ NTSTATUS __stdcall xbox_NtWriteFile(
+     return STATUS_UNSUCCESSFUL;
+ }
+ 
++/* ── Open files and their positions (a game's rollback) ──────────────────
++ *
++ * A read without an offset uses the host file's own position, which moves
++ * on with every read. A game that puts its memory back a few frames and
++ * plays them again (rollback netplay) must put those positions back too, or
++ * the replayed reads get the next bytes instead of the same ones (a level
++ * loaded, or music streamed, differently on two PCs). So the files opened
++ * here are listed, and their positions can be read and set. */
++#define FT_MAX 128
++static HANDLE  s_ft[FT_MAX];
++static SRWLOCK s_ft_lock = SRWLOCK_INIT;
++
++static void ft_add(HANDLE h)
++{
++    int k;
++    AcquireSRWLockExclusive(&s_ft_lock);
++    for (k = 0; k < FT_MAX; k++) if (!s_ft[k]) { s_ft[k] = h; break; }
++    ReleaseSRWLockExclusive(&s_ft_lock);
++}
++
++static void ft_del(HANDLE h)
++{
++    int k;
++    AcquireSRWLockExclusive(&s_ft_lock);
++    for (k = 0; k < FT_MAX; k++) if (s_ft[k] == h) s_ft[k] = NULL;
++    ReleaseSRWLockExclusive(&s_ft_lock);
++}
++
++/* The open files and where each one is: returns how many (at most max). */
++int xbox_FilePositions(void **h, int64_t *pos, int max)
++{
++    int k, n = 0;
++    LARGE_INTEGER zero, cur;
++    zero.QuadPart = 0;
++    AcquireSRWLockShared(&s_ft_lock);
++    for (k = 0; k < FT_MAX && n < max; k++)
++        if (s_ft[k] && SetFilePointerEx(s_ft[k], zero, &cur, FILE_CURRENT)) {
++            h[n] = s_ft[k];
++            pos[n] = cur.QuadPart;
++            n++;
++        }
++    ReleaseSRWLockShared(&s_ft_lock);
++    return n;
++}
++
++/* Put an open file's position back (nothing if it has been closed since). */
++void xbox_FileSetPosition(void *h, int64_t pos)
++{
++    int k;
++    LARGE_INTEGER p;
++    p.QuadPart = pos;
++    AcquireSRWLockShared(&s_ft_lock);
++    for (k = 0; k < FT_MAX; k++)
++        if (s_ft[k] == (HANDLE)h) { SetFilePointerEx((HANDLE)h, p, NULL, FILE_BEGIN); break; }
++    ReleaseSRWLockShared(&s_ft_lock);
++}
++
+ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
+ {
+     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
+     if (Handle && Handle != INVALID_HANDLE_VALUE) {
++        ft_del(Handle);
+         overwrite_settle(Handle);
+         xbox_dir_context_drop(Handle);
+         CloseHandle(Handle);
+@@ -877,7 +961,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
          WCHAR* clean_path = dir_path;
          if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
              clean_path += 4;
@@ -763,7 +849,7 @@ index 2991d89..d2da94c 100644
              WCHAR pattern_wide[MAX_PATH];
              MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
                                  pattern_wide, MAX_PATH);
-@@ -888,6 +915,9 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+@@ -888,6 +976,9 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
          }
          ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
          if (ctx->find_handle == INVALID_HANDLE_VALUE) {

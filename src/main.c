@@ -446,6 +446,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                 g_apu_state ? "up" : "FAILED to initialise");
     }
 
+    {
+        /* A rollback netplay session (gz_rbnet.c): connect and take the
+         * host's profile before the game reads its saves, and leave the USB
+         * controllers out: the session's pads are answered at the game's
+         * controller API (recomp_manual.c), from the shared inputs. */
+        extern int gz_rbn_session_boot(void);
+        if (gz_rbn_session_boot()) _putenv("RECOMP_USB=");
+    }
+
     /* USB controller model (OHCI + gamepad). The game's statically linked XAPI
      * (XPP section) enumerates controllers over USB, so without this it never
      * sees a pad. Opt-in inside: does nothing unless RECOMP_USB is set. The

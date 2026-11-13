@@ -1321,6 +1321,14 @@ void sub_0009B0C0(void)
     uint32_t obj = junction ? GZ_MEM32(junction + 4) : 0;
     uint32_t name = obj ? GZ_MEM32(obj + 0x3C) : 0;
     int i, which = -1, rollback = 0;
+    {
+        /* A menu list asks its entries' names (highlight, select): the menus
+         * are back, and a netplay session leaves its fight mode (gz_rbnet.c:
+         * no guesses outside a fight). The fight's HUD looks objects up too,
+         * but never asks a list entry's name. */
+        extern void gz_rbn_set_fight(int on);
+        gz_rbn_set_fight(0);
+    }
     if (name)
         for (i = 0; i < GZ_OPT_N; i++)
             if (!strcmp(gz_guest_cstr(name), gz_opt_names[i])) which = i;
@@ -1719,9 +1727,134 @@ extern void sub_002D8D7E_gen(void);
 extern GZ_TLS uint32_t g_ebx;
 int gz_rb_pad(int port, uint8_t *pad18);
 
+/* -- Controllers in a rollback netplay session (gz_rbnet.c) ----------------
+ *
+ * The emulated USB controllers run on the host's clock: a pad arrives, and
+ * its reports come, at moments that differ between two PCs. A session plays
+ * the menus as well as the fight on both PCs from the same inputs, so there
+ * the game's controller API answers for the gamepad type directly: two pads,
+ * ports 1 and 2, present from the first call; their state is the session's
+ * input for the tick (gz_rb_pad). The XDK functions (stdcall; the poller
+ * sub_0001ECB0 and the setup sub_0001EBA0 call them):
+ *   sub_002D8E87  XGetDevices(type)                         ret 4
+ *   sub_002D8EA9  XGetDeviceChanges(type, *ins, *rem)        ret 12
+ *   sub_002D8B44  XInputOpen(type, port, slot, params)       ret 16
+ *   sub_002D8B9A  XInputClose(handle)                        ret 4
+ *   sub_002D8BA6  XInputGetCapabilities(handle, *caps)       ret 8
+ *   sub_002D8D7E  XInputGetState(handle, *state)             ret 8
+ *   sub_002D8DF1  XInputSetState(handle, *feedback)          ret 8 (rumble)
+ * Other device types (memory units, voice) go to the originals, which find
+ * none: a session runs without the USB model (main.c). */
+#define GZ_XDEV_GAMEPAD  0x002D7ABCu            /* XDEVICE_TYPE_GAMEPAD */
+#define GZ_FAKE_PAD(p)   (0x47A50000u | (uint32_t)(p))
+#define GZ_IS_FAKE_PAD(h) (((h) & 0xFFFFFFF0u) == 0x47A50000u)
+int gz_rbn_session(void);
+extern void sub_002D8E87_gen(void);
+extern void sub_002D8EA9_gen(void);
+extern void sub_002D8B44_gen(void);
+extern void sub_002D8B9A_gen(void);
+extern void sub_002D8BA6_gen(void);
+extern void sub_002D8DF1_gen(void);
+static int gz_pads_reported;                    /* XGetDevices or the first change said "2 pads" */
+
+static void gz_stdcall_ret(uint32_t eax, unsigned args)
+{
+    g_eax = eax;
+    g_esp += 4u + 4u * args;
+}
+
+void sub_002D8E87(void)
+{
+    if (gz_rbn_session() && GZ_MEM32(g_esp + 4) == GZ_XDEV_GAMEPAD) {
+        gz_pads_reported = 1;
+        gz_stdcall_ret(0x3u, 1);
+        return;
+    }
+    sub_002D8E87_gen();
+}
+
+void sub_002D8EA9(void)
+{
+    if (gz_rbn_session() && GZ_MEM32(g_esp + 4) == GZ_XDEV_GAMEPAD) {
+        uint32_t ins = GZ_MEM32(g_esp + 8), rem = GZ_MEM32(g_esp + 12);
+        uint32_t now = gz_pads_reported ? 0u : 0x3u;
+        gz_pads_reported = 1;
+        if (ins) GZ_MEM32(ins) = now;
+        if (rem) GZ_MEM32(rem) = 0;
+        gz_stdcall_ret(now ? 1u : 0u, 3);
+        return;
+    }
+    sub_002D8EA9_gen();
+}
+
+void sub_002D8B44(void)
+{
+    if (gz_rbn_session() && GZ_MEM32(g_esp + 4) == GZ_XDEV_GAMEPAD) {
+        uint32_t port = GZ_MEM32(g_esp + 8);
+        gz_stdcall_ret(port < 2u ? GZ_FAKE_PAD(port) : 0u, 4);
+        return;
+    }
+    sub_002D8B44_gen();
+}
+
+void sub_002D8B9A(void)
+{
+    if (GZ_IS_FAKE_PAD(GZ_MEM32(g_esp + 4))) { gz_stdcall_ret(0, 1); return; }
+    sub_002D8B9A_gen();
+}
+
+void sub_002D8BA6(void)
+{
+    uint32_t h = GZ_MEM32(g_esp + 4), caps = GZ_MEM32(g_esp + 8);
+    if (GZ_IS_FAKE_PAD(h)) {
+        /* XINPUT_CAPABILITIES: SubType (gamepad), then every button, axis
+         * and motor supported */
+        if (caps) {
+            volatile uint8_t *c = (volatile uint8_t *)((uintptr_t)caps + g_xbox_mem_offset);
+            int k;
+            c[0] = 1; c[1] = 0; c[2] = 0; c[3] = 0;
+            for (k = 4; k < 26; k++) c[k] = 0xFF;
+        }
+        gz_stdcall_ret(0, 2);
+        return;
+    }
+    sub_002D8BA6_gen();
+}
+
+void sub_002D8DF1(void)
+{
+    uint32_t h = GZ_MEM32(g_esp + 4), fb = GZ_MEM32(g_esp + 8);
+    if (GZ_IS_FAKE_PAD(h)) {
+        if (fb) GZ_MEM32(fb) = 0;               /* the header: done, ERROR_SUCCESS */
+        gz_stdcall_ret(0, 2);
+        return;
+    }
+    sub_002D8DF1_gen();
+}
+
+/* The session's pad for a port, as XINPUT_STATE. The packet number is the
+ * tick (rollback rewinds the game, not a counter kept here, and both PCs
+ * must hand the game the same numbers). */
+static void gz_fill_state(uint32_t state, int port)
+{
+    extern uint32_t gz_rb_cur_tick(void);
+    extern int gz_rb_active(void);
+    volatile uint8_t *d = (volatile uint8_t *)((uintptr_t)state + g_xbox_mem_offset);
+    uint8_t pad[18];
+    int k;
+    if (!gz_rb_pad(port, pad)) memset(pad, 0, sizeof pad);
+    GZ_MEM32(state) = gz_rb_active() ? gz_rb_cur_tick() + 1u : 0u;
+    for (k = 0; k < 18; k++) d[4 + k] = pad[k];
+}
+
 void sub_002D8D7E(void)
 {
-    uint32_t ra = GZ_MEM32(g_esp), state = GZ_MEM32(g_esp + 8), port = g_ebx;
+    uint32_t ra = GZ_MEM32(g_esp), h = GZ_MEM32(g_esp + 4), state = GZ_MEM32(g_esp + 8), port = g_ebx;
+    if (GZ_IS_FAKE_PAD(h)) {                    /* a session's pad */
+        if (state) gz_fill_state(state, (int)(h & 0xFu));
+        gz_stdcall_ret(0, 2);
+        return;
+    }
     sub_002D8D7E_gen();
     if (ra == 0x0001EE1Du && port < 4u && state) {
         static uint8_t last[4][18];

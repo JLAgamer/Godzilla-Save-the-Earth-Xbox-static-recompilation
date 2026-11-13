@@ -111,10 +111,12 @@ while another program's window is in front (`RECOMP_PAD_BACKGROUND=1` reads them
 
 - **Rollback netplay (experimental, not in releases yet):** a Versus match between two PCs where your own
   moves never wait for the network. In **Multi-Player**, Xbox Live is replaced by **Rollback Netplay**: one
-  player picks *Host a match*, the other types the host's IP and picks *Join*. Both games restart into the
-  match, set up from the host's last Versus match (its monsters, city and rules); play one Versus match from
-  the menus first on the hosting PC. The same can be started without the menus, on both PCs (the host's
-  monsters, city and seed are used on both):
+  player picks *Host a match*, the other types the host's IP and picks *Join*. Both games restart together
+  as one session with the host's profile: the host's controller is player 1 and drives the menus (Versus,
+  rules, city), the friend's is player 2 (press Start on the monster select to join), and each picks a
+  monster. The menus wait for both controllers every frame; fights run with rollback. Saves made in a
+  session go to a separate `netplay` folder, not your profile. A one-off match without the menus can also
+  be started on both PCs (the host's last Versus setup, monsters, city and seed are used on both):
 
   | | Player 1 (host) | Player 2 |
   |---|---|---|
@@ -160,9 +162,10 @@ next to the program, it keeps saves in the program's `saves\` folder too. `.\pac
   from the game's disk cache (`%LOCALAPPDATA%\GodzillaSTE\Cache`). The game rebuilds the cache itself.
 - Online play has been tested between two copies on one PC (including simulated lag and loss), not yet
   between two PCs over the internet.
-- Rollback netplay: tested between two copies on one PC (scripted input, 40 ms each way); some particle
-  effects can show as solid boxes after a rollback, rolled-back moments are heard twice, and there is no
-  in-game menu for it yet.
+- Rollback netplay: tested between two copies on one PC (scripted input, 40 ms each way), from the
+  Multi-Player menu through Versus, monster and city select into a fight; not yet between two PCs. Some
+  particle effects can show as solid boxes after a rollback, rolled-back moments are heard twice, and the
+  menus slow down on a slow connection (they wait for both controllers every frame).
 
 ## How it works
 

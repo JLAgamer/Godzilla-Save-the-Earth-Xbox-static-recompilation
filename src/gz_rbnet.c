@@ -61,7 +61,7 @@ int      usb_gamepad_report(int pad, uint8_t *out, int max);  /* usb_gamepad.c *
 #define MAXSEND  40u                    /* pads per packet at most */
 #define MAGIC    0x5242475Au            /* "ZGBR" */
 
-enum { M_HELLO = 1, M_SETUP, M_HASHES, M_STATE };
+enum { M_HELLO = 1, M_SETUP, M_HASHES, M_STATE, M_FILES };
 #define MAX_TRANSFER 2000u              /* pages at tick 0, at most (about 8 MB) */
 #define REFUSED      0xFFFFFFFFu
 
@@ -118,6 +118,26 @@ int gz_rbn_on(void)
 }
 
 int gz_rbn_local_port(void) { return s_side - 1; }
+
+/* A fight is on (from its camera set-up until the menus run again): only
+ * then do ticks run on a guess of the other side's pad (see gz_rbn_tick). */
+static int s_fight;
+void gz_rbn_set_fight(int on)
+{
+    if (s_on > 0 && s_fight != on) {
+        s_fight = on;
+        fprintf(stderr, "[RBN] %s\n", on ? "fight: rollback on guesses" : "menus: waiting for both pads (lockstep)");
+    }
+}
+
+/* A session (GZ_RB_SESSION=1, from the Multi-Player menu): the two PCs play
+ * the menus as well as the fights together, from the first frame. */
+int gz_rbn_session(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GZ_RB_SESSION"); v = e && *e == '1'; }
+    return v && gz_rbn_on();
+}
 
 /* ── TCP: whole messages ─────────────────────────────────────────────── */
 
@@ -234,6 +254,150 @@ static int connect_peer(void)
     setsockopt(s_tcp, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
     s_have_peer = 1;
     fprintf(stderr, "[RBN] connected (%.1f s)\n", now_s() - t0);
+    return 1;
+}
+
+/* ── a session's start: the host's profile for both ──────────────────── */
+
+/* Files under dir (relative names), appended to buf as
+ * [u16 name length][name][u32 size][bytes]. */
+static void pack_dir(const char *root, const char *rel, uint8_t **buf, uint32_t *len, uint32_t *cap, uint32_t *count)
+{
+    char pat[MAX_PATH * 2], full[MAX_PATH * 2], sub[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    snprintf(pat, sizeof pat, "%s\\%s%s*", root, rel, *rel ? "\\" : "");
+    if ((h = FindFirstFileA(pat, &fd)) == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        snprintf(sub, sizeof sub, "%s%s%s", rel, *rel ? "\\" : "", fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            pack_dir(root, sub, buf, len, cap, count);
+            continue;
+        }
+        snprintf(full, sizeof full, "%s\\%s", root, sub);
+        {
+            FILE *f = fopen(full, "rb");
+            long sz;
+            uint16_t nl = (uint16_t)strlen(sub);
+            uint32_t s32;
+            if (!f) continue;
+            fseek(f, 0, SEEK_END);
+            sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (sz < 0 || sz > (16 << 20)) { fclose(f); continue; }
+            while (*len + 2 + nl + 4 + (uint32_t)sz > *cap) {
+                *cap = *cap ? *cap * 2 : (1u << 20);
+                *buf = (uint8_t *)realloc(*buf, *cap);
+            }
+            s32 = (uint32_t)sz;
+            memcpy(*buf + *len, &nl, 2); *len += 2;
+            memcpy(*buf + *len, sub, nl); *len += nl;
+            memcpy(*buf + *len, &s32, 4); *len += 4;
+            *len += (uint32_t)fread(*buf + *len, 1, s32, f);
+            fclose(f);
+            (*count)++;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+static void make_dirs_for(const char *path)
+{
+    char d[MAX_PATH * 2], *p;
+    snprintf(d, sizeof d, "%s", path);
+    for (p = d + 3; *p; p++)
+        if (*p == '\\' || *p == '/') { char c = *p; *p = 0; CreateDirectoryA(d, NULL); *p = c; }
+}
+
+static void delete_tree(const char *dir)
+{
+    char pat[MAX_PATH * 2], one[MAX_PATH * 2];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    if ((h = FindFirstFileA(pat, &fd)) != INVALID_HANDLE_VALUE) {
+        do {
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+            snprintf(one, sizeof one, "%s\\%s", dir, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) delete_tree(one);
+            else DeleteFileA(one);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryA(dir);
+}
+
+/* Unpack [count] files into <save>\UDATA. */
+static void unpack_files(const uint8_t *m, uint32_t len, const char *udata)
+{
+    uint32_t count, k, off = 4;
+    if (len < 4) return;
+    memcpy(&count, m, 4);
+    for (k = 0; k < count && off + 2 <= len; k++) {
+        uint16_t nl;
+        uint32_t sz;
+        char name[MAX_PATH], full[MAX_PATH * 2];
+        FILE *f;
+        memcpy(&nl, m + off, 2); off += 2;
+        if (nl >= sizeof name || off + nl + 4 > len) break;
+        memcpy(name, m + off, nl); name[nl] = 0; off += nl;
+        memcpy(&sz, m + off, 4); off += 4;
+        if (off + sz > len || strstr(name, "..")) break;
+        snprintf(full, sizeof full, "%s\\%s", udata, name);
+        make_dirs_for(full);
+        if ((f = fopen(full, "wb")) != NULL) { fwrite(m + off, 1, sz, f); fclose(f); }
+        off += sz;
+    }
+}
+
+/* At boot, before the game starts (main.c): connect, and give both PCs the
+ * host's profile, so the menus (profiles, unlocks) are the same on both.
+ * 0 = no session (the game then starts on its own). */
+int gz_rbn_session_boot(void)
+{
+    const char *save = getenv("GZ_SAVE_DIR"), *from = getenv("GZ_RB_PROFILE_FROM");
+    char udata[MAX_PATH * 2];
+    uint32_t type, len;
+    uint8_t *m;
+    if (!gz_rbn_session()) return 0;
+    if (!save || !*save) { s_on = 0; return 0; }
+    snprintf(udata, sizeof udata, "%s\\UDATA", save);
+    if (!connect_peer()) {
+        MessageBoxA(NULL, s_side == 2 ? "Could not reach the host. Check the IP address and that port 7790 reaches it."
+                                      : "Player 2 did not connect.",
+                    "Rollback Netplay", MB_ICONWARNING);
+        s_on = 0;
+        return 0;
+    }
+    delete_tree(udata);
+    CreateDirectoryA(udata, NULL);
+    if (s_side == 1) {
+        uint8_t *buf = NULL;
+        uint32_t blen = 4, cap = 0, count = 0;
+        char src[MAX_PATH * 2];
+        m = msg_recv(&type, &len);              /* the hello: its UDP port */
+        if (!m || type != M_HELLO || len < 8 || ((uint32_t *)m)[0] != MAGIC) { free(m); s_on = 0; return 0; }
+        s_peer.sin_port = htons((uint16_t)((uint32_t *)m)[1]);
+        free(m);
+        cap = 1u << 20;
+        buf = (uint8_t *)malloc(cap);
+        if (from && *from) {
+            snprintf(src, sizeof src, "%s\\UDATA", from);
+            pack_dir(src, "", &buf, &blen, &cap, &count);
+        }
+        memcpy(buf, &count, 4);
+        msg_send(M_FILES, buf, blen, NULL, 0);
+        unpack_files(buf, blen, udata);         /* the same copy here */
+        free(buf);
+        fprintf(stderr, "[RBN] session: %u profile file(s) sent to player 2\n", count);
+    } else {
+        m = msg_recv(&type, &len);
+        if (!m || type != M_FILES) { free(m); s_on = 0; return 0; }
+        unpack_files(m, len, udata);
+        fprintf(stderr, "[RBN] session: the host's profile received (%u bytes)\n", len);
+        free(m);
+    }
     return 1;
 }
 
@@ -504,7 +668,29 @@ uint32_t gz_rbn_tick(uint32_t cur)
     double t0;
     static double last_report;
     lag_flush();
-    /* this side's pads up to cur + delay */
+    /* this side's pads up to cur + delay. A session's menus wait for both
+     * pads every tick (no guesses there); GZ_RB_MENU_DELAY (experimental)
+     * gives them a longer delay so they stall less on a slow connection.
+     * Not the default: with 6 ticks in the menus and 2 in the fight, two
+     * copies on one PC (40 ms each way) played different fights after the
+     * fight's first rollbacks, every time, and the same with 2 and 2 did
+     * not. The cause is not found yet. */
+    {
+        static int menu_delay = -1;
+        int delay = s_delay;
+        if (menu_delay < 0) {
+            const char *v = getenv("GZ_RB_MENU_DELAY");
+            menu_delay = v && *v ? atoi(v) : s_delay;
+            if (menu_delay < s_delay) menu_delay = s_delay;
+            if (menu_delay > 30) menu_delay = 30;
+        }
+        if (gz_rbn_session() && !s_fight) delay = menu_delay;
+        while (s_local_max < (int64_t)cur + delay) {
+            int64_t t = s_local_max + 1;
+            read_local((uint32_t)t, s_local[t % RING]);
+            s_local_max = t;
+        }
+    }
     while (s_local_max < (int64_t)cur + s_delay) {
         int64_t t = s_local_max + 1;
         read_local((uint32_t)t, s_local[t % RING]);
@@ -513,9 +699,13 @@ uint32_t gz_rbn_tick(uint32_t cur)
     send_pads(cur);
     recv_pads(cur);
 
-    /* Too far ahead of what the other side has confirmed: wait for it. */
+    /* Too far ahead of what the other side has confirmed: wait for it. Out
+     * of a fight (a session's menus, loading) nothing runs on a guess: a
+     * level load's file reads cannot be played again (the host file has
+     * moved on), and a rollback across one gave the two PCs different
+     * levels. Those ticks wait for the other side's pad instead. */
     t0 = now_s();
-    while ((int64_t)cur - s_remote_max > s_window) {
+    while ((int64_t)cur - s_remote_max > (gz_rbn_session() && !s_fight ? 0 : s_window)) {
         Sleep(1);
         lag_flush();
         recv_pads(cur);
@@ -548,6 +738,8 @@ uint32_t gz_rbn_tick(uint32_t cur)
         uint32_t back = cur - (uint32_t)s_first_bad;
         s_first_bad = -1;
         s_stat_rb++;
+        if (getenv("GZ_RB_LOG_ROLLBACKS"))
+            fprintf(stderr, "[RBN] rollback at tick %u: back %u to %u\n", cur, back, (uint32_t)(cur - back));
         s_stat_rb_ticks += back;
         return back;
     }
@@ -562,12 +754,13 @@ void gz_rbn_off(void) { s_on = 0; }
 /* ── Rollback Netplay from the Multi-Player menu ────────────────────────
  *
  * The entry that was Xbox Live (recomp_manual.c, sub_0009B0C0) calls this.
- * After the prompt the game starts again as a netplay session: both PCs boot
- * the same way, deterministic from the first frame (main.c), straight into a
- * match set up from the host's last Versus setup (the quick fight's
- * gz_quickfight.bin; the client takes the host's). Two games that each went
- * their own way through the menus are too far apart in memory to agree on a
- * match. */
+ * After the prompt the game starts again as a netplay session: the two PCs
+ * connect at boot, both take the host's profile (gz_rbn_session_boot), and
+ * from the first frame they run on the same inputs, rollback included: the
+ * host's pad is player 1 and drives the menus (rules, city), the client's is
+ * player 2, and each picks a monster. Two games that each went their own way
+ * through the menus are too far apart in memory to agree on a match, so the
+ * session starts both from the same point. */
 void gz_rbn_menu_pick(void)
 {
     char ip[128], peer[160], base[MAX_PATH], save[MAX_PATH + 16], exe[MAX_PATH];
@@ -575,17 +768,8 @@ void gz_rbn_menu_pick(void)
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
     int r = gz_rbn_prompt(ip, sizeof ip);
-    FILE *f;
+    (void)qf;
     if (!r) return;
-    if (r == 1) {
-        if ((f = fopen(qf && *qf ? qf : "gz_quickfight.bin", "rb")) == NULL) {
-            MessageBoxA(GetForegroundWindow(),
-                        "Play one Versus match from the menus first: the host's last Versus setup "
-                        "(monsters, city, rules) is the match you play.", "Rollback Netplay", MB_ICONINFORMATION);
-            return;
-        }
-        fclose(f);
-    }
     if (sd && *sd) snprintf(base, sizeof base, "%s", sd);
     else {
         const char *la = getenv("LOCALAPPDATA");
@@ -600,10 +784,10 @@ void gz_rbn_menu_pick(void)
     SetEnvironmentVariableA("GZ_RB_SIDE", r == 1 ? "1" : "2");
     SetEnvironmentVariableA("GZ_RB_PEER", r == 2 ? peer : NULL);
     SetEnvironmentVariableA("GZ_SAVE_DIR", save);
-    SetEnvironmentVariableA("GZ_QUICK_FIGHT", "1");
+    SetEnvironmentVariableA("GZ_RB_SESSION", "1");          /* menus and fights together */
+    SetEnvironmentVariableA("GZ_RB_PROFILE_FROM", base);    /* the host's profile, for both */
+    SetEnvironmentVariableA("GZ_QUICK_FIGHT", NULL);
     SetEnvironmentVariableA("GZ_MOVIES", "0");
-    SetEnvironmentVariableA("GZ_QF_DELAY", "60");
-    SetEnvironmentVariableA("RECOMP_USB_PADS", "2");
     SetEnvironmentVariableA("GZ_RATE", "60");
     SetEnvironmentVariableA("GZ_TOURNAMENT", "1");
     if (!GetModuleFileNameA(NULL, exe, sizeof exe)) return;

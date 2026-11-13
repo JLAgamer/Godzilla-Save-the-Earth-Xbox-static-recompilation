@@ -2774,8 +2774,47 @@ static const float (*pv(const Nv2aProgramDraw *p, uint32_t k))[4]
     return (const float (*)[4])v;
 }
 
+/* Face culling for vertex-program draws (the monsters, most of a stage),
+ * done by the rasterizer as the title asks (SET_CULL_FACE_ENABLE, CULL_FACE,
+ * FRONT_FACE). These used to draw both faces of every triangle. A model with
+ * two skins back to back - Rodan's wings, top and underside a hair apart -
+ * then had both drawn over each other, and the depth test picked a texel of
+ * one or the other in a fine checker of the two lightings (player report:
+ * "Rodan's wings textures are glitchy"). The front face is clockwise on the
+ * render target for GL_CW (0x900), as in cull_tris: the game culls FRONT
+ * with front CW, and the stages' visible faces are counter-clockwise on the
+ * screen (measured with the CPU interpreter in the frame trace). Strips must
+ * then wind every triangle alike (RECOMP_STRIP_ALT_WINDING, switched on with
+ * this in gz_gpu_register): emitted as (i, i+1, i+2) throughout, every second
+ * triangle of a strip faced the other way and was culled.
+ * GZ_PROG_CULL=0 draws both faces as before. Returns the state to draw with,
+ * or NULL when the title culls both faces (nothing to draw). */
+static ID3D11RasterizerState *s_rs_cull[2][2];      /* [cull back][front counter-clockwise] */
+static ID3D11RasterizerState *prog_rs(const Nv2aRenderState *rs)
+{
+    static int on = -1;
+    int back, ccw;
+    if (on < 0) on = env_int("GZ_PROG_CULL", 1, 0, 1);
+    if (!on || !rs->cull_enable) return s_rs;
+    if (rs->cull_face == 0x408) return NULL;            /* FRONT_AND_BACK */
+    if (rs->cull_face != 0x404 && rs->cull_face != 0x405) return s_rs;
+    back = rs->cull_face == 0x405;
+    ccw = rs->front_face != 0x900;
+    if (!s_rs_cull[back][ccw]) {
+        D3D11_RASTERIZER_DESC rd;
+        memset(&rd, 0, sizeof rd);
+        rd.FillMode = D3D11_FILL_SOLID;
+        rd.CullMode = back ? D3D11_CULL_BACK : D3D11_CULL_FRONT;
+        rd.FrontCounterClockwise = ccw ? TRUE : FALSE;
+        rd.DepthClipEnable = FALSE;
+        if (FAILED(ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs_cull[back][ccw]))) return s_rs;
+    }
+    return s_rs_cull[back][ccw];
+}
+
 static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aProgramDraw *p)
 {
+    ID3D11RasterizerState *prs;
     Rt *r;
     Ds *d;
     UINT vat, iat, strides[2], offsets[2];
@@ -2789,6 +2828,7 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     if (!ready()) return 0;
     if (!s->color_va || !s->width || !s->height || p->nindices < 3) return 1;
     if (!p->packed || !(layout = prog_layout(p->packed_mask))) return 0;
+    if (!(prs = prog_rs(b->state))) return 1;           /* both faces culled */
     nact = prog_nact(p->packed_mask);
     if (!(r = rt_get(s))) return 1;
     d = ds_get(b->state->zeta_va, r->w, r->h);
@@ -2854,6 +2894,9 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
         }
     }
     draw_state(s, b, r, d);
+    /* after draw_state, which binds the no-cull state when the cache is cold;
+     * fixed-function draws bind that again (be_draw_t clears the cache) */
+    ID3D11DeviceContext_RSSetState(s_ctx, prs);
     if (!s_sc.ok || s_sc.layout != layout) {
         ID3D11DeviceContext_IASetInputLayout(s_ctx, layout);
         s_sc.layout = layout;
@@ -2948,7 +2991,34 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
         }
         for (st = 0; st < 4; st++) {
             const Nv2aTexture *t = b->textures[st] ? b->textures[st] : (st == 0 ? b->texture : NULL);
-            if (t) fprintf(stderr, " | t%d %08X fmt %02X %ux%u c%u addr %u/%u", st, t->offset, t->color, t->width, t->height, t->cube, t->addr_u, t->addr_v);
+            if (t) fprintf(stderr, " | t%d %08X fmt %02X %ux%u c%u addr %u/%u filt %08X", st, t->offset, t->color, t->width,
+                           t->height, t->cube, t->addr_u, t->addr_v, t->filter);
+        }
+        if (b->combiner) {
+            const Nv2aCombiner *rc = b->combiner;
+            fprintf(stderr, " | cull %u/%X/%X", b->state->cull_enable, b->state->cull_face, b->state->front_face);
+            {
+                /* winding on the screen (y down) of the first triangles, by
+                 * the CPU interpreter: clockwise / counter-clockwise / skipped */
+                uint32_t tri, ncw = 0, nccw = 0, nskip = 0;
+                for (tri = 0; tri + 2 < p->nindices && tri < 600; tri += 3) {
+                    Nv2aVshOutput o[3];
+                    int k, okv = 1;
+                    float area;
+                    for (k = 0; k < 3 && okv; k++)
+                        okv = nv2a_vsh_run(pv(p, p->indices[tri + k]), &o[k]) && o[k].pos[3] > 0.0f;
+                    if (!okv) { nskip++; continue; }
+                    area = (o[1].pos[0] - o[0].pos[0]) * (o[2].pos[1] - o[0].pos[1])
+                         - (o[2].pos[0] - o[0].pos[0]) * (o[1].pos[1] - o[0].pos[1]);
+                    if (area > 0.0f) ncw++; else if (area < 0.0f) nccw++; else nskip++;
+                }
+                fprintf(stderr, " wind cw %u ccw %u skip %u", ncw, nccw, nskip);
+            }
+            fprintf(stderr, " | rc ctl %08X fin %08X/%08X fc %08X/%08X", rc->control, rc->final0, rc->final1,
+                    rc->final_c0, rc->final_c1);
+            for (st = 0; st < (int)(rc->control & 0xFF) && st < 8; st++)
+                fprintf(stderr, " s%d c%08X a%08X oc%08X oa%08X f0 %08X f1 %08X", st, rc->color_icw[st],
+                        rc->alpha_icw[st], rc->color_ocw[st], rc->alpha_ocw[st], rc->factor0[st], rc->factor1[st]);
         }
         fprintf(stderr, "\n");
     }
@@ -2982,6 +3052,11 @@ int gz_gpu_register(void)
         fprintf(stderr, "[GPU-D3D11] RECOMP_PB_EXEC is not set, so nothing would call the back end; not registering\n");
         return 0;
     }
+    /* Culling program draws (prog_rs) needs strips wound as the hardware
+     * winds them. Set before the executor first reads it; an explicit
+     * RECOMP_STRIP_ALT_WINDING stands. */
+    if (env_int("GZ_PROG_CULL", 1, 0, 1) && !getenv("RECOMP_STRIP_ALT_WINDING"))
+        _putenv("RECOMP_STRIP_ALT_WINDING=1");
     nv2a_backend_register_with_present_sync(&s_backend, be_present_sync);
     fprintf(stderr, "[GPU-D3D11] back end registered (device is created on the first draw)\n");
     return 1;

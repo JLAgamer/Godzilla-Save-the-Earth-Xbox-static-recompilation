@@ -32,7 +32,7 @@ Windows 10/11 (64-bit) with a Direct3D 11 graphics card. Movies need `ffmpeg.exe
 - Runs natively on Windows with a D3D11 renderer for the Xbox GPU's command stream
 - Higher internal resolution (up to 6x), mip-mapped 16x anisotropic filtering, borderless fullscreen
 - **Widescreen 16:9**: a wider view at the camera (culling follows), HUD kept in shape and pinned to the corners
-- **Frame rate 60 / 120 / 144**, with game speed kept to real time when the PC can't hold the rate
+- **Frame rate 60 / 120 / 144**, at the game's own speed. Pick a rate your PC can hold: the game steps by frames, so a PC that falls short of 120 or 144 plays a little slow, as the console did when it dropped frames
 - **In-game Options entries**: tournament mode, PlayStation or Xbox button icons, frame rate, aspect ratio
 - **Tournament mode**: every monster and city unlocked, whatever the profile holds
 - **Biollante**: the cut monster (complete on the disc) gets a cell on the monster select screen
@@ -54,7 +54,7 @@ Estimates from what has been checked in game so far. Overall is the average of t
 | Audio | 95% | Music, effects and voices sound right in play; fixed: menu crackle, corrupted voice lines and UI sounds (memory and timing bugs in the sound emulation) |
 | Movies | 100% | Intro, story and credits play through ffmpeg; skipping them (GZ_MOVIES=0) is silent |
 | Widescreen | 95% | Wider view with matching culling in fights and menus, HUD in the corners; the pause menu's dimming covers only the middle |
-| High frame rate | 95% | Up to 144 fps (higher rates were too unstable in play); game speed stays correct |
+| High frame rate | 95% | Up to 144 fps (higher rates were too unstable in play); game speed correct at a rate the PC holds (it used to run up to 30% fast at 120/144) |
 | Online (System Link) | 60% | Works between two copies on one PC; not yet tested PC to PC over the internet |
 
 ## Requirements (building from source)

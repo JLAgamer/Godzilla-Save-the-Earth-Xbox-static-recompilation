@@ -33,8 +33,8 @@ Windows 10/11 (64-bit) with a Direct3D 11 graphics card. Movies need `ffmpeg.exe
 - Higher internal resolution (up to 6x), mip-mapped 16x anisotropic filtering, borderless fullscreen
 - **Widescreen 16:9**: a wider view at the camera (culling follows), HUD kept in shape and pinned to the corners
 - **Frame rate 60 / 120 / 144**, at the game's own speed. Pick a rate your PC can hold: the game steps by frames, so a PC that falls short of 120 or 144 plays a little slow, as the console did when it dropped frames
-- **In-game Options entries**: tournament mode, PlayStation or Xbox button icons, frame rate, aspect ratio
-- **Tournament mode**: every monster and city unlocked, whatever the profile holds
+- **In-game Options entries**: tournament mode, PlayStation or Xbox button icons (with a PlayStation controller picture), frame rate, aspect ratio
+- **Tournament mode**: every monster and city unlocked, whatever the profile holds (cheats stay as you set them)
 - **Biollante**: the cut monster (complete on the disc) gets a cell on the monster select screen
 - **FMV movies** (intro, story, credits) decoded with ffmpeg
 - **System Link over the internet/LAN** (the game's own Xbox LAN multiplayer, on UDP sockets)
@@ -50,7 +50,7 @@ Estimates from what has been checked in game so far. Overall is the average of t
 | Versus fights | 95% | Played on all ten city and arena stages: HUD, beams, destruction, win/lose |
 | Other modes | 20% | Action, Melee, Survival and Challenges have not been played through yet |
 | Stages | 80% | The ten city and arena stages and the Mothership are checked in fights; the challenge stages are not |
-| Graphics | 90% | Combiners, cube maps, water reflections, fog; rare effects may still be wrong |
+| Graphics | 90% | Combiners, cube maps, water reflections, fog; rare effects may still be wrong (MechaGodzilla 2 and 3's missiles don't show in flight) |
 | Audio | 95% | Music, effects and voices sound right in play; fixed: menu crackle, corrupted voice lines and UI sounds (memory and timing bugs in the sound emulation) |
 | Movies | 100% | Intro, story and credits play through ffmpeg; skipping them (GZ_MOVIES=0) is silent |
 | Widescreen | 95% | Wider view with matching culling in fights and menus, HUD in the corners; the pause menu's dimming covers only the middle |
@@ -134,6 +134,8 @@ next to the program, it keeps saves in the program's `saves\` folder too. `.\pac
 - Not every stage and mode has been played through; the recompilation can still hit untranslated paths.
 - The frame rate setting goes up to 144. The first run compiles shaders into `shader_cache\` and is
   less smooth than later ones.
+- MechaGodzilla 2 and 3's missiles are invisible in flight: the launch flash and the hits show, the
+  missile and its trail don't. Being investigated.
 - Online play has been tested between two copies on one PC (including simulated lag and loss), not yet
   between two PCs over the internet.
 

@@ -2441,3 +2441,71 @@ index 260fa3f..e09672d 100644
  #if !defined(_WIN32)
  /* The POSIX SDL presenter owns event pumping while its main-thread window is
   * active, and keeps SDL alive at shutdown while controller handles are open. */
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index 9476517..0faa251 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -1476,6 +1476,22 @@ static void bridge_NtQueryVirtualMemory(void)
+ /* True when va lies inside a heap block but not at its start; left is
+  * xbox_HeapBlockSize(va). The byte before an interior address is in the same
+  * block, one byte further from its end. NT refuses a release there. */
++/* A title can make heap pages read-only (NtProtectVirtualMemory) and then
++ * free them. On the console the freed range is gone and the next allocation
++ * there gets fresh read/write pages; here the block goes back to the heap with
++ * its old protection, and the next owner faulted zero-filling it. (Godzilla:
++ * Save the Earth, loading the main menu script after a game-cache miss.) So
++ * pages that are freed or decommitted are made read/write again, once a title
++ * has protected anything. */
++static volatile LONG s_guest_pages_protected;
++static void bridge_pages_writable(uint32_t va, uint32_t size)
++{
++    DWORD old;
++    if (!s_guest_pages_protected || !size)
++        return;
++    VirtualProtect(XBOX_TO_NATIVE(va & ~0xFFFu), (SIZE_T)size + (va & 0xFFFu), PAGE_READWRITE, &old);
++}
++
+ static int bridge_heap_interior(uint32_t va, uint32_t left)
+ {
+     return left && va && xbox_HeapBlockSize(va - 1) == left + 1;
+@@ -1536,6 +1552,7 @@ static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
+             return;
+         }
+         size = left;
++        bridge_pages_writable(page_base, size);
+         xbox_HeapFree(page_base);          /* ignores what it never handed out */
+         releases++;
+     } else {
+@@ -1549,6 +1566,7 @@ static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
+         if (left && end - page_base > left)
+             end = page_base + left;
+         size = end - page_base;
++        bridge_pages_writable(page_base, size);
+         if (size)
+             memset(XBOX_TO_NATIVE(page_base), 0, size);
+         decommits++;
+@@ -1607,6 +1625,7 @@ static void bridge_NtFreeVirtualMemory(void)
+                     g_eax = BRIDGE_FREE_VM_NOT_AT_BASE;
+                     return;
+                 }
++                bridge_pages_writable(vm_base, left);
+                 xbox_HeapFree(vm_base);
+                 /* NT writes back what it released: the base and the size. */
+                 BRIDGE_MEM32(size_ptr) = left;
+@@ -1625,6 +1644,7 @@ static void bridge_NtFreeVirtualMemory(void)
+                     end = (uint64_t)vm_base + left;
+                 if (xbox_HeapBlockSize(page_base) != left + (vm_base - page_base))
+                     page_base = vm_base;
++                bridge_pages_writable(page_base, (uint32_t)(end - page_base));
+                 memset(XBOX_TO_NATIVE(page_base), 0, (size_t)(end - page_base));
+                 BRIDGE_MEM32(base_ptr) = page_base;
+                 BRIDGE_MEM32(size_ptr) = (uint32_t)(end - page_base);
+@@ -9000,6 +9020,8 @@ static void bridge_NtProtectVirtualMemory(void)
+     DWORD old = 0;
+ 
+     if (VirtualProtect(XBOX_TO_NATIVE(base_va), size, (DWORD)new_prot, &old)) {
++        if ((new_prot & 0xFFu) != 0x04u && (new_prot & 0xFFu) != 0x40u)
++            InterlockedExchange(&s_guest_pages_protected, 1);
+         if (old_ptr)
+             BRIDGE_MEM32(old_ptr) = (uint32_t)old;
+         g_eax = 0;  /* STATUS_SUCCESS */

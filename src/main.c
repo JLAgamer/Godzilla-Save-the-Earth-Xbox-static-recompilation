@@ -258,6 +258,13 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             g_ebx, g_esi, g_edi);
         fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
             (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery((LPCVOID)fault_addr, &mbi, sizeof mbi))
+                fprintf(stderr, "  host page: base %p size 0x%llX state 0x%lX protect 0x%lX type 0x%lX (alloc base %p)\n",
+                        mbi.BaseAddress, (unsigned long long)mbi.RegionSize, mbi.State, mbi.Protect, mbi.Type,
+                        mbi.AllocationBase);
+        }
         print_guest_context((void *)ep->ContextRecord->Rip);
 
         /*

@@ -1,7 +1,7 @@
 /*
  * gz_settings.c - the recomp's own settings, in gz_settings.ini.
  *
- * Four are shown as extra entries on the game's Options screen (see "Options
+ * Five are shown as extra entries on the game's Options screen (see "Options
  * menu toggles" in recomp_manual.c):
  *   tournament  every monster and city unlocked, whatever the profile holds
  *   ps_prompts  button pictures: 1 = cross/circle/square/triangle, 0 = Xbox
@@ -10,6 +10,8 @@
  *               entry steps through 60 / 120 / 144. Higher rates were too
  *               unstable in play; a saved or GZ_RATE value above 144 is
  *               treated as 144.
+ *   turbo       1 = the game runs 1.2x faster (a player suggestion: the pace
+ *               of the old high-frame-rate speed bug); never in System Link
  * Two more are only in the file (and in RecompLauncher's settings):
  *   online       1 = System Link over the network (GZ_NET)
  *   online_peer  the other players' IP addresses (GZ_NET_PEER)
@@ -21,8 +23,8 @@
  * The file is in the working folder (GZ_SETTINGS_FILE overrides the path).
  * It is written out with every key and a comment for each the first time the
  * game starts; after that only the lines of changed keys are rewritten, so
- * comments and other lines stay. GZ_TOURNAMENT / GZ_PS_PROMPTS / GZ_WIDE (0 or
- * 1) and GZ_RATE (a number) override the file for that run (tests use them); a
+ * comments and other lines stay. GZ_TOURNAMENT / GZ_PS_PROMPTS / GZ_WIDE /
+ * GZ_TURBO (0 or 1) and GZ_RATE (a number) override the file for that run (tests use them); a
  * change made in the menu still applies and is saved.
  */
 #include <stdio.h>
@@ -33,13 +35,13 @@
 /* the toolkit's input layer: which pad is plugged in */
 int xbox_InputPadIsPlayStation(unsigned long port);
 
-enum { OPT_TOURNAMENT, OPT_PROMPTS, OPT_RATE, OPT_WIDE, OPT_COUNT };
+enum { OPT_TOURNAMENT, OPT_PROMPTS, OPT_RATE, OPT_WIDE, OPT_TURBO, OPT_COUNT };
 
-static int s_val[OPT_COUNT] = { 0, 1, 60, 0 };
+static int s_val[OPT_COUNT] = { 0, 1, 60, 0, 0 };
 static const int s_rates[] = { 60, 120, 144 };
 #define GZ_RATE_MAX 144
-static const char *const s_key[OPT_COUNT] = { "tournament", "ps_prompts", "frame_rate", "widescreen" };
-static const char *const s_env[OPT_COUNT] = { "GZ_TOURNAMENT", "GZ_PS_PROMPTS", "GZ_RATE", "GZ_WIDE" };
+static const char *const s_key[OPT_COUNT] = { "tournament", "ps_prompts", "frame_rate", "widescreen", "turbo" };
+static const char *const s_env[OPT_COUNT] = { "GZ_TOURNAMENT", "GZ_PS_PROMPTS", "GZ_RATE", "GZ_WIDE", "GZ_TURBO" };
 static int s_loaded;
 static volatile unsigned s_generation = 1;
 
@@ -52,6 +54,7 @@ static const char *const s_header[] = {
     "; ps_prompts   button icons: 1 = PlayStation, 0 = Xbox",
     "; frame_rate   60 (the console's), 120 or 144; game speed stays real time",
     "; widescreen   1 = 16:9 with a wider view, 0 = the original 4:3",
+    "; turbo        1 = the game runs 1.2x faster (not in System Link), 0 = normal speed",
     "; online       1 = System Link over the network (Multi-Player > System Link)",
     "; online_peer  the other player's IP address (several: comma separated);",
     ";              empty on the same home network. UDP ports 1000-1002 must be open.",
@@ -191,8 +194,9 @@ static void load(void)
         else if (e && (*e == '0' || *e == '1')) s_val[i] = *e == '1';
     }
     if (s_val[OPT_RATE] > GZ_RATE_MAX) s_val[OPT_RATE] = GZ_RATE_MAX;
-    fprintf(stderr, "[SETTINGS] tournament=%d ps_prompts=%d frame_rate=%d widescreen=%d (%s)\n",
-            s_val[OPT_TOURNAMENT], s_val[OPT_PROMPTS], s_val[OPT_RATE], s_val[OPT_WIDE], settings_path());
+    fprintf(stderr, "[SETTINGS] tournament=%d ps_prompts=%d frame_rate=%d widescreen=%d turbo=%d (%s)\n",
+            s_val[OPT_TOURNAMENT], s_val[OPT_PROMPTS], s_val[OPT_RATE], s_val[OPT_WIDE], s_val[OPT_TURBO],
+            settings_path());
 }
 
 /* online / online_peer from the file into GZ_NET / GZ_NET_PEER, unless the
@@ -238,6 +242,7 @@ int gz_opt_tournament(void) { return gz_opt_get(OPT_TOURNAMENT); }
 int gz_opt_ps_prompts(void) { return gz_opt_get(OPT_PROMPTS); }
 int gz_opt_rate(void)       { return gz_opt_get(OPT_RATE); }
 int gz_opt_wide(void)       { return gz_opt_get(OPT_WIDE); }
+int gz_opt_turbo(void)      { return gz_opt_get(OPT_TURBO); }
 
 /* Changes whenever a setting changes (the texture cache re-checks on it). */
 unsigned gz_opt_generation(void) { return s_generation; }

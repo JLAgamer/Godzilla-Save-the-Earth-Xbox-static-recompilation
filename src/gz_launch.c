@@ -360,7 +360,7 @@ static int match_text_pos(const char *s, const char *end, const char *name, cons
 
 static int patch_options(const char *b, size_t n, Buf *out)
 {
-    static const char *const names[4] = { "GzTournament", "GzPrompts", "GzRate", "GzWide" };
+    static const char *const names[5] = { "GzTournament", "GzPrompts", "GzRate", "GzWide", "GzSpeed" };
     const char *i = mem_find(b, n, "<interface n=\"Options\">"), *j, *m, *me, *s, *num;
     size_t xn, nl, k, need;
     double ys[3];
@@ -383,12 +383,12 @@ static int patch_options(const char *b, size_t n, Buf *out)
             }
     }
     if (ny != 3) return 0;
-    for (k = 0; k < 4; k++) {           /* the new entries, from the TopTen one */
+    for (k = 0; k < 5; k++) {           /* the new entries, from the TopTen one */
         Buf t = {0};
         char nm[48], pos[48];
         const char *e = tpl.p + tpl.n;
         snprintf(nm, sizeof nm, "n=\"%s\"", names[k]);
-        snprintf(pos, sizeof pos, "<position> 0 %.2f 0", ys[0] + 28.0 * (double)(k + 3));
+        snprintf(pos, sizeof pos, "<position> 0 %.2f 0", ys[0] + 24.0 * (double)(k + 3));
         for (s = tpl.p; s < e;) {
             if (e - s >= 10 && !memcmp(s, "n=\"TopTen\"", 10)) { buf_put(&t, nm, strlen(nm)); s += 10; }
             else { buf_put(&t, s, 1); s++; }
@@ -407,7 +407,7 @@ static int patch_options(const char *b, size_t n, Buf *out)
         char v[32];
         int hits = 0;
         Buf r = {0};
-        snprintf(v, sizeof v, "%.2f", ys[0] + 28.0 * (double)(k + 1));
+        snprintf(v, sizeof v, "%.2f", ys[0] + 24.0 * (double)(k + 1));
         for (s = x.p; s < e;) {
             if (match_text_pos(s, e, nm, &num, &nl)) {
                 buf_put(&r, s, (size_t)(num - s)); buf_put(&r, v, strlen(v));
@@ -526,6 +526,9 @@ static int build_menu_mods(const WCHAR *game_dir)
     swprintf_s(src, MAX_PATH, L"%s\\ShellData\\ControlRoom.bdl", game_dir);
     swprintf_s(stamp, MAX_PATH, L"%s\\mods\\gz_built_from.txt", s_exe_dir);
     file_stamp(src, want, sizeof want);
+    /* The layout version: menus built by an older release (four Options
+     * entries, before Game speed) are built again. */
+    strncat_s(want, sizeof want, "|options5", _TRUNCATE);
     swprintf_s(dst, MAX_PATH, L"%s\\mods\\biollante_slot\\ShellData\\ControlRoom.bdl", s_exe_dir);
     if (stamp_matches(stamp, want) && file_exists(dst)) return 0;
     progress(0.96, "Adding the Options entries and the Biollante cell");

@@ -33,7 +33,8 @@ Windows 10/11 (64-bit) with a Direct3D 11 graphics card. Movies need `ffmpeg.exe
 - Higher internal resolution (up to 6x), mip-mapped 16x anisotropic filtering, borderless fullscreen
 - **Widescreen 16:9**: a wider view at the camera (culling follows), HUD kept in shape and pinned to the corners
 - **Frame rate 60 / 120 / 144**, at the game's own speed. Pick a rate your PC can hold: the game steps by frames, so a PC that falls short of 120 or 144 plays a little slow, as the console did when it dropped frames
-- **In-game Options entries**: tournament mode, PlayStation or Xbox button icons (with a PlayStation controller picture), frame rate, aspect ratio
+- **In-game Options entries**: tournament mode, PlayStation or Xbox button icons (with a PlayStation controller picture), frame rate, aspect ratio, game speed
+- **Turbo game speed**: the whole game runs 1.2x faster (a player suggestion; System Link stays at normal speed)
 - **Tournament mode**: every monster and city unlocked, whatever the profile holds (cheats stay as you set them)
 - **Biollante**: the cut monster (complete on the disc) gets a cell on the monster select screen
 - **FMV movies** (intro, story, credits) decoded with ffmpeg
@@ -95,7 +96,7 @@ while another program's window is in front (`RECOMP_PAD_BACKGROUND=1` reads them
   Xbox button and stick to a control of your pad by position (`south`, `east`, `left_shoulder`, ...), with
   stick deadzones and a trigger threshold. Delete it to get the defaults back.
 
-- **Options menu** (last entries): Tournament mode, Button icons, Frame rate, Aspect — saved in `gz_settings.ini`,
+- **Options menu** (last entries): Tournament mode, Button icons, Frame rate, Aspect, Game speed — saved in `gz_settings.ini`,
   which lists every setting with a comment. The first start picks button icons from the controller plugged in.
 - **`play.bat`** options at the top: fullscreen, window size, internal resolution, texture filtering,
   online play, movies

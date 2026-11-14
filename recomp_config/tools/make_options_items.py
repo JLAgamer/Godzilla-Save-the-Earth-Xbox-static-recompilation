@@ -1,10 +1,10 @@
-"""Add four entries to the Options menu: tournament mode, button icons,
-frame rate and aspect ratio.
+"""Add five entries to the Options menu: tournament mode, button icons,
+frame rate, aspect ratio and game speed.
 
 The Options screen's layout is XML text inside ShellData/ControlRoom.bdl
 (<interface n="Options">); its MainBox list holds AudioAdjust,
-ControllerAdjust and TopTen. This writes a copy of the bundle with four more
-list entries, GzTournament, GzPrompts, GzRate and GzWide, and moves the entries
+ControllerAdjust and TopTen. This writes a copy of the bundle with five more
+list entries, GzTournament, GzPrompts, GzRate, GzWide and GzSpeed, and moves the entries
 closer together so they stay above the Audio / Controls panels. The game's own Options script does
 nothing for names it does not know; the recomp reacts to them (see "Options
 menu toggles" in src/recomp_manual.c) and sets their text.
@@ -32,9 +32,9 @@ assert m
 tpl = re.sub(rb'[\t\r\n]+', b'', m.group(0))
 ys = [float(v) for v in re.findall(rb'<text n="(?:AudioAdjust|ControllerAdjust|TopTen)">\s*<position> 0 ([0-9.]+) 0', x)]
 assert len(ys) == 3, ys
-STEP = 28.0                     # original spacing is 34.85
+STEP = 24.0                     # original spacing is 34.85; eight entries end where seven at 28 did
 new = b''
-for k, name in enumerate((b'GzTournament', b'GzPrompts', b'GzRate', b'GzWide')):
+for k, name in enumerate((b'GzTournament', b'GzPrompts', b'GzRate', b'GzWide', b'GzSpeed')):
     t = tpl.replace(b'n="TopTen"', b'n="' + name + b'"')
     t = re.sub(rb'<position> 0 [0-9.]+ 0', b'<position> 0 %.2f 0' % (ys[0] + STEP * (k + 3)), t)
     new += t

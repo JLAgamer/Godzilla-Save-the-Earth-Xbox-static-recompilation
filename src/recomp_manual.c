@@ -1160,8 +1160,8 @@ static void gz_tournament_tick(void)
 
 /* -- Options menu toggles ------------------------------------------------
  *
- * mods/menu (RECOMP_OVERLAY_DIR) adds four entries to the Options screen's
- * MainBox list: GzTournament, GzPrompts, GzRate and GzWide
+ * mods/menu (RECOMP_OVERLAY_DIR) adds five entries to the Options screen's
+ * MainBox list: GzTournament, GzPrompts, GzRate, GzWide and GzSpeed
  * (recomp_config/tools/make_options_items.py). The game's Options script
  * asks the highlighted entry for its name when A is pressed and does nothing
  * for a name it does not know, so the recomp acts on them here.
@@ -1179,8 +1179,9 @@ extern void sub_0009B0C0_gen(void);
 void sub_0007B5A0(void);
 void sub_00078F20(void);
 
-#define GZ_OPT_N 4
-static const char *const gz_opt_names[GZ_OPT_N] = { "GzTournament", "GzPrompts", "GzRate", "GzWide" };
+#define GZ_OPT_N 5
+static const char *const gz_opt_names[GZ_OPT_N] = { "GzTournament", "GzPrompts", "GzRate", "GzWide", "GzSpeed" };
+int gz_opt_turbo(void);
 
 static const char *gz_guest_cstr(uint32_t va)
 {
@@ -1195,8 +1196,10 @@ static void gz_opt_label(int which, char *out, size_t max)
         snprintf(out, max, "BUTTON ICONS: %s", gz_opt_ps_prompts() ? "PLAYSTATION" : "XBOX");
     else if (which == 2)
         snprintf(out, max, "FRAME RATE: %d", gz_opt_rate());
-    else
+    else if (which == 3)
         snprintf(out, max, "ASPECT: %s", gz_opt_wide() ? "16:9" : "4:3");
+    else
+        snprintf(out, max, "GAME SPEED: %s", gz_opt_turbo() ? "TURBO" : "NORMAL");
 }
 
 /* Call a guest thiscall function taking one C string; returns eax. */
@@ -1726,6 +1729,22 @@ static void gz_slow_watch(double now)
 }
 extern GZ_TLS int g_fp_top;
 
+/* Turbo (Options > Game speed): frames stay one period apart in real time,
+ * but the world -- and the fight clock, which counts frames x the period at
+ * 0x00442634 -- moves 1.2 periods per frame: the pace players liked from the
+ * old speed bug. Never in System Link, where both sides must keep the
+ * console's timing. GZ_TURBO_SCALE=<x> tries another factor. */
+static double gz_turbo_scale(void)
+{
+    static double scale;
+    if (!gz_opt_turbo() || gz_net_session()) return 1.0;
+    if (scale <= 0.0) {
+        const char *e = getenv("GZ_TURBO_SCALE");
+        scale = (e && atof(e) >= 0.5 && atof(e) <= 3.0) ? atof(e) : 1.2;
+    }
+    return scale;
+}
+
 void sub_00012240(void)
 {
     static int uncap = -1, log = -1;
@@ -1760,18 +1779,19 @@ void sub_00012240(void)
              * its call), the base period at 0x00442634 and period x frame
              * interval at 0x00400F2C (both only once a fight has set them). */
             static int logged_rate;
-            float want = 1.0f / (float)rate, v;
-            uint32_t wb, vb;
+            float want = 1.0f / (float)rate, v, wstep = want * (float)gz_turbo_scale();
+            uint32_t wb, sb, vb;
             int k;
             /* 0x00400F2C (the step) is set by the pacing below from real time */
             static const uint32_t globals[1] = { 0x00442634u };
             memcpy(&wb, &want, 4);
+            memcpy(&sb, &wstep, 4);
             GZ_MEM32(0x4323A0) = (uint32_t)rate;
-            if (ra == 0x0001D802u && g_ecx) GZ_MEM32(g_ecx + 0x44) = wb;
+            if (ra == 0x0001D802u && g_ecx) GZ_MEM32(g_ecx + 0x44) = wb;   /* the limiter's real-time period */
             for (k = 0; k < 1; k++) {
                 vb = GZ_MEM32(globals[k]);
                 memcpy(&v, &vb, 4);
-                if (v > 0.002f && v < 0.2f) GZ_MEM32(globals[k]) = wb;
+                if (v > 0.002f && v < 0.2f) GZ_MEM32(globals[k]) = sb;     /* the world's step (turbo: longer) */
             }
             if (logged_rate != rate) {
                 logged_rate = rate;
@@ -1878,7 +1898,7 @@ void sub_00012240(void)
                      * plays slower, as the console did when it dropped frames
                      * (the same PC at ~105-115 fps: 0.98x at 120, 0.85x at
                      * 144). */
-                    step = (double)period;
+                    step = (double)period * gz_turbo_scale();
                     f = (float)step;
                     memcpy(&fb, &f, 4);
                     GZ_MEM32(0x00400F2Cu) = fb;

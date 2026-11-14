@@ -1054,6 +1054,14 @@ static void gz_quick_fight_tick(void)
         if (p1 && *p1) { gz_qf_str(GZ_GAMEINFO + 0x160, p1, 0x1F); gz_qf_str(GZ_GAMEINFO + 0x17F, p1, 0x1F); }
         if (p2 && *p2) { gz_qf_str(GZ_GAMEINFO + 0x238, p2, 0x1F); gz_qf_str(GZ_GAMEINFO + 0x257, p2, 0x1F); }
         if (city && *city) gz_qf_str(GZ_GAMEINFO + 0xD0, city, 0x40);
+        {
+            /* GZ_QF_ROUND_TIME=<seconds>, GZ_QF_ROUNDS=<n>: a short match (for
+             * testing what follows one, like the results screen). ShellGameInfo
+             * get/setRoundTime is the float at +0x120, get/setRounds +0x128. */
+            const char *rt = getenv("GZ_QF_ROUND_TIME"), *rn = getenv("GZ_QF_ROUNDS");
+            if (rt && *rt) { float t = (float)atof(rt); uint32_t b; memcpy(&b, &t, 4); GZ_MEM32(GZ_GAMEINFO + 0x120) = b; }
+            if (rn && *rn) GZ_MEM32(GZ_GAMEINFO + 0x128) = (uint32_t)atoi(rn);
+        }
         fprintf(stderr, "[QUICKFIGHT] launching %s vs %s in %s\n",
                 (const char *)(gi + 0x160), (const char *)(gi + 0x238), (const char *)(gi + 0xD0));
         g_esp -= 4; GZ_MEM32(g_esp) = 0x00012240u;             /* return address */

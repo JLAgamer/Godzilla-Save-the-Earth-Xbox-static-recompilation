@@ -106,6 +106,18 @@ static float wide_anchor(float mn, float mx, float ymn, float ymx, float w, floa
     }
     return w * 0.5f;
 }
+/* No picture on a draw, for the full-width exception below. batch.texture is
+ * whatever is bound on stage 0, sampled or not; once the title has set up the
+ * register combiners, textures[] holds only the stages its program reads. The
+ * round-end overlay (the dimmed "DRAW" / "PLAYER 1 WINS" screen) is such a
+ * quad with a stale stage-0 binding, and was squeezed to the 4:3 middle. */
+static int wide_untextured(const Nv2aBatch *b)
+{
+    int st;
+    if (!b->combiner) return !b->texture && !b->textures[0];
+    for (st = 0; st < 4; st++) if (b->textures[st]) return 0;
+    return 1;
+}
 #define WIDE_SURF(w, h) (s_wide && (w) == 640u && (h) == 480u)
 #define PX_W(w, h) (WIDE_SURF(w, h) ? ((w) * (UINT)s_scale * 4u + 2u) / 3u : (w) * (UINT)s_scale)
 
@@ -2184,7 +2196,7 @@ static void be_draw(const Nv2aSurface *s, const Nv2aBatch *b)
                 if (verts[k].y > ymx) ymx = verts[k].y;
                 if (verts[k].rhw < 0.99999f || verts[k].rhw > 1.00001f) flat = 0;
             }
-            if (flat && count <= 6 && !b->texture && !b->textures[0] && mn <= 2.0f && mx >= (float)r->w - 2.0f)
+            if (flat && count <= 6 && wide_untextured(b) && mn <= 2.0f && mx >= (float)r->w - 2.0f)
                 s_draw_squeeze = 0.0f;
             else if (flat)
             {
@@ -2884,7 +2896,7 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
                 if (o.pos[1] > ymx) ymx = o.pos[1];
                 if (o.pos[3] < 0.99999f || o.pos[3] > 1.00001f) flat = 0;
             }
-            if (flat && p->nverts <= 6 && !b->texture && !b->textures[0] && mn <= 2.0f && mx >= (float)r->w - 2.0f)
+            if (flat && p->nverts <= 6 && wide_untextured(b) && mn <= 2.0f && mx >= (float)r->w - 2.0f)
                 s_draw_squeeze = 0.0f;
             else if (flat)
             {

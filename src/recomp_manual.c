@@ -2004,7 +2004,7 @@ extern GZ_TLS int g_fp_top;
 static double gz_turbo_scale(void)
 {
     static double scale;
-    if (!gz_opt_turbo() || gz_net_session() || gz_rb_active()) return 1.0;
+    if (!gz_opt_turbo() || gz_net_session() || gz_rb_deterministic()) return 1.0;  /* never in netplay */
     if (scale <= 0.0) {
         const char *e = getenv("GZ_TURBO_SCALE");
         scale = (e && atof(e) >= 0.5 && atof(e) <= 3.0) ? atof(e) : 1.2;

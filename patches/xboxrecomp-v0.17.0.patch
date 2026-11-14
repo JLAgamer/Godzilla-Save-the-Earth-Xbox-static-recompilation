@@ -1,8 +1,21 @@
 diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
-index a6a3657..eac015c 100644
+index a6a3657..c9f4bcc 100644
 --- a/src/apu/apu_core.c
 +++ b/src/apu/apu_core.c
-@@ -139,6 +139,49 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
+@@ -49,6 +49,12 @@ uint64_t g_dbg_muted_voices[4] = { 0 };
+ /* Global audio mute — disables all AWD/mixer sound playback */
+ volatile int g_audio_muted = 0;  /* 0 = audio enabled */
+ 
++/* A game's rollback (xbox_ApuCatchUp): frames to render at once, without the
++ * device hearing them, and how many frames have been rendered in all. */
++static volatile long g_apu_ff;
++static volatile long long g_apu_frames;
++static volatile int g_apu_ff_now;       /* the frame in hand is a catch-up one */
++
+ /* ============================================================
+  * Debug frame markers (minimal stubs)
+  * ============================================================ */
+@@ -139,6 +145,49 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
   * where the host mapped RAM) or "wrap" (above the mapping, folded into the
   * low 64 MB). A voice reading noise from "wrap" or "hiwin" is the address
   * resolution, not the decoder. */
@@ -52,7 +65,46 @@ index a6a3657..eac015c 100644
  const char *mcpx_apu_phys_class(uint64_t addr)
  {
      uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
-@@ -1501,6 +1544,29 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
+@@ -909,6 +958,10 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
+         mix_into(period, (const int16_t (*)[2])extra, MIXER_FRAME_SAMPLES);
+     }
+ 
++    /* A catch-up period (xbox_ApuCatchUp) was heard the first time. */
++    if (g_apu_ff_now)
++        return;
++
+     /* A period dropped while pacing is stalled never reaches the device,
+      * so it stays out of the dump too. */
+     if (!(xa2_is_active() && d->pace_stalled))
+@@ -1186,7 +1239,10 @@ static void *mcpx_apu_frame_thread(void *arg)
+         /* Always run the audio output loop — the software mixer and test tone
+          * need continuous frame delivery regardless of APU register state.
+          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
+-        throttle(d);
++        int ff = g_apu_ff > 0;
++        g_apu_ff_now = ff;
++        if (!ff)
++            throttle(d);
+         int div0 = d->ep_frame_div;
+ 
+         /* The doorbell ack stands in for the GP DSP, which on hardware runs
+@@ -1230,8 +1286,13 @@ static void *mcpx_apu_frame_thread(void *arg)
+             d->ep_frame_div++;
+         }
+ 
+-        if (div0 % 8 == 0 && d->ep_frame_div != div0)
+-            mcpx_apu_pace_rendered(d);
++        if (d->ep_frame_div != div0) {
++            g_apu_frames++;
++            if (ff)
++                g_apu_ff--;     /* off the clock: those were paced the first time */
++            else if (div0 % 8 == 0)
++                mcpx_apu_pace_rendered(d);
++        }
+ 
+         /* The SSL tick: the sequencer's periodic sample-limit interrupt.
+          *
+@@ -1501,6 +1562,29 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
  void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)
  {
      if (!d) return;
@@ -82,7 +134,7 @@ index a6a3657..eac015c 100644
      mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
  }
  
-@@ -1746,3 +1812,101 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
+@@ -1746,3 +1830,134 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
      }
      LeaveCriticalSection(&g_mixer_cs);
  }
@@ -126,6 +178,39 @@ index a6a3657..eac015c 100644
 +{
 +    if (g_state)
 +        qemu_mutex_unlock(&g_state->lock);
++}
++
++/* Frames rendered since boot (32 samples each). */
++unsigned long long xbox_ApuFrames(void)
++{
++    return (unsigned long long)g_apu_frames;
++}
++
++/* A game that went back in time and played some ticks again (rollback) has
++ * put the sound chip back as well: its voices are behind where they were by
++ * the frames rendered since. This renders `frames` of them now, as fast as
++ * the frame thread can and without the device (the device played them the
++ * first time), and waits up to timeout_ms. Returns the frames not done. */
++unsigned xbox_ApuCatchUp(unsigned frames, unsigned timeout_ms)
++{
++    MCPXAPUState *d = g_state;
++    int64_t t0;
++    long left;
++    if (!d || !frames)
++        return 0;
++    qemu_mutex_lock(&d->lock);
++    g_apu_ff = (long)frames;
++    qemu_cond_broadcast(&d->cond);
++    qemu_mutex_unlock(&d->lock);
++    t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++    while (g_apu_ff > 0 &&
++           qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0 < (int64_t)timeout_ms * 1000)
++        SwitchToThread();
++    qemu_mutex_lock(&d->lock);
++    left = g_apu_ff > 0 ? g_apu_ff : 0;
++    g_apu_ff = 0;
++    qemu_mutex_unlock(&d->lock);
++    return (unsigned)left;
 +}
 +
 +size_t xbox_ApuStateSize(void)
@@ -680,19 +765,28 @@ index e725646..b7d41e0 100644
      if (FAILED(hr)) {
          fprintf(stderr, "[XA2] Start failed: 0x%08lX\n", hr);
 diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
-index 2991d89..9e28cae 100644
+index 2991d89..af2c731 100644
 --- a/src/kernel/kernel_file.c
 +++ b/src/kernel/kernel_file.c
-@@ -263,6 +263,8 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
+@@ -263,6 +263,9 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
      return xbox_translate_path(xbox_path, win_path, buf_size);
  }
  
-+static void ft_add(HANDLE h);               /* open files, for a game's rollback (below) */
++static void ft_add(HANDLE h, int ro);       /* open files, for a game's rollback (below) */
++void (*xbox_file_conflict_hook)(void);      /* a game's rollback: files it holds open (kernel_bridge.c) */
 +
  NTSTATUS __stdcall xbox_NtCreateFile(
      PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
      PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
-@@ -326,7 +328,14 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+@@ -271,6 +274,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+ {
+     WCHAR win_path[MAX_PATH];
+     HANDLE h;
++    int ro_open = 0;                        /* opened for reading only (ft_add) */
+     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
+     (void)AllocationSize;
+ 
+@@ -326,7 +330,14 @@ NTSTATUS __stdcall xbox_NtCreateFile(
          if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
              flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
          DWORD access = xbox_access_to_win32(DesiredAccess);
@@ -707,7 +801,7 @@ index 2991d89..9e28cae 100644
          /* An overwrite of an existing non-empty file is deferred (see
           * s_overwrite_pending). It needs write access to settle later. */
          int defer = disposition_overwrites(CreateDisposition)
-@@ -336,7 +345,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+@@ -336,7 +347,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
                   && (fad.nFileSizeHigh || fad.nFileSizeLow);
          h = INVALID_HANDLE_VALUE;
          if (defer) {
@@ -716,7 +810,7 @@ index 2991d89..9e28cae 100644
                  NULL, OPEN_EXISTING, flags_and_attrs, NULL);
              if (h != INVALID_HANDLE_VALUE)
                  overwrite_take(h);          /* a stale mark; see below */
-@@ -347,7 +356,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+@@ -347,7 +358,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
          }
          if (h == INVALID_HANDLE_VALUE) {    /* not deferred, or it vanished */
              h = CreateFileW(win_path, access,
@@ -725,15 +819,34 @@ index 2991d89..9e28cae 100644
                  xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
              /* A HANDLE value is reused once closed, and a pending handle
               * closed by DuplicateHandle(DUPLICATE_CLOSE_SOURCE) never went
-@@ -388,6 +397,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+@@ -355,7 +366,18 @@ NTSTATUS __stdcall xbox_NtCreateFile(
+              * Clear it, or this unrelated file is truncated on first use. */
+             if (h != INVALID_HANDLE_VALUE)
+                 overwrite_take(h);
++            /* refused because a close the game made is being held back (a
++             * game's rollback, xbox_SetCloseDefer): let those go and try again */
++            if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION
++                    && xbox_file_conflict_hook) {
++                xbox_file_conflict_hook();
++                h = CreateFileW(win_path, access, share, NULL,
++                    xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
++                if (h != INVALID_HANDLE_VALUE)
++                    overwrite_take(h);
++            }
+         }
++        ro_open = !(access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE));
+     }
+ 
+     if (h == INVALID_HANDLE_VALUE) {
+@@ -388,6 +410,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
      }
  
      *FileHandle = h;
-+    ft_add(h);                              /* xbox_FilePositions */
++    ft_add(h, ro_open);                     /* xbox_FilePositions */
      if (IoStatusBlock) {
          IoStatusBlock->Status = STATUS_SUCCESS;
          IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
-@@ -404,10 +414,24 @@ NTSTATUS __stdcall xbox_NtReadFile(
+@@ -404,10 +427,24 @@ NTSTATUS __stdcall xbox_NtReadFile(
      DWORD bytes_read = 0;
      BOOL result;
      OVERLAPPED ov;
@@ -758,7 +871,7 @@ index 2991d89..9e28cae 100644
  
      overwrite_settle(FileHandle);
      if (ByteOffset && ByteOffset->QuadPart >= 0) {
-@@ -418,6 +442,8 @@ NTSTATUS __stdcall xbox_NtReadFile(
+@@ -418,6 +455,8 @@ NTSTATUS __stdcall xbox_NtReadFile(
      } else {
          result = ReadFile(FileHandle, Buffer, Length, &bytes_read, NULL);
      }
@@ -767,7 +880,7 @@ index 2991d89..9e28cae 100644
  
      if (result || GetLastError() == ERROR_HANDLE_EOF) {
          IoStatusBlock->Information = bytes_read;
-@@ -474,10 +500,68 @@ NTSTATUS __stdcall xbox_NtWriteFile(
+@@ -474,10 +513,79 @@ NTSTATUS __stdcall xbox_NtWriteFile(
      return STATUS_UNSUCCESSFUL;
  }
  
@@ -781,13 +894,14 @@ index 2991d89..9e28cae 100644
 + * here are listed, and their positions can be read and set. */
 +#define FT_MAX 128
 +static HANDLE  s_ft[FT_MAX];
++static uint8_t s_ft_ro[FT_MAX];             /* opened for reading only */
 +static SRWLOCK s_ft_lock = SRWLOCK_INIT;
 +
-+static void ft_add(HANDLE h)
++static void ft_add(HANDLE h, int ro)
 +{
 +    int k;
 +    AcquireSRWLockExclusive(&s_ft_lock);
-+    for (k = 0; k < FT_MAX; k++) if (!s_ft[k]) { s_ft[k] = h; break; }
++    for (k = 0; k < FT_MAX; k++) if (!s_ft[k]) { s_ft[k] = h; s_ft_ro[k] = (uint8_t)(ro != 0); break; }
 +    ReleaseSRWLockExclusive(&s_ft_lock);
 +}
 +
@@ -816,6 +930,16 @@ index 2991d89..9e28cae 100644
 +    return n;
 +}
 +
++/* 0: not an open file here; 1: open; 2: open for reading only. */
++int xbox_FileIsOpen(void *h)
++{
++    int k, r = 0;
++    AcquireSRWLockShared(&s_ft_lock);
++    for (k = 0; k < FT_MAX; k++) if (s_ft[k] == (HANDLE)h) { r = s_ft_ro[k] ? 2 : 1; break; }
++    ReleaseSRWLockShared(&s_ft_lock);
++    return r;
++}
++
 +/* Put an open file's position back (nothing if it has been closed since). */
 +void xbox_FileSetPosition(void *h, int64_t pos)
 +{
@@ -836,7 +960,7 @@ index 2991d89..9e28cae 100644
          overwrite_settle(Handle);
          xbox_dir_context_drop(Handle);
          CloseHandle(Handle);
-@@ -877,7 +961,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+@@ -877,7 +985,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
          WCHAR* clean_path = dir_path;
          if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
              clean_path += 4;
@@ -849,7 +973,7 @@ index 2991d89..9e28cae 100644
              WCHAR pattern_wide[MAX_PATH];
              MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
                                  pattern_wide, MAX_PATH);
-@@ -888,6 +976,9 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+@@ -888,6 +1000,9 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
          }
          ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
          if (ctx->find_handle == INVALID_HANDLE_VALUE) {
@@ -2055,7 +2179,7 @@ index 5fab4c3..3f83d87 100644
      if (*slot) {
          s_seen[*slot - 1].count++;
 diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
-index c7fd25d..3473f97 100644
+index c7fd25d..2017e7f 100644
 --- a/src/kernel/nv2a_vsh_interp.c
 +++ b/src/kernel/nv2a_vsh_interp.c
 @@ -43,6 +43,8 @@ static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
@@ -2123,7 +2247,7 @@ index c7fd25d..3473f97 100644
              } else if (d->oaddr == 0) {
                  write_masked(regs[12].v, src, d->omask);
              } else if (d->oaddr < 13) {
-@@ -707,3 +718,58 @@ static int vsh_run_fields(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out
+@@ -707,3 +718,90 @@ static int vsh_run_fields(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out
      }
      return 0;
  }
@@ -2182,8 +2306,40 @@ index c7fd25d..3473f97 100644
 +    *rev = s_const_revision;
 +    return (const float (*)[4])s_const;
 +}
++
++/* ---- a game's rollback (xbox_Nv2aStateSave in nv2a_pb_exec.c) ----------- */
++
++typedef struct {
++    uint32_t program[NV2A_VSH_SLOTS][4];
++    float    cnst[NV2A_VSH_CONSTANTS][4];
++    uint32_t load_slot, load_word, start_slot, const_load, const_word, cxt_write;
++} VshSnapshot;
++
++size_t nv2a_vsh_state_size(void) { return sizeof(VshSnapshot); }
++
++void nv2a_vsh_state_save(void *buf)
++{
++    VshSnapshot *s = (VshSnapshot *)buf;
++    memcpy(s->program, s_program, sizeof s_program);
++    memcpy(s->cnst, s_const, sizeof s_const);
++    s->load_slot = s_load_slot; s->load_word = s_load_word; s->start_slot = s_start_slot;
++    s->const_load = s_const_load; s->const_word = s_const_word; s->cxt_write = s_cxt_write;
++}
++
++/* The revisions move on rather than go back, so every decoded or exported
++ * copy of the program and constants is made again. */
++void nv2a_vsh_state_load(const void *buf)
++{
++    const VshSnapshot *s = (const VshSnapshot *)buf;
++    memcpy(s_program, s->program, sizeof s_program);
++    memcpy(s_const, s->cnst, sizeof s_const);
++    s_load_slot = s->load_slot; s_load_word = s->load_word; s_start_slot = s->start_slot;
++    s_const_load = s->const_load; s_const_word = s->const_word; s_cxt_write = s->cxt_write;
++    s_program_revision++;
++    s_const_revision++;
++}
 diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
-index 8acb0af..166dcc7 100644
+index 8acb0af..830d198 100644
 --- a/src/kernel/nv2a_vsh_interp.h
 +++ b/src/kernel/nv2a_vsh_interp.h
 @@ -35,6 +35,7 @@ typedef struct {
@@ -2194,7 +2350,7 @@ index 8acb0af..166dcc7 100644
  } Nv2aVshOutput;
  
  void nv2a_vsh_set_load_slot(uint32_t slot);           /* _PROGRAM_LOAD      */
-@@ -58,4 +59,11 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
+@@ -58,4 +59,16 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
  void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
  void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
  
@@ -2204,6 +2360,11 @@ index 8acb0af..166dcc7 100644
 + * program cannot run there (none loaded, or it writes c[] per vertex). */
 +int nv2a_vsh_export_program(uint32_t out[][8], uint32_t *ninstr, uint32_t *rev);
 +const float (*nv2a_vsh_export_constants(uint32_t *rev))[4];
++
++/* A game's rollback: program memory, constants and the upload cursors. */
++size_t nv2a_vsh_state_size(void);
++void   nv2a_vsh_state_save(void *buf);
++void   nv2a_vsh_state_load(const void *buf);
 +
  #endif
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
@@ -2866,240 +3027,7 @@ index 260fa3f..e09672d 100644
  /* The POSIX SDL presenter owns event pumping while its main-thread window is
   * active, and keeps SDL alive at shutdown while controller handles are open. */
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 9476517..0faa251 100644
---- a/src/kernel/kernel_bridge.c
-+++ b/src/kernel/kernel_bridge.c
-@@ -1476,6 +1476,22 @@ static void bridge_NtQueryVirtualMemory(void)
- /* True when va lies inside a heap block but not at its start; left is
-  * xbox_HeapBlockSize(va). The byte before an interior address is in the same
-  * block, one byte further from its end. NT refuses a release there. */
-+/* A title can make heap pages read-only (NtProtectVirtualMemory) and then
-+ * free them. On the console the freed range is gone and the next allocation
-+ * there gets fresh read/write pages; here the block goes back to the heap with
-+ * its old protection, and the next owner faulted zero-filling it. (Godzilla:
-+ * Save the Earth, loading the main menu script after a game-cache miss.) So
-+ * pages that are freed or decommitted are made read/write again, once a title
-+ * has protected anything. */
-+static volatile LONG s_guest_pages_protected;
-+static void bridge_pages_writable(uint32_t va, uint32_t size)
-+{
-+    DWORD old;
-+    if (!s_guest_pages_protected || !size)
-+        return;
-+    VirtualProtect(XBOX_TO_NATIVE(va & ~0xFFFu), (SIZE_T)size + (va & 0xFFFu), PAGE_READWRITE, &old);
-+}
-+
- static int bridge_heap_interior(uint32_t va, uint32_t left)
- {
-     return left && va && xbox_HeapBlockSize(va - 1) == left + 1;
-@@ -1536,6 +1552,7 @@ static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
-             return;
-         }
-         size = left;
-+        bridge_pages_writable(page_base, size);
-         xbox_HeapFree(page_base);          /* ignores what it never handed out */
-         releases++;
-     } else {
-@@ -1549,6 +1566,7 @@ static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
-         if (left && end - page_base > left)
-             end = page_base + left;
-         size = end - page_base;
-+        bridge_pages_writable(page_base, size);
-         if (size)
-             memset(XBOX_TO_NATIVE(page_base), 0, size);
-         decommits++;
-@@ -1607,6 +1625,7 @@ static void bridge_NtFreeVirtualMemory(void)
-                     g_eax = BRIDGE_FREE_VM_NOT_AT_BASE;
-                     return;
-                 }
-+                bridge_pages_writable(vm_base, left);
-                 xbox_HeapFree(vm_base);
-                 /* NT writes back what it released: the base and the size. */
-                 BRIDGE_MEM32(size_ptr) = left;
-@@ -1625,6 +1644,7 @@ static void bridge_NtFreeVirtualMemory(void)
-                     end = (uint64_t)vm_base + left;
-                 if (xbox_HeapBlockSize(page_base) != left + (vm_base - page_base))
-                     page_base = vm_base;
-+                bridge_pages_writable(page_base, (uint32_t)(end - page_base));
-                 memset(XBOX_TO_NATIVE(page_base), 0, (size_t)(end - page_base));
-                 BRIDGE_MEM32(base_ptr) = page_base;
-                 BRIDGE_MEM32(size_ptr) = (uint32_t)(end - page_base);
-@@ -9000,6 +9020,8 @@ static void bridge_NtProtectVirtualMemory(void)
-     DWORD old = 0;
- 
-     if (VirtualProtect(XBOX_TO_NATIVE(base_va), size, (DWORD)new_prot, &old)) {
-+        if ((new_prot & 0xFFu) != 0x04u && (new_prot & 0xFFu) != 0x40u)
-+            InterlockedExchange(&s_guest_pages_protected, 1);
-         if (old_ptr)
-             BRIDGE_MEM32(old_ptr) = (uint32_t)old;
-         g_eax = 0;  /* STATUS_SUCCESS */
-diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
-index 45d548c..0beb45c 100644
---- a/src/kernel/kernel_hal.c
-+++ b/src/kernel/kernel_hal.c
-@@ -1048,6 +1048,11 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
- 
- volatile ULONG xbox_KeTickCount = 0;
- 
-+int xbox_VirtualTimeHere(void);             /* the virtual clock, below */
-+uint64_t xbox_VirtualSystemTime(void);
-+static uint64_t vtsc_read(void);
-+static uint64_t vtsc_in(uint64_t tsc, uint64_t hz);
-+
- /* Call this periodically or on-demand to update KeTickCount */
- static void xbox_update_tick_count(void)
- {
-@@ -1064,6 +1069,12 @@ static void xbox_update_tick_count(void)
- LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
- {
-     LARGE_INTEGER counter;
-+    if (xbox_VirtualTimeHere()) {           /* the virtual clock (see there) */
-+        LARGE_INTEGER f;
-+        QueryPerformanceFrequency(&f);
-+        counter.QuadPart = (LONGLONG)vtsc_in(vtsc_read(), (uint64_t)f.QuadPart);
-+        return counter;
-+    }
-     QueryPerformanceCounter(&counter);
-     return counter;
- }
-@@ -1125,6 +1136,10 @@ VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
- 
-     if (!CurrentTime)
-         return;
-+    if (xbox_VirtualTimeHere()) {           /* the virtual clock (see there) */
-+        CurrentTime->QuadPart = (LONGLONG)xbox_VirtualSystemTime();
-+        return;
-+    }
- 
-     InitOnceExecuteOnce(&s_time_once, anchor_system_time, NULL, NULL);
-     QueryPerformanceCounter(&now);
-@@ -1774,12 +1789,74 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
-  * ========================================================================= */
- #define XBOX_TSC_HZ 733333333ull
- 
-+/* A virtual clock for one thread (a game's rollback / netplay code): while
-+ * set, that thread's reads return the given value, a microsecond further on
-+ * each read, instead of real time - so the same code run twice sees the same
-+ * clock. With lockstep workers on (kernel_bridge.c), the workers share it:
-+ * they run only in turns the main thread grants, so one counter stays
-+ * deterministic. Every clock a guest thread can read follows it then: the
-+ * time stamp counter, the performance counter, the system and interrupt
-+ * times. Device-model and timer threads keep real time. */
-+static volatile LONG g_vtsc_thread;         /* thread id, 0 = off */
-+static uint64_t g_vtsc;
-+int xbox_LockstepGuestThread(void);         /* kernel_bridge.c */
-+
-+/* This thread reads the virtual clock. */
-+int xbox_VirtualTimeHere(void)
-+{
-+    if (!g_vtsc_thread)
-+        return 0;
-+    return (DWORD)g_vtsc_thread == GetCurrentThreadId() || xbox_LockstepGuestThread();
-+}
-+
-+/* The virtual clock, a microsecond further on (a reader that waits for time
-+ * to pass by polling still sees it pass). */
-+static uint64_t vtsc_read(void)
-+{
-+    return g_vtsc += 733333333ull / 1000000ull;
-+}
-+
-+/* The virtual clock in other units: ticks of `hz`, whole seconds and the
-+ * remainder scaled apart so nothing overflows. */
-+static uint64_t vtsc_in(uint64_t tsc, uint64_t hz)
-+{
-+    return (tsc / 733333333ull) * hz + (tsc % 733333333ull) * hz / 733333333ull;
-+}
-+
-+/* 100 ns units since boot (KeInterruptTime), on the virtual clock. */
-+uint64_t xbox_VirtualTime100ns(void)
-+{
-+    return vtsc_in(vtsc_read(), 10000000ull);
-+}
-+
-+/* The system time on the virtual clock: a fixed date (2004-01-01) plus the
-+ * clock, so two machines read the same. */
-+#define VTIME_BASE_100NS 127174464000000000ull
-+uint64_t xbox_VirtualSystemTime(void)
-+{
-+    return VTIME_BASE_100NS + vtsc_in(vtsc_read(), 10000000ull);
-+}
-+
-+void xbox_VirtualTscSet(uint64_t value)
-+{
-+    g_vtsc = value;
-+    InterlockedExchange(&g_vtsc_thread, (LONG)GetCurrentThreadId());
-+}
-+
-+void xbox_VirtualTscOff(void)
-+{
-+    InterlockedExchange(&g_vtsc_thread, 0);
-+}
-+
- uint64_t xbox_ReadTimeStampCounter(void)
- {
-     static LARGE_INTEGER freq;
-     static LARGE_INTEGER origin;
-     LARGE_INTEGER now;
- 
-+    if (xbox_VirtualTimeHere())
-+        return vtsc_read();
-+
-     if (freq.QuadPart == 0) {
-         QueryPerformanceFrequency(&freq);
-         QueryPerformanceCounter(&origin);
-@@ -1934,3 +2011,11 @@ void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
-         break;
-     }
- }
-+
-+/* For a stall report (the rollback's watchdog). */
-+void xbox_IrqDump(void)
-+{
-+    fprintf(stderr, "  [IRQ] pending lines 0x%lX, gate held by tid %ld\n",
-+            (long)s_irq_pending, (long)s_gate_owner);
-+    fflush(stderr);
-+}
-diff --git a/src/usb/ohci.c b/src/usb/ohci.c
-index 5462e9a..27ff6ab 100644
---- a/src/usb/ohci.c
-+++ b/src/usb/ohci.c
-@@ -1053,6 +1053,21 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
-  * the interrupt it has been waiting for. Repeat delivery and the transfer
-  * lists come after that answer, not before it.
-  */
-+/* Snapshot support (a game's rollback code): while paused the controller
-+ * thread delivers nothing and touches no guest memory, so the driver's
-+ * transfer queues in guest RAM and this model cannot drift apart when the
-+ * game puts its memory back in time. xbox_OhciPause(1) returns once the
-+ * thread is parked between passes (no interrupt handler in flight). */
-+static volatile LONG s_pause_req, s_parked;
-+
-+void xbox_OhciPause(int on)
-+{
-+    DWORD t0 = GetTickCount();
-+    InterlockedExchange(&s_pause_req, on ? 1 : 0);
-+    while (on && s_enabled && !InterlockedCompareExchange(&s_parked, 0, 0) && GetTickCount() - t0 < 500)
-+        Sleep(1);
-+}
-+
- static DWORD WINAPI ohci_thread(LPVOID unused)
- {
-     /* This thread calls recompiled code, so it needs what any thread running
-@@ -1090,6 +1105,11 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
-         uint32_t pass_done = 0;     /* this pass's done queue, newest first */
- 
-         Sleep(OHCI_TICK_MS);
-+        if (InterlockedCompareExchange(&s_pause_req, 0, 0)) {
-+            InterlockedExchange(&s_parked, 1);
-+            continue;
-+        }
-+        InterlockedExchange(&s_parked, 0);
-         control = hc->reg[HcControl / 4];
-         enable  = hc->reg[HcInterruptEnable / 4];
- 
-diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 9476517..d2b6ba7 100644
+index 9476517..3bb50d5 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -690,6 +690,323 @@ static uint32_t thobj_current(void)
@@ -3450,7 +3378,110 @@ index 9476517..d2b6ba7 100644
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-@@ -2034,6 +2358,47 @@ static void bridge_KeSetEvent(void)
+@@ -976,6 +1300,18 @@ static int  bridge_handle_is_async(uint32_t token);
+ static void   bridge_write_handle(uint32_t handle_va, HANDLE h);
+ static HANDLE bridge_take_handle(uint32_t token);
+ 
++/* A game's rollback (xbox_SetCloseDefer): a file the guest closes may have
++ * to be open again if the game goes back past the close, so the close can be
++ * held back. The hook returns nonzero to keep the file and its token as they
++ * are; the game closes it later with xbox_CloseToken. Only files opened for
++ * reading (what a replay reads again; written files do not go back in time),
++ * and an open the held file refuses lets them go (xbox_file_conflict_hook). */
++static int (*s_close_defer)(uint32_t token, void *h);
++int xbox_FileIsOpen(void *h);                     /* kernel_file.c */
++static HANDLE bridge_resolve_handle(uint32_t token);
++void xbox_SetCloseDefer(int (*fn)(uint32_t token, void *h)) { s_close_defer = fn; }
++void xbox_CloseToken(uint32_t raw_handle);
++
+ static void bridge_NtClose(void)
+ {
+     uint32_t raw_handle = STACK_ARG(0);
+@@ -984,7 +1320,20 @@ static void bridge_NtClose(void)
+         fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
+         fflush(stderr);
+     }
++    if (s_close_defer && (raw_handle & 0xFF000000u) == 0x48000000u) {
++        HANDLE h = bridge_resolve_handle(raw_handle);
++        if (h && h != INVALID_HANDLE_VALUE && xbox_FileIsOpen(h) == 2 && s_close_defer(raw_handle, h)) {
++            g_eax = 0;
++            return;
++        }
++    }
++    xbox_CloseToken(raw_handle);
++    g_eax = 0; /* STATUS_SUCCESS */
++}
+ 
++/* NtClose's work, for a token (a held-back close, see above). */
++void xbox_CloseToken(uint32_t raw_handle)
++{
+     bridge_forget_async_handle(raw_handle);
+     thobj_detach_token(raw_handle);
+ 
+@@ -994,7 +1343,6 @@ static void bridge_NtClose(void)
+         if (h && h != INVALID_HANDLE_VALUE)
+             xbox_NtClose(h);   /* settles a pending overwrite; drops a dir context */
+     }
+-    g_eax = 0; /* STATUS_SUCCESS */
+ }
+ 
+ /* ── MmAllocateContiguousMemory (ordinal 165) ─────────────
+@@ -1476,6 +1824,22 @@ static void bridge_NtQueryVirtualMemory(void)
+ /* True when va lies inside a heap block but not at its start; left is
+  * xbox_HeapBlockSize(va). The byte before an interior address is in the same
+  * block, one byte further from its end. NT refuses a release there. */
++/* A title can make heap pages read-only (NtProtectVirtualMemory) and then
++ * free them. On the console the freed range is gone and the next allocation
++ * there gets fresh read/write pages; here the block goes back to the heap with
++ * its old protection, and the next owner faulted zero-filling it. (Godzilla:
++ * Save the Earth, loading the main menu script after a game-cache miss.) So
++ * pages that are freed or decommitted are made read/write again, once a title
++ * has protected anything. */
++static volatile LONG s_guest_pages_protected;
++static void bridge_pages_writable(uint32_t va, uint32_t size)
++{
++    DWORD old;
++    if (!s_guest_pages_protected || !size)
++        return;
++    VirtualProtect(XBOX_TO_NATIVE(va & ~0xFFFu), (SIZE_T)size + (va & 0xFFFu), PAGE_READWRITE, &old);
++}
++
+ static int bridge_heap_interior(uint32_t va, uint32_t left)
+ {
+     return left && va && xbox_HeapBlockSize(va - 1) == left + 1;
+@@ -1536,6 +1900,7 @@ static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
+             return;
+         }
+         size = left;
++        bridge_pages_writable(page_base, size);
+         xbox_HeapFree(page_base);          /* ignores what it never handed out */
+         releases++;
+     } else {
+@@ -1549,6 +1914,7 @@ static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
+         if (left && end - page_base > left)
+             end = page_base + left;
+         size = end - page_base;
++        bridge_pages_writable(page_base, size);
+         if (size)
+             memset(XBOX_TO_NATIVE(page_base), 0, size);
+         decommits++;
+@@ -1607,6 +1973,7 @@ static void bridge_NtFreeVirtualMemory(void)
+                     g_eax = BRIDGE_FREE_VM_NOT_AT_BASE;
+                     return;
+                 }
++                bridge_pages_writable(vm_base, left);
+                 xbox_HeapFree(vm_base);
+                 /* NT writes back what it released: the base and the size. */
+                 BRIDGE_MEM32(size_ptr) = left;
+@@ -1625,6 +1992,7 @@ static void bridge_NtFreeVirtualMemory(void)
+                     end = (uint64_t)vm_base + left;
+                 if (xbox_HeapBlockSize(page_base) != left + (vm_base - page_base))
+                     page_base = vm_base;
++                bridge_pages_writable(page_base, (uint32_t)(end - page_base));
+                 memset(XBOX_TO_NATIVE(page_base), 0, (size_t)(end - page_base));
+                 BRIDGE_MEM32(base_ptr) = page_base;
+                 BRIDGE_MEM32(size_ptr) = (uint32_t)(end - page_base);
+@@ -2034,6 +2402,47 @@ static void bridge_KeSetEvent(void)
          g_eax = 0;
  }
  
@@ -3498,7 +3529,7 @@ index 9476517..d2b6ba7 100644
  /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
  static void bridge_KeWaitForSingleObject(void)
  {
-@@ -2050,9 +2415,14 @@ static void bridge_KeWaitForSingleObject(void)
+@@ -2050,9 +2459,14 @@ static void bridge_KeWaitForSingleObject(void)
          int type;
          HANDLE ge = ke_guest_event_prepare(object, &type);
          if (ge) {
@@ -3516,7 +3547,7 @@ index 9476517..d2b6ba7 100644
              if (g_eax == 0 && type == 1)               /* synchronization: consumed */
                  BRIDGE_MEM32(object + 4) = 0;
              return;
-@@ -2065,6 +2435,14 @@ static void bridge_KeWaitForSingleObject(void)
+@@ -2065,6 +2479,14 @@ static void bridge_KeWaitForSingleObject(void)
      if (!h)
          h = XBOX_TO_NATIVE(object);
  
@@ -3531,7 +3562,7 @@ index 9476517..d2b6ba7 100644
      g_eax = (uint32_t)xbox_KeWaitForSingleObject(
          h, wait_reason, wait_mode,
          (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
-@@ -2085,6 +2463,14 @@ static void bridge_NtWaitForSingleObject(void)
+@@ -2085,6 +2507,14 @@ static void bridge_NtWaitForSingleObject(void)
  
      if (bridge_run_io_apcs(alertable, 1))
          return;
@@ -3546,7 +3577,7 @@ index 9476517..d2b6ba7 100644
      g_eax = (uint32_t)xbox_NtWaitForSingleObject(
          handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
  }
-@@ -2149,6 +2535,14 @@ static void bridge_NtWaitForSingleObjectEx(void)
+@@ -2149,6 +2579,14 @@ static void bridge_NtWaitForSingleObjectEx(void)
  
      if (bridge_run_io_apcs(alertable, wait_mode))
          return;
@@ -3561,7 +3592,7 @@ index 9476517..d2b6ba7 100644
      g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
          handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
          XBOX_TO_NATIVE(timeout_ptr));
-@@ -2222,6 +2616,14 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
+@@ -2222,6 +2660,14 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
  
      if (bridge_run_io_apcs(alertable, wait_mode))
          return;
@@ -3576,7 +3607,7 @@ index 9476517..d2b6ba7 100644
      g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
          count, handles, wait_type, (BOOLEAN)alertable,
          XBOX_TO_NATIVE(timeout_ptr));
-@@ -2332,6 +2734,14 @@ static void bridge_KeDelayExecutionThread(void)
+@@ -2332,6 +2778,14 @@ static void bridge_KeDelayExecutionThread(void)
  
      if (bridge_run_io_apcs(alertable, wait_mode))
          return;
@@ -3591,7 +3622,7 @@ index 9476517..d2b6ba7 100644
      g_eax = (uint32_t)xbox_KeDelayExecutionThread(
          (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
          XBOX_TO_NATIVE(interval_ptr));
-@@ -2480,6 +2890,7 @@ static void bridge_PsTerminateSystemThread(void)
+@@ -2480,6 +2934,7 @@ static void bridge_PsTerminateSystemThread(void)
          g_thread_stack_top = 0;
          thobj_exit(g_thread_obj_va, exit_status);
          g_thread_obj_va = 0;
@@ -3599,7 +3630,40 @@ index 9476517..d2b6ba7 100644
          ExitThread(exit_status);
      }
  }
-@@ -5910,11 +6321,19 @@ static void bridge_KeWaitForMultipleObjects(void)
+@@ -4116,6 +4571,32 @@ static HANDLE bridge_take_handle(uint32_t token)
+     return NULL;   /* untagged -> not a table handle, do not close */
+ }
+ 
++/* For a game's rollback: the token that names a host handle (0: none), and
++ * a slot set to a value directly. A slot held by INVALID_HANDLE_VALUE is
++ * taken but names nothing (a file closed in a stretch the game went back
++ * over keeps its number until the replay closes it again). */
++uint32_t xbox_HandleTokenOf(void *h)
++{
++    int i;
++    if (!h || h == INVALID_HANDLE_VALUE) return 0;
++    handle_lock();
++    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
++        if (s_handle_table[i] == (HANDLE)h) { handle_unlock(); return BRIDGE_HANDLE_TAG | (uint32_t)i; }
++    handle_unlock();
++    return 0;
++}
++
++int xbox_HandleSlotPut(uint32_t token, void *h)
++{
++    uint32_t i = token & BRIDGE_HANDLE_MASK;
++    int ok = 0;
++    if ((token & 0xFF000000u) != BRIDGE_HANDLE_TAG || i == 0 || i >= BRIDGE_HANDLE_MAX) return 0;
++    handle_lock();
++    if (!h || !s_handle_table[i]) { s_handle_table[i] = (HANDLE)h; ok = 1; }
++    handle_unlock();
++    return ok;
++}
++
+ /* Build a native OBJECT_ATTRIBUTES wrapping the translated Xbox path. */
+ static void bridge_build_oa(uint32_t obj_attrs_va,
+                             XBOX_OBJECT_ATTRIBUTES* oa, XBOX_ANSI_STRING* name)
+@@ -5910,11 +6391,19 @@ static void bridge_KeWaitForMultipleObjects(void)
          }
      }
  
@@ -3624,7 +3688,7 @@ index 9476517..d2b6ba7 100644
  
      /* Only a successful wait consumes synchronization events. WaitAny's
       * result selects one member; WaitAll consumes every signalled member. */
-@@ -7755,11 +8174,16 @@ static void bridge_MmGlobalData(void)
+@@ -7755,11 +8244,16 @@ static void bridge_MmGlobalData(void)
      g_eax = XBOX_KERNEL_DATA_BASE + KDATA_MMGLOBAL;
  }
  
@@ -3642,7 +3706,7 @@ index 9476517..d2b6ba7 100644
      BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 0) = (uint32_t)t;
      BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 4) = (uint32_t)(t >> 32);
      g_eax = XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME;
-@@ -7771,6 +8195,11 @@ static void bridge_KeSystemTime(void)
+@@ -7771,6 +8265,11 @@ static void bridge_KeSystemTime(void)
      /* Refresh the 100ns-since-1601 clock before handing out the pointer. */
      FILETIME ft;
      GetSystemTimeAsFileTime(&ft);
@@ -3654,7 +3718,16 @@ index 9476517..d2b6ba7 100644
      BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = ft.dwLowDateTime;
      BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = ft.dwHighDateTime;
      g_eax = XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME;
-@@ -9289,6 +9718,7 @@ static void bridge_PsCreateSystemThread(void)
+@@ -9000,6 +9499,8 @@ static void bridge_NtProtectVirtualMemory(void)
+     DWORD old = 0;
+ 
+     if (VirtualProtect(XBOX_TO_NATIVE(base_va), size, (DWORD)new_prot, &old)) {
++        if ((new_prot & 0xFFu) != 0x04u && (new_prot & 0xFFu) != 0x40u)
++            InterlockedExchange(&s_guest_pages_protected, 1);
+         if (old_ptr)
+             BRIDGE_MEM32(old_ptr) = (uint32_t)old;
+         g_eax = 0;  /* STATUS_SUCCESS */
+@@ -9289,6 +9790,7 @@ static void bridge_PsCreateSystemThread(void)
              if (is_first_call) {
                  xbox_DpcMarkGuestThread();
                  xbox_GuestThreadPin("guest-main");
@@ -3662,7 +3735,7 @@ index 9476517..d2b6ba7 100644
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-@@ -10864,10 +11294,21 @@ void guest_cpu_part(void)
+@@ -10864,10 +11366,21 @@ void guest_cpu_part(void)
  static void kernel_thunk_dispatch(void)
  {
      int slot = g_kernel_dispatch_slot;
@@ -3687,6 +3760,133 @@ index 9476517..d2b6ba7 100644
      if (held)
          xbox_GuestCpuAcquire();
  }
+diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
+index 45d548c..0beb45c 100644
+--- a/src/kernel/kernel_hal.c
++++ b/src/kernel/kernel_hal.c
+@@ -1048,6 +1048,11 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
+ 
+ volatile ULONG xbox_KeTickCount = 0;
+ 
++int xbox_VirtualTimeHere(void);             /* the virtual clock, below */
++uint64_t xbox_VirtualSystemTime(void);
++static uint64_t vtsc_read(void);
++static uint64_t vtsc_in(uint64_t tsc, uint64_t hz);
++
+ /* Call this periodically or on-demand to update KeTickCount */
+ static void xbox_update_tick_count(void)
+ {
+@@ -1064,6 +1069,12 @@ static void xbox_update_tick_count(void)
+ LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
+ {
+     LARGE_INTEGER counter;
++    if (xbox_VirtualTimeHere()) {           /* the virtual clock (see there) */
++        LARGE_INTEGER f;
++        QueryPerformanceFrequency(&f);
++        counter.QuadPart = (LONGLONG)vtsc_in(vtsc_read(), (uint64_t)f.QuadPart);
++        return counter;
++    }
+     QueryPerformanceCounter(&counter);
+     return counter;
+ }
+@@ -1125,6 +1136,10 @@ VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
+ 
+     if (!CurrentTime)
+         return;
++    if (xbox_VirtualTimeHere()) {           /* the virtual clock (see there) */
++        CurrentTime->QuadPart = (LONGLONG)xbox_VirtualSystemTime();
++        return;
++    }
+ 
+     InitOnceExecuteOnce(&s_time_once, anchor_system_time, NULL, NULL);
+     QueryPerformanceCounter(&now);
+@@ -1774,12 +1789,74 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
+  * ========================================================================= */
+ #define XBOX_TSC_HZ 733333333ull
+ 
++/* A virtual clock for one thread (a game's rollback / netplay code): while
++ * set, that thread's reads return the given value, a microsecond further on
++ * each read, instead of real time - so the same code run twice sees the same
++ * clock. With lockstep workers on (kernel_bridge.c), the workers share it:
++ * they run only in turns the main thread grants, so one counter stays
++ * deterministic. Every clock a guest thread can read follows it then: the
++ * time stamp counter, the performance counter, the system and interrupt
++ * times. Device-model and timer threads keep real time. */
++static volatile LONG g_vtsc_thread;         /* thread id, 0 = off */
++static uint64_t g_vtsc;
++int xbox_LockstepGuestThread(void);         /* kernel_bridge.c */
++
++/* This thread reads the virtual clock. */
++int xbox_VirtualTimeHere(void)
++{
++    if (!g_vtsc_thread)
++        return 0;
++    return (DWORD)g_vtsc_thread == GetCurrentThreadId() || xbox_LockstepGuestThread();
++}
++
++/* The virtual clock, a microsecond further on (a reader that waits for time
++ * to pass by polling still sees it pass). */
++static uint64_t vtsc_read(void)
++{
++    return g_vtsc += 733333333ull / 1000000ull;
++}
++
++/* The virtual clock in other units: ticks of `hz`, whole seconds and the
++ * remainder scaled apart so nothing overflows. */
++static uint64_t vtsc_in(uint64_t tsc, uint64_t hz)
++{
++    return (tsc / 733333333ull) * hz + (tsc % 733333333ull) * hz / 733333333ull;
++}
++
++/* 100 ns units since boot (KeInterruptTime), on the virtual clock. */
++uint64_t xbox_VirtualTime100ns(void)
++{
++    return vtsc_in(vtsc_read(), 10000000ull);
++}
++
++/* The system time on the virtual clock: a fixed date (2004-01-01) plus the
++ * clock, so two machines read the same. */
++#define VTIME_BASE_100NS 127174464000000000ull
++uint64_t xbox_VirtualSystemTime(void)
++{
++    return VTIME_BASE_100NS + vtsc_in(vtsc_read(), 10000000ull);
++}
++
++void xbox_VirtualTscSet(uint64_t value)
++{
++    g_vtsc = value;
++    InterlockedExchange(&g_vtsc_thread, (LONG)GetCurrentThreadId());
++}
++
++void xbox_VirtualTscOff(void)
++{
++    InterlockedExchange(&g_vtsc_thread, 0);
++}
++
+ uint64_t xbox_ReadTimeStampCounter(void)
+ {
+     static LARGE_INTEGER freq;
+     static LARGE_INTEGER origin;
+     LARGE_INTEGER now;
+ 
++    if (xbox_VirtualTimeHere())
++        return vtsc_read();
++
+     if (freq.QuadPart == 0) {
+         QueryPerformanceFrequency(&freq);
+         QueryPerformanceCounter(&origin);
+@@ -1934,3 +2011,11 @@ void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
+         break;
+     }
+ }
++
++/* For a stall report (the rollback's watchdog). */
++void xbox_IrqDump(void)
++{
++    fprintf(stderr, "  [IRQ] pending lines 0x%lX, gate held by tid %ld\n",
++            (long)s_irq_pending, (long)s_gate_owner);
++    fflush(stderr);
++}
 diff --git a/src/kernel/kernel_rtl.c b/src/kernel/kernel_rtl.c
 index a9853dd..74a8357 100644
 --- a/src/kernel/kernel_rtl.c
@@ -3731,3 +3931,41 @@ index a9853dd..74a8357 100644
      xbox_cs_note_owner(cs);
      if (g_cs_contention_reports <= 16) {
          fprintf(stderr, "  [CS] thread %lu acquired 0x%08X\n",
+diff --git a/src/usb/ohci.c b/src/usb/ohci.c
+index 5462e9a..27ff6ab 100644
+--- a/src/usb/ohci.c
++++ b/src/usb/ohci.c
+@@ -1053,6 +1053,21 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
+  * the interrupt it has been waiting for. Repeat delivery and the transfer
+  * lists come after that answer, not before it.
+  */
++/* Snapshot support (a game's rollback code): while paused the controller
++ * thread delivers nothing and touches no guest memory, so the driver's
++ * transfer queues in guest RAM and this model cannot drift apart when the
++ * game puts its memory back in time. xbox_OhciPause(1) returns once the
++ * thread is parked between passes (no interrupt handler in flight). */
++static volatile LONG s_pause_req, s_parked;
++
++void xbox_OhciPause(int on)
++{
++    DWORD t0 = GetTickCount();
++    InterlockedExchange(&s_pause_req, on ? 1 : 0);
++    while (on && s_enabled && !InterlockedCompareExchange(&s_parked, 0, 0) && GetTickCount() - t0 < 500)
++        Sleep(1);
++}
++
+ static DWORD WINAPI ohci_thread(LPVOID unused)
+ {
+     /* This thread calls recompiled code, so it needs what any thread running
+@@ -1090,6 +1105,11 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+         uint32_t pass_done = 0;     /* this pass's done queue, newest first */
+ 
+         Sleep(OHCI_TICK_MS);
++        if (InterlockedCompareExchange(&s_pause_req, 0, 0)) {
++            InterlockedExchange(&s_parked, 1);
++            continue;
++        }
++        InterlockedExchange(&s_parked, 0);
+         control = hc->reg[HcControl / 4];
+         enable  = hc->reg[HcInterruptEnable / 4];
+ 

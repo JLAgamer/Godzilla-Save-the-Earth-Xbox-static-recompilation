@@ -94,9 +94,18 @@ typedef struct {
     RecompXmm xmm[8];
 } RbRegs;
 
-#define RB_FILES 48
+#define RB_FILES 128                            /* kernel_file.c's FT_MAX */
 int  xbox_FilePositions(void **h, int64_t *pos, int max);   /* kernel_file.c */
 void xbox_FileSetPosition(void *h, int64_t pos);
+void     xbox_SetCloseDefer(int (*fn)(uint32_t token, void *h));   /* kernel_bridge.c */
+void     xbox_CloseToken(uint32_t token);
+uint32_t xbox_HandleTokenOf(void *h);
+int      xbox_HandleSlotPut(uint32_t token, void *h);
+unsigned long long xbox_ApuFrames(void);                       /* apu_core.c */
+unsigned xbox_ApuCatchUp(unsigned frames, unsigned timeout_ms);
+size_t xbox_Nv2aStateSize(void);                               /* nv2a_pb_exec.c: the GPU's method state */
+void   xbox_Nv2aStateSave(void *buf);
+void   xbox_Nv2aStateLoad(const void *buf);
 
 /* One tick's record, in the ring of slots (each RB_ENTRY bytes): the heap
  * tables at its boundary in s_heap_slots slots from `heap`, then its page
@@ -114,6 +123,9 @@ typedef struct {
     uint32_t nfiles;
     void    *fh[RB_FILES];
     int64_t  fpos[RB_FILES];
+    /* the sound chip's frames rendered by this boundary, less s_apu_off: a
+     * replayed tick renders as many again (rb_apu_catch_up) */
+    uint64_t apu_pos;
 } RbFrame;
 
 /* The sound chip's host-side state (xbox_ApuStateSave) is kept in the same
@@ -152,8 +164,15 @@ static uint32_t   s_vtick;
 static uint64_t   s_stat_faults, s_stat_pages_max;
 static int        s_ver_want;                   /* GZ_RB_VERIFY: copy at this boundary */
 static uint32_t   s_replay_until;               /* netplay: replaying ticks up to this one */
+static uint64_t   s_apu_off;                    /* xbox_ApuFrames() - apu_pos */
+static uint64_t   s_ff_pos[RB_FRAMES + 1];      /* apu_pos of the ticks being replayed, the first time */
+static uint32_t   s_ff_base, s_ff_n;
+static int        s_ff_give_up;
 static void verify_take(void);
 static void verify_check(void);
+static int  rb_close_defer(uint32_t token, void *h);
+static void rb_closes_release_all(void);
+extern void (*xbox_file_conflict_hook)(void);   /* kernel_file.c */
 
 int gz_rb_active(void) { return s_tracking; }
 
@@ -264,21 +283,30 @@ static LONG CALLBACK rb_veh(EXCEPTION_POINTERS *ep)
 }
 
 /* The sound chip's state: s_apu_shadow is what it was at the last boundary,
- * s_apu_live a scratch copy of now. */
+ * s_apu_live a scratch copy of now. The emulated GPU's method state (render
+ * states, texture stages, combiners, vertex program and constants) follows
+ * it from s_gpu_at: without it a rollback left the GPU drawing with the
+ * states of the tick it came from (particles drawn as solid boxes). */
 static uint8_t *s_apu_shadow, *s_apu_live;
 static uint32_t s_apu_chunks;                  /* 0 = not kept */
+static size_t   s_gpu_at;
 
 static void apu_init(void)
 {
     size_t size = xbox_ApuStateSize();
-    uint32_t n = (uint32_t)((size + RB_PAGE - 1) / RB_PAGE);
+    uint32_t n;
     s_apu_chunks = 0;
-    if (!size || n > RB_APU_MAX) return;
+    if (!size) return;
+    s_gpu_at = (size + RB_PAGE - 1) / RB_PAGE * RB_PAGE;
+    size = s_gpu_at + xbox_Nv2aStateSize();
+    n = (uint32_t)((size + RB_PAGE - 1) / RB_PAGE);
+    if (n > RB_APU_MAX) return;
     if (!s_apu_shadow) {
         s_apu_shadow = (uint8_t *)VirtualAlloc(NULL, (size_t)n * RB_PAGE, MEM_COMMIT, PAGE_READWRITE);
         s_apu_live = (uint8_t *)VirtualAlloc(NULL, (size_t)n * RB_PAGE, MEM_COMMIT, PAGE_READWRITE);
     }
     if (!s_apu_shadow || !s_apu_live || !xbox_ApuStateSave(s_apu_shadow)) return;
+    xbox_Nv2aStateSave(s_apu_shadow + s_gpu_at);
     s_apu_chunks = n;
 }
 
@@ -289,6 +317,7 @@ static void apu_capture(RbFrame *f)
 {
     uint32_t k;
     if (!s_apu_chunks || !xbox_ApuStateSave(s_apu_live)) return;
+    xbox_Nv2aStateSave(s_apu_live + s_gpu_at);
     for (k = 0; k < s_apu_chunks; k++) {
         uint8_t *now = s_apu_live + (size_t)k * RB_PAGE, *was = s_apu_shadow + (size_t)k * RB_PAGE;
         if (!memcmp(now, was, RB_PAGE)) continue;
@@ -314,6 +343,7 @@ static void frame_begin(uint32_t tick)
     f->vtick = s_vtick;
     regs_save(&f->regs);
     f->nfiles = (uint32_t)xbox_FilePositions(f->fh, f->fpos, RB_FILES);
+    f->apu_pos = xbox_ApuFrames() - s_apu_off;
     xbox_HeapStateSave(s_heap_tmp);
     f->heap = s_next;
     for (j = 0; j < s_heap_slots; j++)
@@ -502,6 +532,8 @@ static int history_start(void)
     if ((ns = xbox_LockstepQuiesce(2000)) != 0)
         fprintf(stderr, "[RB] %d worker(s) did not park: their state is not exact\n", ns);
     AddVectoredExceptionHandler(1, rb_veh);
+    xbox_SetCloseDefer(rb_close_defer);
+    xbox_file_conflict_hook = rb_closes_release_all;
     /* The USB controller model stops: pads come through gz_rb_pad() now, and
      * the driver's queues in guest memory must not go back in time under a
      * controller that did not. */
@@ -559,17 +591,235 @@ static void rb_pump(void)
     }
 }
 
+/* ── Files closed while the history is on ─────────────────────────────
+ *
+ * A file the game closes in a tick it may go back over must still be open
+ * when the replay reads it, and the number the game holds for it must still
+ * name it. So the close is held back (kernel_bridge.c calls rb_close_defer):
+ * the file and its handle number stay as they are, and the close is done for
+ * real RB_CLOSE_KEEP ticks later, at a boundary, when no rollback can reach
+ * back that far. The handle numbers a later open gets then depend only on
+ * the tick, as on the other PC.
+ *
+ * Going back to a tick (rb_closes_rollback):
+ *  - a file opened after it is closed for real (nothing in the game holds it
+ *    now; the replay opens it again and gets the same number back);
+ *  - a held close from after it is undone if the file was open at that tick
+ *    (the replay closes it again), else done for real;
+ *  - a close done for real after it takes its number back, held by a slot
+ *    that names nothing, until the replay passes that tick again. */
+#define RB_CLOSE_KEEP 600u
+#define RB_CLOSES     256
+typedef struct { uint32_t token; void *h; uint32_t closed, released; int done; } RbClose;
+static RbClose s_closes[RB_CLOSES];
+static int     s_nclose;
+static SRWLOCK s_close_lock = SRWLOCK_INIT;
+
+static int rb_close_defer(uint32_t token, void *h)
+{
+    int ok = 0;
+    AcquireSRWLockExclusive(&s_close_lock);
+    if (s_tracking && s_nclose < RB_CLOSES) {
+        RbClose *c = &s_closes[s_nclose++];
+        c->token = token;
+        c->h = h;
+        c->closed = s_cur;
+        c->released = 0;
+        c->done = 0;
+        ok = 1;
+    } else if (s_tracking) {
+        static unsigned nlog;
+        if (nlog++ < 4) fprintf(stderr, "[RB] tick %u: too many held file closes, closing now\n", s_cur);
+    }
+    ReleaseSRWLockExclusive(&s_close_lock);
+    return ok;
+}
+
+static void rb_close_drop(int k)
+{
+    s_closes[k] = s_closes[--s_nclose];
+}
+
+/* At the boundary that opens s_cur (after the record is opened). */
+static void rb_closes_at_boundary(void)
+{
+    int k;
+    AcquireSRWLockExclusive(&s_close_lock);
+    for (k = 0; k < s_nclose; ) {
+        RbClose *c = &s_closes[k];
+        if (!c->done && s_cur - c->closed >= RB_CLOSE_KEEP) {
+            xbox_CloseToken(c->token);          /* the file, or the slot that named nothing */
+            c->done = 1;
+            c->released = s_cur;
+            c->h = NULL;
+        }
+        if (c->done && s_cur - c->released >= RB_CLOSE_KEEP) { rb_close_drop(k); continue; }
+        k++;
+    }
+    ReleaseSRWLockExclusive(&s_close_lock);
+}
+
+/* An open that a held file refused (kernel_file.c): the held closes are done
+ * now. The handle numbers after this may differ from the other PC's. */
+static void rb_closes_release_all(void)
+{
+    int k, n = 0;
+    AcquireSRWLockExclusive(&s_close_lock);
+    for (k = 0; k < s_nclose; k++)
+        if (!s_closes[k].done) {
+            xbox_CloseToken(s_closes[k].token);
+            s_closes[k].done = 1;
+            s_closes[k].released = s_cur;
+            s_closes[k].h = NULL;
+            n++;
+        }
+    ReleaseSRWLockExclusive(&s_close_lock);
+    fprintf(stderr, "[RB] tick %u: an open was refused by %d held file close(s); closed them now\n", s_cur, n);
+}
+
+static int rb_frame_has_file(const RbFrame *f, void *h)
+{
+    uint32_t j;
+    for (j = 0; j < f->nfiles; j++) if (f->fh[j] == h) return 1;
+    return 0;
+}
+
+/* After going back to `target` (f its record), outside s_lock. */
+static void rb_closes_rollback(const RbFrame *f, uint32_t target)
+{
+    static void *now_h[RB_FILES];
+    static int64_t now_p[RB_FILES];
+    int n, k, j, opened = 0, undone = 0, retaken = 0;
+    AcquireSRWLockExclusive(&s_close_lock);
+    n = xbox_FilePositions(now_h, now_p, RB_FILES);
+    for (k = 0; k < n; k++) {                   /* opened after target */
+        int held = 0;
+        uint32_t t;
+        if (rb_frame_has_file(f, now_h[k])) continue;
+        for (j = 0; j < s_nclose; j++) if (!s_closes[j].done && s_closes[j].h == now_h[k]) held = 1;
+        if (held) continue;                     /* below */
+        if ((t = xbox_HandleTokenOf(now_h[k])) != 0) { xbox_CloseToken(t); opened++; }
+    }
+    for (k = 0; k < s_nclose; ) {               /* held closes from target on */
+        RbClose *c = &s_closes[k];
+        if (!c->done && c->closed >= target && c->h) {
+            if (!rb_frame_has_file(f, c->h)) xbox_CloseToken(c->token);
+            else undone++;
+            rb_close_drop(k);
+            continue;
+        }
+        k++;
+    }
+    for (k = 0; k < s_nclose; k++) {            /* real closes after target: the numbers back */
+        RbClose *c = &s_closes[k];
+        if (c->done && c->released > target) {
+            if (!xbox_HandleSlotPut(c->token, INVALID_HANDLE_VALUE))
+                fprintf(stderr, "[RB] handle %08X was taken again: later handles may differ\n", c->token);
+            c->done = 0;
+            c->h = NULL;
+            retaken++;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_close_lock);
+    if (opened || undone || retaken) {
+        static unsigned nlog;
+        if (nlog++ < 20)
+            fprintf(stderr, "[RB] back to %u: %d file(s) opened since closed, %d close(s) undone, %d number(s) taken back\n",
+                    target, opened, undone, retaken);
+    }
+}
+
+/* A replayed tick renders the sound chip's frames the first run rendered in
+ * it (see xbox_ApuCatchUp): the voices were put back with the rest, and
+ * without this they ran that far behind and the replayed stretch was heard
+ * twice. At the boundary that closes s_cur, while replaying. */
+static int rb_sound_catch_up_on(void)          /* GZ_RB_SOUND_CATCHUP=0: off */
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GZ_RB_SOUND_CATCHUP"); v = !(e && *e == '0'); }
+    return v;
+}
+
+static void rb_apu_catch_up(void)
+{
+    uint32_t i = s_cur + 1 - s_ff_base;
+    uint64_t want, have;
+    if (s_ff_give_up || i > s_ff_n) return;
+    want = s_ff_pos[i];
+    have = xbox_ApuFrames() - s_apu_off;
+    if (want > have && want - have < 100000u) {
+        unsigned left = xbox_ApuCatchUp((unsigned)(want - have), 8);
+        if (left) {
+            static unsigned nlog;
+            s_ff_give_up = 1;               /* the chip is held up: not this replay again */
+            if (nlog++ < 8) fprintf(stderr, "[RB] tick %u: sound chip %u frame(s) short after a rollback\n", s_cur, left);
+        }
+    }
+}
+
+/* GZ_RB_HASHLOG=path: for every tick, a hash of each guest page the tick
+ * wrote, as it was at the tick's end (and a mark at every rollback, after
+ * which the ticks from its target on are logged again). Two sides' logs
+ * show the first tick and page at which they played differently
+ * (recomp_config/tools/rb_hashdiff.py). */
+static FILE *s_hashlog;
+static int   s_hashlog_on = -1;
+static int rb_local_page(uint32_t i);
+
+static uint64_t page_hash64(const uint8_t *p)
+{
+    const uint64_t *q = (const uint64_t *)p;
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    uint32_t k;
+    for (k = 0; k < RB_PAGE / 8; k++) h = (h ^ q[k]) * 0x100000001B3ull + (h >> 29);
+    return h;
+}
+
+static void hashlog_tick(const RbFrame *f)
+{
+    uint32_t k;
+    if (s_hashlog_on < 0) {
+        const char *e = getenv("GZ_RB_HASHLOG");
+        s_hashlog_on = e && *e && (s_hashlog = fopen(e, "wb")) != NULL;
+        if (s_hashlog) setvbuf(s_hashlog, NULL, _IOFBF, 1 << 20);
+    }
+    if (!s_hashlog_on) return;
+    for (k = 0; k < f->npages; k++) {
+        const uint8_t *e = slot_ptr(f->first + k);
+        uint32_t i, rec[4];
+        uint64_t h;
+        memcpy(&i, e, 4);
+        if (i >= RB_NPAGES || rb_local_page(i)) continue;
+        h = page_hash64(page_ptr(i));
+        rec[0] = s_cur; rec[1] = i; rec[2] = (uint32_t)h; rec[3] = (uint32_t)(h >> 32);
+        fwrite(rec, sizeof rec, 1, s_hashlog);
+    }
+    if (s_cur % 60 == 0) fflush(s_hashlog);     /* the test harness kills the process */
+}
+
+static void hashlog_rollback(uint32_t target)
+{
+    if (s_hashlog_on > 0) {
+        uint32_t rec[4] = { 0xFFFFFFFFu, target, 0, 0 };
+        fwrite(rec, sizeof rec, 1, s_hashlog);
+    }
+}
+
+void gz_rb_hashlog_flush(void) { if (s_hashlog_on > 0) fflush(s_hashlog); }
+
 /* A boundary: close the tick that ran, open the next. */
 static void boundary(void)
 {
     RbFrame *f = &s_frames[s_cur % RB_FRAMES];
     InterlockedIncrement(&s_progress);
     rb_pump();
+    if (s_replay_until && s_cur < s_replay_until && rb_sound_catch_up_on()) rb_apu_catch_up();
     xbox_DispatchGateEnter();           /* sound and other device code: not in flight */
     xbox_Nv2aPause(1);
     xbox_ApuLock();                     /* before s_lock: see xbox_ApuLock */
     AcquireSRWLockExclusive(&s_lock);
     apu_capture(f);
+    hashlog_tick(f);
     if (f->npages > s_stat_pages_max) s_stat_pages_max = f->npages;
     reprotect(f);
     s_cur++;
@@ -580,6 +830,7 @@ static void boundary(void)
     xbox_ApuUnlock();
     xbox_Nv2aResume();
     xbox_DispatchGateLeave();
+    rb_closes_at_boundary();
 }
 
 /* The worker threads' TIBs and TLS blocks keep their present bytes through a
@@ -627,6 +878,15 @@ static int rollback(uint32_t n)
     DWORD old;
     double t0 = now_s();
     if (n > s_cur || target < s_oldest || s_lost) return 0;
+    if (n >= RB_CLOSE_KEEP) return 0;           /* past a file close done for real */
+    {
+        /* the sound chip's place at each tick of the first run, for the replay */
+        uint32_t i;
+        for (i = 0; i <= n; i++) s_ff_pos[i] = s_frames[(target + i) % RB_FRAMES].apu_pos;
+        s_ff_base = target;
+        s_ff_n = n;
+        s_ff_give_up = 0;
+    }
     xbox_DispatchGateEnter();
     xbox_Nv2aPause(1);
     xbox_ApuLock();
@@ -669,6 +929,7 @@ static int rollback(uint32_t n)
     keep_tibs_load(ntib);
     /* the shadow is now the sound chip at the target boundary */
     if (s_apu_chunks) xbox_ApuStateLoad(s_apu_shadow);
+    if (s_apu_chunks) xbox_Nv2aStateLoad(s_apu_shadow + s_gpu_at);
     s_cur = target;
     verify_check();                         /* GZ_RB_VERIFY */
     {
@@ -687,11 +948,15 @@ static int rollback(uint32_t n)
         s_next = f->first;                      /* the later records are gone */
         f->npages = 0;
         s_cur = target;
+        /* the sound chip is back at target's place */
+        s_apu_off = xbox_ApuFrames() - f->apu_pos;
     }
     ReleaseSRWLockExclusive(&s_lock);
     xbox_ApuUnlock();
     xbox_Nv2aResume();
     xbox_DispatchGateLeave();
+    rb_closes_rollback(&s_frames[target % RB_FRAMES], target);
+    hashlog_rollback(target);
     {
         static unsigned nlog;
         if (nlog++ < 12 || (nlog & 63u) == 0)

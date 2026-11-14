@@ -832,7 +832,7 @@ index 87788ed..624b417 100644
   * of the semaphore the title reads GPU progress from (for XDK D3D, the
   * pointer at device+0x30). The executor writes each release there once it
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a5ea9cc..215dfa1 100644
+index a5ea9cc..0bf5b93 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -448,6 +448,13 @@ static void dump_texture_bmp(uint32_t seq);
@@ -1213,7 +1213,7 @@ index a5ea9cc..215dfa1 100644
          return 2;
      default:
          return 4;
-@@ -3321,15 +3535,342 @@ static void xf_set_viewport(void)
+@@ -3321,15 +3535,343 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -1515,7 +1515,8 @@ index a5ea9cc..215dfa1 100644
  {
      uint32_t i, n = s_gpu.idx_count;
  
-+    if (gpu_program_draw())
++    /* Points are expanded into quads on the CPU path (below). */
++    if (s_gpu.prim != NV_PRIM_POINTS && gpu_program_draw())
 +        return;
      if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
          return;
@@ -1559,7 +1560,49 @@ index a5ea9cc..215dfa1 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -3615,8 +4156,6 @@ static void draw_primitive(void)
+@@ -3458,6 +4000,32 @@ static void raster_batch_program(void)
+             raster_xf_clipped(&s_xf[i], &s_xf[i+3], &s_xf[i+2]);
+         }
+         break;
++    case NV_PRIM_POINTS:
++        /* Point sprites: each point becomes a screen-aligned square, oPts
++         * pixels across, with texture coordinates running 0..1 over it.
++         * Godzilla: Save the Earth draws its "tiny" particles this way --
++         * MechaGodzilla's rocket fire and smoke among them -- and dropping
++         * POINTS batches is what made those rockets invisible in flight. */
++        for (i = 0; i < n; i++) {
++            static const float corner[4][2] = { {0, 0}, {1, 0}, {1, 1}, {0, 1} };
++            Nv2aVshOutput q[4];
++            float half = (batch_uses_program() && s_xf[i].pts > 0.0f) ? s_xf[i].pts * 0.5f : 0.5f;
++            int c, st;
++            for (c = 0; c < 4; c++) {
++                q[c] = s_xf[i];
++                q[c].pos[0] += (corner[c][0] * 2.0f - 1.0f) * half * aa_scale_x();
++                q[c].pos[1] += (corner[c][1] * 2.0f - 1.0f) * half * aa_scale_y();
++                for (st = 0; st < 4; st++) {
++                    q[c].tex[st][0] = corner[c][0];
++                    q[c].tex[st][1] = corner[c][1];
++                    q[c].tex[st][2] = 0.0f;
++                    q[c].tex[st][3] = 1.0f;
++                }
++            }
++            raster_xf_clipped(&q[0], &q[1], &q[2]);
++            raster_xf_clipped(&q[0], &q[2], &q[3]);
++        }
++        break;
+     default:
+         break;
+     }
+@@ -3473,7 +4041,7 @@ static void raster_batch(void)
+     uint32_t before = s_gpu.tris_drawn;
+     int textured = 0;
+ 
+-    if (s_gpu.idx_count < 3)
++    if (s_gpu.idx_count < (s_gpu.prim == NV_PRIM_POINTS ? 1u : 3u))
+         return;
+     if (batch_uses_program() || batch_is_ffp()) {
+         raster_batch_program();
+@@ -3615,8 +4183,6 @@ static void draw_primitive(void)
      if (!s_gpu.prim || !s_gpu.idx_count)
          return;
      s_gpu.draws++;
@@ -1568,7 +1611,7 @@ index a5ea9cc..215dfa1 100644
      s_gpu.verts += s_gpu.idx_count;
  
      /* How many batches carry coordinates at all, and what range they span.
-@@ -3687,7 +4226,8 @@ static void draw_primitive(void)
+@@ -3687,7 +4253,8 @@ static void draw_primitive(void)
          }
      }
  
@@ -1578,7 +1621,7 @@ index a5ea9cc..215dfa1 100644
          static int shown;
          if (shown++ < 6) {
              fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
-@@ -4173,6 +4713,29 @@ int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
+@@ -4173,6 +4740,29 @@ int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
      return 1;
  }
  
@@ -1608,7 +1651,7 @@ index a5ea9cc..215dfa1 100644
  void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  {
      /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
-@@ -4346,7 +4909,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4346,7 +4936,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x033C: s_gpu.alpha_func = param; break;
      case 0x0340: s_gpu.alpha_ref = param; break;
      case 0x02A4: s_gpu.fog_enable = param; break;
@@ -1622,7 +1665,7 @@ index a5ea9cc..215dfa1 100644
      case 0x029C: s_gpu.fog_mode = param; break;
      case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
      case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
-@@ -4792,7 +5360,7 @@ static void find_nan_matrices(void)
+@@ -4792,7 +5387,7 @@ static void find_nan_matrices(void)
   * pointer or a number", and guessing wrong costs a run. */
  static void peek_addresses(void)
  {
@@ -1631,7 +1674,7 @@ index a5ea9cc..215dfa1 100644
      const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
      char buf[256];
      char *tok, *ctx = NULL;
-@@ -4823,7 +5391,7 @@ static void peek_addresses(void)
+@@ -4823,7 +5418,7 @@ static void peek_addresses(void)
   */
  static void peek_chain(void)
  {
@@ -1640,7 +1683,7 @@ index a5ea9cc..215dfa1 100644
      const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
      char buf[256], *tok, *ctx = NULL;
      uint32_t cur = 0;
-@@ -4861,13 +5429,15 @@ void nv2a_pb_exec_report(void)
+@@ -4861,13 +5456,15 @@ void nv2a_pb_exec_report(void)
  {
      peek_addresses();
      peek_chain();
@@ -1658,7 +1701,7 @@ index a5ea9cc..215dfa1 100644
          static int done;
          if (!done) { done = 1; find_quad_vertices(); }
      }
-@@ -4885,6 +5455,12 @@ void nv2a_pb_exec_report(void)
+@@ -4885,6 +5482,12 @@ void nv2a_pb_exec_report(void)
          last_flips = s_gpu.flips;
          last_ms = now;
      }
@@ -1671,6 +1714,82 @@ index a5ea9cc..215dfa1 100644
      flip_hold_report();
      fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
                      " clears %u | %u unhandled methods (%d distinct)\n",
+@@ -5001,3 +5604,75 @@ void nv2a_pb_exec_report(void)
+         s_unhandled_slot[(s_unhandled[i].method & 0x1FFC) / 4] = (uint16_t)(i + 1);
+     fflush(stderr);
+ }
++
++/* ---- A game's rollback --------------------------------------------------
++ *
++ * The title's Direct3D keeps its own copy of the render state in guest
++ * memory and sends only what changed. A game that puts its memory back a few
++ * frames (rollback netplay) puts that copy back, but not this executor's
++ * state, which went on to hold what the undone frames sent: the two then
++ * disagreed until each state happened to change again -- particles drawn as
++ * solid boxes with another draw's texture stage and blend. So the method
++ * state is saved and loaded with the rest (gz_rollback.c, at frame
++ * boundaries, with the executor idle). The per-batch arrays (indices, inline
++ * vertices) hold nothing between batches and stay out. */
++#define GPU_OFF(f) ((size_t)((const char *)&s_gpu.f - (const char *)&s_gpu))
++/* s_gpu in three pieces: up to idx, idx_count up to inline_buf, and from
++ * inline_count to the end */
++static size_t gpu_piece(int k, size_t *off)
++{
++    switch (k) {
++    case 0: *off = 0; return GPU_OFF(idx);
++    case 1: *off = GPU_OFF(idx_count); return GPU_OFF(inline_buf) - GPU_OFF(idx_count);
++    default: *off = GPU_OFF(inline_count); return sizeof s_gpu - GPU_OFF(inline_count);
++    }
++}
++
++size_t xbox_Nv2aStateSize(void)
++{
++    size_t n = 0, off;
++    int k;
++    for (k = 0; k < 3; k++) n += gpu_piece(k, &off);
++    return n + sizeof s_reg + sizeof s_tex_reg + sizeof s_tex_set + nv2a_vsh_state_size();
++}
++
++void xbox_Nv2aStateSave(void *buf)
++{
++    uint8_t *p = (uint8_t *)buf;
++    size_t n, off;
++    int k;
++    for (k = 0; k < 3; k++) { n = gpu_piece(k, &off); memcpy(p, (const uint8_t *)&s_gpu + off, n); p += n; }
++    memcpy(p, s_reg, sizeof s_reg); p += sizeof s_reg;
++    memcpy(p, s_tex_reg, sizeof s_tex_reg); p += sizeof s_tex_reg;
++    memcpy(p, s_tex_set, sizeof s_tex_set); p += sizeof s_tex_set;
++    nv2a_vsh_state_save(p);
++}
++
++/* What follows this machine's frames rather than the title's state: the
++ * surfaces being drawn into and flipped (the title's frame bookkeeping is
++ * left out of a rollback for the same reason) and the counters. */
++#define GPU_KEEP(X) X(color_offset) X(color_base) X(pitch) X(format) X(zeta_offset)     X(drawn_offset) X(drawn_pitch) X(drawn_x) X(drawn_y) X(drawn_w) X(drawn_h) X(drawn_bpp)     X(drawn_stale) X(clip_x) X(clip_w) X(clip_y) X(clip_h) X(clip_raw_h) X(clip_raw_v)     X(aa_sx) X(aa_sy) X(flip_read) X(flip_write) X(flip_modulo) X(flips) X(draws) X(verts)     X(nonzero_draws) X(clears) X(pixels) X(pixel_max)
++
++void xbox_Nv2aStateLoad(const void *buf)
++{
++    const uint8_t *p = (const uint8_t *)buf;
++    size_t n, off;
++    int k;
++    {
++        /* the kept fields, by value, around the load */
++        static uint8_t keep[512];
++        size_t at = 0;
++#define GPU_PUT(f) memcpy(keep + at, &s_gpu.f, sizeof s_gpu.f); at += sizeof s_gpu.f;
++#define GPU_GET(f) memcpy(&s_gpu.f, keep + at, sizeof s_gpu.f); at += sizeof s_gpu.f;
++        GPU_KEEP(GPU_PUT)
++        for (k = 0; k < 3; k++) { n = gpu_piece(k, &off); memcpy((uint8_t *)&s_gpu + off, p, n); p += n; }
++        at = 0;
++        GPU_KEEP(GPU_GET)
++#undef GPU_PUT
++#undef GPU_GET
++    }
++    memcpy(s_reg, p, sizeof s_reg); p += sizeof s_reg;
++    memcpy(s_tex_reg, p, sizeof s_tex_reg); p += sizeof s_tex_reg;
++    memcpy(s_tex_set, p, sizeof s_tex_set); p += sizeof s_tex_set;
++    nv2a_vsh_state_load(p);
++}
 diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
 index 5fab4c3..3f83d87 100644
 --- a/src/kernel/nv2a_pb_scan.c
@@ -1714,7 +1833,7 @@ index 5fab4c3..3f83d87 100644
      if (*slot) {
          s_seen[*slot - 1].count++;
 diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
-index c7fd25d..63673f2 100644
+index c7fd25d..3473f97 100644
 --- a/src/kernel/nv2a_vsh_interp.c
 +++ b/src/kernel/nv2a_vsh_interp.c
 @@ -43,6 +43,8 @@ static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
@@ -1762,7 +1881,15 @@ index c7fd25d..63673f2 100644
  }
  
  /* ---- execution ----------------------------------------------------------- */
-@@ -569,8 +577,10 @@ static int vsh_run_decoded(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *ou
+@@ -360,6 +368,7 @@ static void vsh_finish(Nv2aVshOutput *out, const vec4 *opos,
+     memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
+     memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
+     memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
++    out->pts = outregs[6][0];
+ }
+ 
+ static void vsh_init_regs(vec4 temp[12], vec4 *opos, float outregs[13][4])
+@@ -569,8 +578,10 @@ static int vsh_run_decoded(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *ou
          if (d->omask) {
              const vec4 *src = d->from_ilu ? &ires : &mres;
              if (!d->to_o) {                               /* to c[] */
@@ -1774,7 +1901,7 @@ index c7fd25d..63673f2 100644
              } else if (d->oaddr == 0) {
                  write_masked(regs[12].v, src, d->omask);
              } else if (d->oaddr < 13) {
-@@ -707,3 +717,58 @@ static int vsh_run_fields(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out
+@@ -707,3 +718,58 @@ static int vsh_run_fields(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out
      }
      return 0;
  }
@@ -1834,10 +1961,18 @@ index c7fd25d..63673f2 100644
 +    return (const float (*)[4])s_const;
 +}
 diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
-index 8acb0af..2ac7552 100644
+index 8acb0af..166dcc7 100644
 --- a/src/kernel/nv2a_vsh_interp.h
 +++ b/src/kernel/nv2a_vsh_interp.h
-@@ -58,4 +58,11 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
+@@ -35,6 +35,7 @@ typedef struct {
+     float d0[4], d1[4];
+     float fog[4];
+     float tex[4][4];
++    float pts;                  /* oPts.x: point size in pixels (POINTS batches) */
+ } Nv2aVshOutput;
+ 
+ void nv2a_vsh_set_load_slot(uint32_t slot);           /* _PROGRAM_LOAD      */
+@@ -58,4 +59,11 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
  void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
  void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
  

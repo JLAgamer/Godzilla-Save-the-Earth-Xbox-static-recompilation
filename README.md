@@ -2,9 +2,9 @@
 [![Get it on RecompLauncher](https://recomplauncher.com/assets/press/launcher/badge-dark.svg)](https://recomplauncher.com/game/godzilla-save-the-earth-xbox-static-recompilation)
 # Godzilla: Save the Earth — Xbox static recompilation
 
-![Overall progress](https://img.shields.io/badge/overall-82%25-green)
-![Boot and menus](https://img.shields.io/badge/Boot_and_menus-95%25-brightgreen) ![Versus fights](https://img.shields.io/badge/Versus_fights-95%25-brightgreen) ![Other modes](https://img.shields.io/badge/Other_modes-20%25-red) ![Stages](https://img.shields.io/badge/Stages-80%25-green) ![Graphics](https://img.shields.io/badge/Graphics-90%25-brightgreen)
-![Audio](https://img.shields.io/badge/Audio-95%25-brightgreen) ![Movies](https://img.shields.io/badge/Movies-100%25-brightgreen) ![Widescreen](https://img.shields.io/badge/Widescreen-95%25-brightgreen) ![High frame rate](https://img.shields.io/badge/High_frame_rate-95%25-brightgreen) ![Online (System Link)](https://img.shields.io/badge/Online_%28System_Link%29-60%25-yellow)
+![Overall progress](https://img.shields.io/badge/overall-84%25-green)
+![Boot and menus](https://img.shields.io/badge/Boot_and_menus-95%25-brightgreen) ![Versus fights](https://img.shields.io/badge/Versus_fights-95%25-brightgreen) ![Other modes](https://img.shields.io/badge/Other_modes-25%25-red) ![Stages](https://img.shields.io/badge/Stages-80%25-green) ![Graphics](https://img.shields.io/badge/Graphics-93%25-brightgreen)
+![Audio](https://img.shields.io/badge/Audio-95%25-brightgreen) ![Movies](https://img.shields.io/badge/Movies-100%25-brightgreen) ![Widescreen](https://img.shields.io/badge/Widescreen-97%25-brightgreen) ![High frame rate](https://img.shields.io/badge/High_frame_rate-95%25-brightgreen) ![Online (System Link)](https://img.shields.io/badge/Online_%28System_Link%29-60%25-yellow)
 
 A native Windows port of the Xbox version of *Godzilla: Save the Earth* (2004), made by statically
 recompiling the game's `default.xbe` into C with the [xboxrecomp](https://github.com/sp00nznet/xboxrecomp)
@@ -48,12 +48,12 @@ Estimates from what has been checked in game so far. Overall is the average of t
 |---|---|---|
 | Boot and menus | 95% | Every menu works, including the new Options entries and the Biollante cell; they stay after returning from a match |
 | Versus fights | 95% | Played on all ten city and arena stages: HUD, beams, destruction, win/lose |
-| Other modes | 20% | Action, Melee, Survival and Challenges have not been played through yet |
+| Other modes | 25% | Action's first stage plays through to its results screen; the rest of Action, Melee, Survival and Challenges have not been played through yet |
 | Stages | 80% | The ten city and arena stages and the Mothership are checked in fights; the challenge stages are not |
-| Graphics | 90% | Combiners, cube maps, water reflections, fog; rare effects may still be wrong (MechaGodzilla 2 and 3's missiles don't show in flight) |
+| Graphics | 93% | Combiners, cube maps, water reflections, fog, point-sprite particles; rare effects may still be wrong. Fixed: MechaGodzilla 2 and 3's missiles now show in flight with their trails |
 | Audio | 95% | Music, effects and voices sound right in play; fixed: menu crackle, corrupted voice lines and UI sounds (memory and timing bugs in the sound emulation) |
 | Movies | 100% | Intro, story and credits play through ffmpeg; skipping them (GZ_MOVIES=0) is silent |
-| Widescreen | 95% | Wider view with matching culling in fights and menus, HUD in the corners; the pause menu's dimming covers only the middle |
+| Widescreen | 97% | Wider view with matching culling in fights and menus, HUD in the corners. Fixed: the round-end screen dims the whole picture, and the Action results screen keeps its layout. The pause menu's dimming may still cover only the middle (not rechecked) |
 | High frame rate | 95% | Up to 144 fps (higher rates were too unstable in play); game speed correct at a rate the PC holds (it used to run up to 30% fast at 120/144) |
 | Online (System Link) | 60% | Works between two copies on one PC; not yet tested PC to PC over the internet |
 
@@ -134,8 +134,8 @@ next to the program, it keeps saves in the program's `saves\` folder too. `.\pac
 - Not every stage and mode has been played through; the recompilation can still hit untranslated paths.
 - The frame rate setting goes up to 144. The first run compiles shaders into `shader_cache\` and is
   less smooth than later ones.
-- MechaGodzilla 2 and 3's missiles are invisible in flight: the launch flash and the hits show, the
-  missile and its trail don't. Being investigated.
+- Fixed since v0.1.7: a crash at startup, while the main menu loaded, after a file had gone missing
+  from the game's disk cache (`%LOCALAPPDATA%\GodzillaSTE\Cache`). The game rebuilds the cache itself.
 - Online play has been tested between two copies on one PC (including simulated lag and loss), not yet
   between two PCs over the internet.
 

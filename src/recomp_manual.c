@@ -1072,6 +1072,40 @@ static void gz_quick_fight_tick(void)
     }
 }
 
+/* Test aid: GZ_KO=<seconds> -- that long after a fight's opponent (player 2)
+ * appears, set its hit points to 0 so player 1 wins by knockout (to reach a
+ * results screen fast). Game object 0x004424F0: monster count at +0x450, list
+ * at +0x454 (8 bytes each, in RAM or the 0x80000000 window); monster +0xDC =
+ * player number, +0x85C = hit points (float). */
+static void gz_ko_tick(void)
+{
+    static int secs = -1;
+    static DWORD last, since;
+    static uint32_t cur, done;
+    uint32_t n, i, m = 0;
+    if (secs < 0) { const char *e = getenv("GZ_KO"); secs = e ? atoi(e) : 0; }
+    if (secs <= 0 || GetTickCount() - last < 250u) return;
+    last = GetTickCount();
+    n = GZ_MEM32(0x004424F0u + 0x450u);
+    for (i = 0; i < n && i < 8; i++) {
+        uint32_t c = GZ_MEM32(0x004424F0u + 0x454u + i * 8u);
+        if (((c >= 0x10000u && c < 0x04000000u) || (c >= 0x80000000u && c < 0x84000000u))
+                && GZ_MEM32(c + 0xDCu) == 1u) { m = c; break; }
+    }
+    if (!m) { cur = 0; return; }
+    if (m != cur) { cur = m; since = GetTickCount(); done = 0; }
+    if (!done && GetTickCount() - since >= (DWORD)secs * 1000u) {
+        float hp;
+        uint32_t x = GZ_MEM32(m + 0x85Cu);
+        memcpy(&hp, &x, 4);
+        if (hp > 0.0f) {
+            GZ_MEM32(m + 0x85Cu) = 0;
+            fprintf(stderr, "[KO] opponent %08X hit points %g -> 0\n", m, hp);
+        }
+        done = 1;
+    }
+}
+
 /* ── Tournament mode: everything unlocked (GZ_TOURNAMENT=1) ─────────────
  *
  * The cheat codes the menus accept set bits in GameInfo's "shell cheats" word
@@ -1704,6 +1738,7 @@ void sub_00012240(void)
     }
     memcpy(&req, &bits, 4);
     gz_quick_fight_tick();
+    gz_ko_tick();
     gz_tournament_tick();
     gz_opt_tick();
     gz_camera_tick();

@@ -1054,6 +1054,14 @@ static void gz_quick_fight_tick(void)
         if (p1 && *p1) { gz_qf_str(GZ_GAMEINFO + 0x160, p1, 0x1F); gz_qf_str(GZ_GAMEINFO + 0x17F, p1, 0x1F); }
         if (p2 && *p2) { gz_qf_str(GZ_GAMEINFO + 0x238, p2, 0x1F); gz_qf_str(GZ_GAMEINFO + 0x257, p2, 0x1F); }
         if (city && *city) gz_qf_str(GZ_GAMEINFO + 0xD0, city, 0x40);
+        {
+            /* GZ_QF_ROUND_TIME=<seconds>, GZ_QF_ROUNDS=<n>: a short match (for
+             * testing what follows one, like the results screen). ShellGameInfo
+             * get/setRoundTime is the float at +0x120, get/setRounds +0x128. */
+            const char *rt = getenv("GZ_QF_ROUND_TIME"), *rn = getenv("GZ_QF_ROUNDS");
+            if (rt && *rt) { float t = (float)atof(rt); uint32_t b; memcpy(&b, &t, 4); GZ_MEM32(GZ_GAMEINFO + 0x120) = b; }
+            if (rn && *rn) GZ_MEM32(GZ_GAMEINFO + 0x128) = (uint32_t)atoi(rn);
+        }
         fprintf(stderr, "[QUICKFIGHT] launching %s vs %s in %s\n",
                 (const char *)(gi + 0x160), (const char *)(gi + 0x238), (const char *)(gi + 0xD0));
         g_esp -= 4; GZ_MEM32(g_esp) = 0x00012240u;             /* return address */
@@ -1061,6 +1069,40 @@ static void gz_quick_fight_tick(void)
         sub_0009AA20();                                         /* Shell::launchGame */
         gz_qf_launching = 0;
         g_eax = eax; g_ecx = ecx; g_edx = edx;
+    }
+}
+
+/* Test aid: GZ_KO=<seconds> -- that long after a fight's opponent (player 2)
+ * appears, set its hit points to 0 so player 1 wins by knockout (to reach a
+ * results screen fast). Game object 0x004424F0: monster count at +0x450, list
+ * at +0x454 (8 bytes each, in RAM or the 0x80000000 window); monster +0xDC =
+ * player number, +0x85C = hit points (float). */
+static void gz_ko_tick(void)
+{
+    static int secs = -1;
+    static DWORD last, since;
+    static uint32_t cur, done;
+    uint32_t n, i, m = 0;
+    if (secs < 0) { const char *e = getenv("GZ_KO"); secs = e ? atoi(e) : 0; }
+    if (secs <= 0 || GetTickCount() - last < 250u) return;
+    last = GetTickCount();
+    n = GZ_MEM32(0x004424F0u + 0x450u);
+    for (i = 0; i < n && i < 8; i++) {
+        uint32_t c = GZ_MEM32(0x004424F0u + 0x454u + i * 8u);
+        if (((c >= 0x10000u && c < 0x04000000u) || (c >= 0x80000000u && c < 0x84000000u))
+                && GZ_MEM32(c + 0xDCu) == 1u) { m = c; break; }
+    }
+    if (!m) { cur = 0; return; }
+    if (m != cur) { cur = m; since = GetTickCount(); done = 0; }
+    if (!done && GetTickCount() - since >= (DWORD)secs * 1000u) {
+        float hp;
+        uint32_t x = GZ_MEM32(m + 0x85Cu);
+        memcpy(&hp, &x, 4);
+        if (hp > 0.0f) {
+            GZ_MEM32(m + 0x85Cu) = 0;
+            fprintf(stderr, "[KO] opponent %08X hit points %g -> 0\n", m, hp);
+        }
+        done = 1;
     }
 }
 
@@ -1696,6 +1738,7 @@ void sub_00012240(void)
     }
     memcpy(&req, &bits, 4);
     gz_quick_fight_tick();
+    gz_ko_tick();
     gz_tournament_tick();
     gz_opt_tick();
     gz_camera_tick();

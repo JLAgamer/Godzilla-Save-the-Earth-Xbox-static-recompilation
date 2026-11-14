@@ -79,11 +79,23 @@ static float s_draw_squeeze, s_draw_anchor, s_draw_yscale = 1.0f;
  * share of the screen as in 4:3. GZ_WIDE_HUD=1 leaves them at that smaller
  * size in the middle. */
 int gz_wide_fight_active(void);
+/* A frame that has drawn a dark full-screen layer (the dim behind a results,
+ * round-end or pause screen; how strong it is comes from the combiners, so
+ * only its colour is looked at) is showing an overlay from then on: what follows
+ * is that screen's own layout, not the fight HUD, so it is not spread to the
+ * corners. Whatever was drawn before the layer (the HUD under a pause dim)
+ * keeps the HUD rule. */
+static uint32_t s_frame;
+static uint32_t s_overlay_frame;
+static int wide_hud_on(void)
+{
+    return s_overlay_frame != s_frame && gz_wide_fight_active();
+}
 static void wide_hud_scale(float anchor, float w, float ymx, float h)
 {
     static int mode = -1;
     if (mode < 0) { const char *e = getenv("GZ_WIDE_HUD"); mode = (e && *e) ? atoi(e) : 2; }
-    if (mode < 2 || ymx > h * 0.30f || !gz_wide_fight_active()) return;
+    if (mode < 2 || ymx > h * 0.30f || !wide_hud_on()) return;
     if (anchor == w * 0.5f) { s_draw_squeeze = 1.0f; return; }          /* timer: as the game drew it */
     s_draw_squeeze = 4.0f / 3.0f; s_draw_anchor = w * 0.5f; s_draw_yscale = 4.0f / 3.0f;
 }
@@ -96,7 +108,7 @@ static float wide_anchor(float mn, float mx, float ymn, float ymx, float w, floa
 {
     static int hud = -1;
     if (hud < 0) hud = !(getenv("GZ_WIDE_HUD") && getenv("GZ_WIDE_HUD")[0] == '0');
-    if (hud && ymx <= h * 0.30f && gz_wide_fight_active()) {   /* fight HUD (top band) only */
+    if (hud && ymx <= h * 0.30f && wide_hud_on()) {   /* fight HUD (top band) only */
         /* By the piece's centre: every piece of a player's HUD (portrait,
          * ring, bar, name) moves with its side; the timer (digits centred
          * between about 298 and 342 of 640) stays in the middle. */
@@ -105,6 +117,18 @@ static float wide_anchor(float mn, float mx, float ymn, float ymx, float w, floa
         if (c > w * 0.535f) return w;
     }
     return w * 0.5f;
+}
+/* No picture on a draw, for the full-width exception below. batch.texture is
+ * whatever is bound on stage 0, sampled or not; once the title has set up the
+ * register combiners, textures[] holds only the stages its program reads. The
+ * round-end overlay (the dimmed "DRAW" / "PLAYER 1 WINS" screen) is such a
+ * quad with a stale stage-0 binding, and was squeezed to the 4:3 middle. */
+static int wide_untextured(const Nv2aBatch *b)
+{
+    int st;
+    if (!b->combiner) return !b->texture && !b->textures[0];
+    for (st = 0; st < 4; st++) if (b->textures[st]) return 0;
+    return 1;
 }
 #define WIDE_SURF(w, h) (s_wide && (w) == 640u && (h) == 480u)
 #define PX_W(w, h) (WIDE_SURF(w, h) ? ((w) * (UINT)s_scale * 4u + 2u) / 3u : (w) * (UINT)s_scale)
@@ -2184,8 +2208,13 @@ static void be_draw(const Nv2aSurface *s, const Nv2aBatch *b)
                 if (verts[k].y > ymx) ymx = verts[k].y;
                 if (verts[k].rhw < 0.99999f || verts[k].rhw > 1.00001f) flat = 0;
             }
-            if (flat && count <= 6 && !b->texture && !b->textures[0] && mn <= 2.0f && mx >= (float)r->w - 2.0f)
+            if (flat && count <= 6 && wide_untextured(b) && mn <= 2.0f && mx >= (float)r->w - 2.0f) {
                 s_draw_squeeze = 0.0f;
+                if (ymn <= 2.0f && ymx >= (float)r->h - 2.0f
+                        && ((verts[0].diffuse >> 16) & 0xFF) < 0x60u && ((verts[0].diffuse >> 8) & 0xFF) < 0x60u
+                        && (verts[0].diffuse & 0xFF) < 0x60u)
+                    s_overlay_frame = s_frame;
+            }
             else if (flat)
             {
                 s_draw_anchor = wide_anchor(mn, mx, ymn, ymx, (float)r->w, (float)r->h);
@@ -2872,20 +2901,25 @@ static int be_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
         s_draw_anchor = (float)r->w * 0.5f;
         s_draw_yscale = 1.0f;
         if (p->nverts <= 64) {
-            float mn = 1e9f, mx = -1e9f, ymn = 1e9f, ymx = -1e9f;
+            float mn = 1e9f, mx = -1e9f, ymn = 1e9f, ymx = -1e9f, c0[4] = {1, 1, 1, 1};
             uint32_t k;
             int flat = 1;
             for (k = 0; k < p->nverts && flat; k++) {
                 Nv2aVshOutput o;
                 if (!nv2a_vsh_run(pv(p, k), &o)) { flat = 0; break; }
+                if (k == 0) memcpy(c0, o.d0, sizeof c0);
                 if (o.pos[0] < mn) mn = o.pos[0];
                 if (o.pos[0] > mx) mx = o.pos[0];
                 if (o.pos[1] < ymn) ymn = o.pos[1];
                 if (o.pos[1] > ymx) ymx = o.pos[1];
                 if (o.pos[3] < 0.99999f || o.pos[3] > 1.00001f) flat = 0;
             }
-            if (flat && p->nverts <= 6 && !b->texture && !b->textures[0] && mn <= 2.0f && mx >= (float)r->w - 2.0f)
+            if (flat && p->nverts <= 6 && wide_untextured(b) && mn <= 2.0f && mx >= (float)r->w - 2.0f) {
                 s_draw_squeeze = 0.0f;
+                if (ymn <= 2.0f && ymx >= (float)r->h - 2.0f
+                        && c0[0] < 0.38f && c0[1] < 0.38f && c0[2] < 0.38f)
+                    s_overlay_frame = s_frame;
+            }
             else if (flat)
             {
                 s_draw_anchor = wide_anchor(mn, mx, ymn, ymx, (float)r->w, (float)r->h);

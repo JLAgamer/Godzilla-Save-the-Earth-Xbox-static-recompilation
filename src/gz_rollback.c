@@ -1497,6 +1497,21 @@ static void shot_keep(int run)
     MoveFileExA(a, b, MOVEFILE_REPLACE_EXISTING);
 }
 
+/* GZ_RB_VERIFY=1 in the sync test (GZ_RB_TEST): memory as it is at the
+ * boundary a run starts from, for the rollback that comes back to it to be
+ * checked against (verify_check). Here, right after that boundary, before
+ * any guest code: the state the rollback restores. Unlike the scripted
+ * match, this one can start during a stage load, so the rollbacks cross
+ * files opened and closed (the held closes, rb_closes_rollback). */
+static void rb_test_verify_take(void)
+{
+    const char *v = getenv("GZ_RB_VERIFY");
+    if (!(v && *v == '1')) return;
+    AcquireSRWLockExclusive(&s_lock);
+    verify_take();
+    ReleaseSRWLockExclusive(&s_lock);
+}
+
 /* Once per frame, from the limiter's main-loop call. */
 void gz_rb_tick(void)
 {
@@ -1541,6 +1556,7 @@ void gz_rb_tick(void)
                 (unsigned long long)s_stat_pages_max);
         s_count = 0;
         s_state = 2;
+        rb_test_verify_take();
         break;
     case 2:                                             /* first run */
         if (++s_count == s_ticks) shot_request();
@@ -1557,6 +1573,7 @@ void gz_rb_tick(void)
         fprintf(stderr, "[RB] round %d done\n", s_round + 1);
         s_count = 0;
         s_state = ++s_round < s_rounds ? 2 : 8;
+        if (s_state == 2) rb_test_verify_take();
         break;
     }
     if (s_state == 8) {

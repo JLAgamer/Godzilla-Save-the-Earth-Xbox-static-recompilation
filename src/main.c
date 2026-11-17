@@ -468,6 +468,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
          * controllers out: the session's pads are answered at the game's
          * controller API (recomp_manual.c), from the shared inputs. */
         extern int gz_rbn_session_boot(void);
+        /* The netplay lobby (gz_lobby.c, GZ_RB_LOBBY=1): it runs before the
+         * game boots and returns with the match it agreed on set up as a
+         * netplay quick fight. */
+        extern void gz_lobby_boot(void);
+        gz_lobby_boot();
         if (gz_rbn_session_boot()) _putenv("RECOMP_USB=");
         {
             /* GZ_RB_SKEW_HEAP=n (a test): this side takes n bytes of the

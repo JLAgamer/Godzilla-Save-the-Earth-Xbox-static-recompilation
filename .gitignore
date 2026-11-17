@@ -46,3 +46,4 @@ __pycache__/
 /dist/
 /rb_shots/
 /gz_netplay.txt
+rb_desync_p*.bin

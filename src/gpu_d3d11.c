@@ -901,10 +901,15 @@ static int init_device(void)
                                  WS_POPUP | WS_VISIBLE, 0, 0, (int)s_win_w, (int)s_win_h,
                                  NULL, NULL, wc.hInstance, NULL);
     } else {
+        /* GZ_WIN_POS=x,y: where the window was (the netplay lobby starts the
+         * game again between a match and the lobby, in the same place) */
+        int wx = CW_USEDEFAULT, wy = CW_USEDEFAULT;
+        const char *pos = getenv("GZ_WIN_POS");
+        if (pos && sscanf(pos, "%d,%d", &wx, &wy) != 2) wx = wy = CW_USEDEFAULT;
         r.left = 0; r.top = 0; r.right = (LONG)s_win_w; r.bottom = (LONG)s_win_h;
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
         s_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Godzilla: Save the Earth (recomp, D3D11)",
-                                 WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+                                 WS_OVERLAPPEDWINDOW | WS_VISIBLE, wx, wy,
                                  r.right - r.left, r.bottom - r.top, NULL, NULL, wc.hInstance, NULL);
     }
     if (s_scale == 0) {
@@ -1064,6 +1069,87 @@ static int ready(void)
     }
     s_ready = 1;
     return 1;
+}
+
+/* ── The netplay lobby (gz_lobby.c) ───────────────────────────────────
+ *
+ * A picture of our own in the game's window before the game boots: the
+ * window and device are made here (by the lobby's thread, which keeps
+ * pumping the window's messages afterwards), the lobby hands over each
+ * frame as BGRA pixels, and the game's own draws later reuse the window. */
+static ID3D11Texture2D *s_lobby_tex;
+static ID3D11ShaderResourceView *s_lobby_srv;
+static int s_lobby_w, s_lobby_h;
+
+HWND gz_gpu_window(void) { return s_hwnd; }
+
+int gz_gpu_lobby_open(void) { return ready(); }
+
+/* The window's top-left corner (for GZ_WIN_POS), 0 = no window. */
+int gz_gpu_window_pos(int *x, int *y)
+{
+    RECT r;
+    if (!s_hwnd || s_fullscreen || IsIconic(s_hwnd) || !GetWindowRect(s_hwnd, &r)) return 0;
+    *x = r.left;
+    *y = r.top;
+    return 1;
+}
+
+void gz_gpu_lobby_present(const uint32_t *bgra, int w, int h)
+{
+    static const float black[4] = { 0, 0, 0, 1 };
+    ID3D11ShaderResourceView *null_srv = NULL;
+    D3D11_VIEWPORT vp;
+    MSG msg;
+    if (!ready()) return;
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (s_quit) ExitProcess(0);
+    if (!s_lobby_tex || w != s_lobby_w || h != s_lobby_h) {
+        D3D11_TEXTURE2D_DESC td;
+        if (s_lobby_srv) { ID3D11ShaderResourceView_Release(s_lobby_srv); s_lobby_srv = NULL; }
+        if (s_lobby_tex) { ID3D11Texture2D_Release(s_lobby_tex); s_lobby_tex = NULL; }
+        memset(&td, 0, sizeof td);
+        td.Width = (UINT)w; td.Height = (UINT)h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_lobby_tex))) { s_lobby_tex = NULL; return; }
+        if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_lobby_tex, NULL, &s_lobby_srv))) {
+            ID3D11Texture2D_Release(s_lobby_tex); s_lobby_tex = NULL; return;
+        }
+        s_lobby_w = w; s_lobby_h = h;
+    }
+    ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_lobby_tex, 0, NULL, bgra, (UINT)w * 4u, 0);
+    if (s_back_rtv) {
+        float aspect = (float)w / (float)h;
+        float ww = (float)s_win_w, wh = (float)s_win_h, fw = ww, fh = ww / aspect;
+        if (fh > wh) { fh = wh; fw = wh * aspect; }
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
+        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
+        vp.TopLeftX = (ww - fw) * 0.5f; vp.TopLeftY = (wh - fh) * 0.5f;
+        vp.Width = fw; vp.Height = fh; vp.MinDepth = 0; vp.MaxDepth = 1;
+        ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+        ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+        ID3D11DeviceContext_OMSetBlendState(s_ctx, s_blend_off, NULL, 0xFFFFFFFFu);
+        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_off, 0);
+        ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11DeviceContext_VSSetShader(s_ctx, s_vs_blit, NULL, 0);
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_ps_blit, NULL, 0);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s_lobby_srv);
+        ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_sampler);
+        ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &null_srv);
+        IDXGISwapChain_Present(s_swap, 1, 0);
+    }
+}
+
+void gz_gpu_lobby_close(void)
+{
+    if (s_lobby_srv) { ID3D11ShaderResourceView_Release(s_lobby_srv); s_lobby_srv = NULL; }
+    if (s_lobby_tex) { ID3D11Texture2D_Release(s_lobby_tex); s_lobby_tex = NULL; }
 }
 
 /* ── Render targets and depth buffers ─────────────────────── */
@@ -2540,6 +2626,17 @@ static void be_flip(void)
         ExitProcess(0);
     }
 
+    {
+        /* Netplay on its way to the Versus screen (gz_rbnet.c): black
+         * until it is up, so the menus it presses through are not seen. */
+        extern int gz_rbn_hide_picture(void);
+        if (s_back_rtv && gz_rbn_hide_picture()) {
+            ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
+            ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
+            IDXGISwapChain_Present(s_swap, (UINT)s_vsync, (!s_vsync && s_tearing) ? GZ_PRESENT_ALLOW_TEARING : 0);
+            goto presented;
+        }
+    }
     if (s_present_rt && s_back_rtv) {
         /* Letterbox the frame (4:3, or 16:9 in widescreen) into the window. */
         float aspect = WIDE_SURF(s_present_rt->w, s_present_rt->h) ? 16.0f / 9.0f : 4.0f / 3.0f;
@@ -2601,6 +2698,10 @@ static void be_flip(void)
             s_h_be[0] = s_h_be[1] = s_h_be[2] = 0; s_h_ben[0] = s_h_ben[1] = s_h_ben[2] = 0;
         }
         s_st_presents++;
+        s_bound_rt = NULL; s_bound_ds = NULL;       /* rebind on the next draw */
+    }
+    if (0) {
+presented:
         s_bound_rt = NULL; s_bound_ds = NULL;       /* rebind on the next draw */
     }
     {

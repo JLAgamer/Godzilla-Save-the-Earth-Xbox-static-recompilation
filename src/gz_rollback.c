@@ -820,47 +820,113 @@ static uint64_t page_hash64(const uint8_t *p)
     return h;
 }
 
+uint64_t xbox_DevicesDigest(void);             /* kernel_bridge.c */
+uint64_t xbox_ApuDigest(void);                 /* apu_core.c */
+int gz_rbn_on(void);                           /* gz_rbnet.c */
+
+/* Every tick's digest, for netplay's desync check (gz_rbnet.c): a hash of
+ * each guest page the tick wrote, as it was at the tick's end - the low
+ * window less this machine's own pages; not the contiguous window (the
+ * sound chip's voices, D3D's push buffers) - and two more "pages" numbered
+ * past the real ones, the devices' state and the sound chip's frames. The
+ * last TH_RING ticks keep their page lists, so a desync can write out what
+ * the two PCs had in memory differently over the ticks before it was seen
+ * (in GZ_RB_HASHLOG's format, for rb_hashdiff.py). A rollback's replay
+ * writes its ticks' entries again. */
+#define TH_RING 128u
+#define TH_MAXP 3072u
+#define TH_BUCKETS 16u                         /* the digest in parts: pages spread by number */
+static uint32_t  s_th_tick[TH_RING];           /* tick + 1; 0 = empty */
+static uint64_t  s_th_sum[TH_RING][TH_BUCKETS];
+static uint32_t  s_th_n[TH_RING];
+static uint32_t (*s_th_rec)[TH_MAXP][4];        /* [TH_RING], allocated at first use */
+
+static void tickhash(const RbFrame *f)
+{
+    uint32_t slot = s_cur % TH_RING, n = 0, k;
+    uint64_t sum[TH_BUCKETS], v[2];
+    memset(sum, 0, sizeof sum);
+    if (!s_th_rec) {
+        s_th_rec = (uint32_t (*)[TH_MAXP][4])calloc(TH_RING, sizeof *s_th_rec);
+        if (!s_th_rec) return;
+    }
+    for (k = 0; k < f->npages; k++) {
+        const uint8_t *e = slot_ptr(f->first + k);
+        uint32_t i;
+        uint64_t h;
+        memcpy(&i, e, 4);
+        if (i >= 2u * RB_WPAGES || (i < RB_WPAGES && rb_local_page(i))) continue;
+        h = page_hash64(page_ptr(i));
+        /* The contiguous window (0x80000000 up) is the GPU's side: D3D's
+         * buffers and fences there follow each PC's GPU, and differed
+         * between two copies whose matches were the same. It is written
+         * out with the rest (to look at) but not compared. */
+        if (i < RB_WPAGES)
+            sum[(i * 0x9E3779B1u) >> 28] += (h ^ ((uint64_t)i * 0x9E3779B97F4A7C15ull)) * 0xFF51AFD7ED558CCDull;
+        if (n < TH_MAXP) {
+            uint32_t *r = s_th_rec[slot][n++];
+            r[0] = s_cur; r[1] = i; r[2] = (uint32_t)h; r[3] = (uint32_t)(h >> 32);
+        }
+    }
+    if (xbox_DevicesLocked()) {
+        v[0] = xbox_DevicesDigest();
+        v[1] = xbox_ApuDigest();
+        for (k = 0; k < 2; k++) {
+            sum[k] += (v[k] ^ (0xFFFFFF00ull + k)) * 0xC4CEB9FE1A85EC53ull;
+            if (n < TH_MAXP) {
+                uint32_t *r = s_th_rec[slot][n++];
+                r[0] = s_cur; r[1] = 0xFFFFFF00u + k; r[2] = (uint32_t)v[k]; r[3] = (uint32_t)(v[k] >> 32);
+            }
+        }
+    }
+    s_th_tick[slot] = s_cur + 1;
+    memcpy(s_th_sum[slot], sum, sizeof sum);
+    s_th_n[slot] = n;
+}
+
+/* Tick `t`'s digest (16 parts), if it is still kept. */
+int gz_rb_tick_digest(uint32_t t, uint64_t h[16])
+{
+    int ok;
+    AcquireSRWLockShared(&s_lock);
+    ok = s_th_tick[t % TH_RING] == t + 1;
+    if (ok) memcpy(h, s_th_sum[t % TH_RING], sizeof s_th_sum[0]);
+    ReleaseSRWLockShared(&s_lock);
+    return ok;
+}
+
+/* The page lists of the kept ticks up to `upto`, oldest first, to `path`
+ * (GZ_RB_HASHLOG's records). Returns how many ticks were written. */
+int gz_rb_write_digests(uint32_t upto, const char *path)
+{
+    FILE *h = fopen(path, "wb");
+    uint32_t t0 = upto >= TH_RING - 1 ? upto - (TH_RING - 1) : 0, t;
+    int ticks = 0;
+    if (!h) return 0;
+    AcquireSRWLockShared(&s_lock);
+    for (t = t0; t <= upto && s_th_rec; t++) {
+        uint32_t slot = t % TH_RING;
+        if (s_th_tick[slot] != t + 1) continue;
+        fwrite(s_th_rec[slot], 16, s_th_n[slot], h);
+        ticks++;
+    }
+    ReleaseSRWLockShared(&s_lock);
+    fclose(h);
+    return ticks;
+}
+
 static void hashlog_tick(const RbFrame *f)
 {
-    uint32_t k;
+    uint32_t slot = s_cur % TH_RING;
+    (void)f;
     if (s_hashlog_on < 0) {
         const char *e = getenv("GZ_RB_HASHLOG");
         s_hashlog_on = e && *e && (s_hashlog = fopen(e, "wb")) != NULL;
         if (s_hashlog) setvbuf(s_hashlog, NULL, _IOFBF, 1 << 20);
     }
-    if (!s_hashlog_on) return;
-    for (k = 0; k < f->npages; k++) {
-        const uint8_t *e = slot_ptr(f->first + k);
-        uint32_t i, rec[4];
-        uint64_t h;
-        memcpy(&i, e, 4);
-        /* the low window less this machine's own pages, and the contiguous
-         * window (the sound chip's voices, D3D's push buffers) */
-        if (i >= 2u * RB_WPAGES || (i < RB_WPAGES && rb_local_page(i))) continue;
-        h = page_hash64(page_ptr(i));
-        rec[0] = s_cur; rec[1] = i; rec[2] = (uint32_t)h; rec[3] = (uint32_t)(h >> 32);
-        fwrite(rec, sizeof rec, 1, s_hashlog);
-    }
+    if (!s_hashlog_on || !s_th_rec || s_th_tick[slot] != s_cur + 1) return;
+    fwrite(s_th_rec[slot], 16, s_th_n[slot], s_hashlog);
     if (s_cur % 60 == 0) fflush(s_hashlog);     /* the test harness kills the process */
-}
-
-uint64_t xbox_DevicesDigest(void);             /* kernel_bridge.c */
-uint64_t xbox_ApuDigest(void);                 /* apu_core.c */
-
-/* Two more "pages" per tick, numbered past the real ones: the devices'
- * state and the sound chip's frames, at the tick's end. */
-static void hashlog_devices(void)
-{
-    uint64_t v[2];
-    int k;
-    if (s_hashlog_on <= 0 || !xbox_DevicesLocked()) return;
-    v[0] = xbox_DevicesDigest();
-    v[1] = xbox_ApuDigest();
-    for (k = 0; k < 2; k++) {
-        uint32_t rec[4];
-        rec[0] = s_cur; rec[1] = 0xFFFFFF00u + (uint32_t)k; rec[2] = (uint32_t)v[k]; rec[3] = (uint32_t)(v[k] >> 32);
-        fwrite(rec, sizeof rec, 1, s_hashlog);
-    }
 }
 
 static void hashlog_rollback(uint32_t target)
@@ -873,6 +939,14 @@ static void hashlog_rollback(uint32_t target)
 
 void gz_rb_hashlog_flush(void) { if (s_hashlog_on > 0) fflush(s_hashlog); }
 
+/* Netplay's unseen way to the Versus screen (gz_rbnet.c): those frames run
+ * as fast as they can, so their sound is not heard (as a replay's). */
+static int rb_unseen_frames(void)
+{
+    extern int gz_rbn_hide_picture(void);
+    return gz_rbn_hide_picture();
+}
+
 /* A boundary: close the tick that ran, open the next. */
 static void boundary(void)
 {
@@ -882,7 +956,7 @@ static void boundary(void)
     if (xbox_DevicesLocked())
         /* the devices' frame (netplay): the same on both PCs, and in a
          * replay the same again, without the sound being heard twice */
-        xbox_DevicesTick(1, s_replay_until && s_cur < s_replay_until);
+        xbox_DevicesTick(1, (s_replay_until && s_cur < s_replay_until) || rb_unseen_frames());
     else if (s_replay_until && s_cur < s_replay_until && rb_sound_catch_up_on())
         rb_apu_catch_up();
     xbox_DispatchGateEnter();           /* sound and other device code: not in flight */
@@ -890,8 +964,8 @@ static void boundary(void)
     xbox_ApuLock();                     /* before s_lock: see xbox_ApuLock */
     AcquireSRWLockExclusive(&s_lock);
     apu_capture(f);
+    if (gz_rbn_on() || s_hashlog_on) tickhash(f);   /* (-1: GZ_RB_HASHLOG not looked at yet) */
     hashlog_tick(f);
-    hashlog_devices();
     if (f->npages > s_stat_pages_max) s_stat_pages_max = f->npages;
     reprotect(f);
     s_cur++;

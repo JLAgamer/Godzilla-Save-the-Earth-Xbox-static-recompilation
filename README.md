@@ -111,13 +111,27 @@ while another program's window is in front (`RECOMP_PAD_BACKGROUND=1` reads them
 
 - **Rollback netplay (experimental, not in releases yet):** a Versus match between two PCs where your own
   moves never wait for the network. In **Multi-Player**, Xbox Live is replaced by **Rollback Netplay**: one
-  player picks *Host a match*, the other types the host's IP and picks *Join*. Both games restart together
-  as one session with the host's profile: the host's controller is player 1 and drives the menus (Versus,
-  rules, city), the friend's is player 2 (press Start on the monster select to join), and each picks a
-  monster. The menus wait for both controllers every frame (with 6 frames of input delay, `GZ_RB_MENU_DELAY`,
-  so a slow connection does not stall them); fights run with rollback. Pausing and quitting a fight goes
-  back to the menus together, and the next fight starts in step again. Saves made in a
-  session go to a separate `netplay` folder, not your profile. A one-off match without the menus can also
+  player picks *Host a match*, the other types the host's IP and picks *Join*. Both games start again
+  together and open straight on the game's **Versus** screen (the host's side presses the way there; the
+  picture stays black meanwhile). Player 2 presses Start to join in, as in the game's own Versus, then both
+  play the game's menus together: the host's controller drives them (rules, city), each picks a monster,
+  fights run with rollback, and after a fight both are back in the menus together for the next. The menus
+  wait for both controllers every frame (6 frames of input delay, `GZ_RB_MENU_DELAY`).
+
+  With `GZ_RB_LOBBY_UI=1` (set before picking Host or Join) both games start again in a **lobby** of our
+  own instead: the host's shows its IP for the friend, and the friend's joins it. Each player picks a
+  monster on their own controller (or the keyboard: arrows, Enter, Esc, Space), the host also picks the city,
+  the rounds and the round time, Start makes you ready, and when both are ready the host's Start counts down
+  and both games boot straight into that match, with rollback. When the match is over (or quit from the
+  pause menu) both go back to the lobby with the same picks, for a rematch. B or *Leave* leaves (it asks
+  first) and the game starts again as it was; if the host leaves, the friend goes back to the game, and if
+  the friend leaves, the host's lobby waits for the next player. A friend who goes silent for 10 s counts
+  as gone. Everything is unlocked in netplay (tournament mode). Saves made in netplay go to a separate
+  `netplay` folder, not your profile. Both PCs play with the host's widescreen
+  setting (it changes what the game culls, and two PCs that culled differently played different matches).
+  The two PCs compare a digest of every frame: `play.log` reports how many frames matched, and if the
+  matches go apart it prints `DESYNC` and writes `rb_desync_p1_0.bin` / `rb_desync_p2_0.bin` next to the
+  game (send both with both logs). A one-off match without the menus can also
   be started on both PCs (the host's last Versus setup, monsters, city and seed are used on both):
 
   | | Player 1 (host) | Player 2 |
@@ -132,6 +146,8 @@ while another program's window is in front (`RECOMP_PAD_BACKGROUND=1` reads them
   first controller. `.\rb_session_test.ps1 -Steps (Get-Content rb_session_fight.txt)` plays two copies on
   one PC as a session through the menus into a Versus fight and logs a hash of every page each frame
   wrote (`recomp_config\tools\rb_hashdiff.py` then names the first frame the two played differently);
+  `.\rb_lobby_test.ps1 -Steps (Get-Content rb_lobby_steps.txt) -Env @{GZ_KO="25"}` plays two copies through
+  the lobby into a one-round match, knocks player 2 out 25 s in and comes back to the lobby;
   `.\rb_menu_test.ps1` goes through the Rollback Netplay prompt; `.\rb_net_test.ps1` plays a scripted
   quick-fight match; `.\rb_test.ps1` tests rollbacks in a single copy.
 

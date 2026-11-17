@@ -260,6 +260,19 @@ void gz_opt_toggle(int which)
     fprintf(stderr, "[SETTINGS] %s=%d\n", s_key[which], s_val[which]);
 }
 
+/* Netplay: the host's widescreen setting for this run (not saved). It
+ * widens the frustum the game culls its scenery against, and two PCs that
+ * culled differently played different matches (gz_rbnet.c). */
+void gz_opt_force_wide(int v)
+{
+    load();
+    if (s_val[OPT_WIDE] != (v != 0)) {
+        s_val[OPT_WIDE] = v != 0;
+        s_generation++;
+        fprintf(stderr, "[SETTINGS] widescreen=%d for this netplay session (the host's)\n", s_val[OPT_WIDE]);
+    }
+}
+
 int gz_opt_tournament(void) { return gz_opt_get(OPT_TOURNAMENT); }
 int gz_opt_ps_prompts(void) { return gz_opt_get(OPT_PROMPTS); }
 int gz_opt_rate(void)       { return gz_opt_get(OPT_RATE); }

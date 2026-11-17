@@ -1,0 +1,13 @@
+2:right:150
+2:right:150
+2:a:200
+2:start:200
+1:down:150
+1:a:200
+1:down:150
+1:down:150
+1:down:150
+1:down:150
+1:left:150
+1:start:200
+1:start:200

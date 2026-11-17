@@ -628,6 +628,7 @@ static void gz_match_over(void)
         if (online) gz_ach_event("online_match_won");
     }
     memset(gz_results_won, 0, sizeof gz_results_won);
+    { extern void gz_rbn_match_over(void); gz_rbn_match_over(); }   /* a lobby's match: back to it */
 }
 
 static void gz_game_results_invoke(void)
@@ -1128,6 +1129,35 @@ static void gz_ko_tick(void)
     static uint32_t cur, done;
     uint32_t n, i, m = 0;
     if (secs < 0) { const char *e = getenv("GZ_KO"); secs = e ? atoi(e) : 0; }
+    if (secs > 0) {
+        /* Rollback netplay: on the frame count, not the clock, so both PCs
+         * (and a rollback's replay) knock it out at the same frame. */
+        extern int gz_rbn_on(void);
+        extern uint32_t gz_rb_cur_tick(void);
+        static uint32_t seen_at = 0xFFFFFFFFu;
+        if (gz_rbn_on()) {
+            uint32_t t = gz_rb_cur_tick();
+            n = GZ_MEM32(0x004424F0u + 0x450u);
+            for (i = 0; i < n && i < 8; i++) {
+                uint32_t c = GZ_MEM32(0x004424F0u + 0x454u + i * 8u);
+                if (((c >= 0x10000u && c < 0x04000000u) || (c >= 0x80000000u && c < 0x84000000u))
+                        && GZ_MEM32(c + 0xDCu) == 1u) { m = c; break; }
+            }
+            if (!m) return;
+            if (seen_at == 0xFFFFFFFFu || t < seen_at) seen_at = t;
+            if (t >= seen_at + (uint32_t)secs * 60u) {
+                float hp;
+                uint32_t x = GZ_MEM32(m + 0x85Cu);
+                memcpy(&hp, &x, 4);
+                if (hp > 0.0f) {
+                    GZ_MEM32(m + 0x85Cu) = 0;
+                    if (!done) fprintf(stderr, "[KO] tick %u: opponent %08X hit points %g -> 0\n", t, m, hp);
+                    done = 1;
+                }
+            }
+            return;
+        }
+    }
     if (secs <= 0 || GetTickCount() - last < 250u) return;
     last = GetTickCount();
     n = GZ_MEM32(0x004424F0u + 0x450u);
@@ -1328,6 +1358,21 @@ void sub_0009B0C0(void)
          * but never asks a list entry's name. */
         extern void gz_rbn_set_fight(int on);
         gz_rbn_set_fight(0);
+    }
+    if (name) {
+        /* the menus' entries, for netplay's way to the Versus screen
+         * (gz_rbnet.c); GZ_MENU_LOG=1 prints each new one */
+        extern void gz_rbn_menu_entry(const char *name);
+        static int log = -1;
+        static char last[64];
+        const char *nm = gz_guest_cstr(name);
+        if (log < 0) log = getenv("GZ_MENU_LOG") != NULL;
+        gz_rbn_menu_entry(nm);
+        if (log && strncmp(last, nm, sizeof last - 1)) {
+            extern uint32_t gz_rb_cur_tick(void);
+            snprintf(last, sizeof last, "%s", nm);
+            fprintf(stderr, "[MENU] tick %u: %s\n", gz_rb_cur_tick(), nm);
+        }
     }
     if (name)
         for (i = 0; i < GZ_OPT_N; i++)
@@ -2098,8 +2143,10 @@ void sub_00012240(void)
                 QueryPerformanceCounter(&q);
                 start = now = (double)q.QuadPart / (double)qf.QuadPart;
                 target = last + (double)period;
-                if (gz_rb_replaying()) {
-                    /* a rollback's replay (gz_rollback.c): no wait */
+                extern int gz_rbn_hide_picture(void);
+                if (gz_rb_replaying() || gz_rbn_hide_picture()) {
+                    /* a rollback's replay (gz_rollback.c), or netplay's
+                     * unseen way to the Versus screen (gz_rbnet.c): no wait */
                     last = now;
                 } else if (now >= target || target - now > 2.0 * (double)period) {
                     /* late, or no schedule yet: no wait */

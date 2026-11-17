@@ -82,6 +82,7 @@ set(GAME_SOURCES
     src/gz_ach.c             # Recomp Achievements events (match results)
     src/gz_rollback.c        # rollback: state history, lockstep workers, sync tests (GZ_RB_TEST / GZ_RB_SCRIPT)
     src/gz_rbnet.c           # rollback netplay for two players (GZ_RB_NET=1)
+    src/gz_lobby.c           # the netplay lobby (pick monsters, city and rules, then the match)
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c
@@ -122,6 +123,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     # function's symbol, i.e. to the guest function that faulted.
     dbghelp
     shell32              # gz_launch.c: CommandLineToArgvW
+    gdi32                # gz_lobby.c: the lobby's picture is drawn with GDI
     bcrypt               # gz_launch.c: SHA-1 of the player's default.xbe
 )
 

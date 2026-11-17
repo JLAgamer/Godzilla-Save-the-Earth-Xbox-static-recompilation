@@ -70,6 +70,11 @@ void     xbox_Nv2aStateLoad(const void *buf);
 int      xbox_Nv2aPause(int want_idle);
 void     xbox_Nv2aResume(void);
 void     xbox_DevicesStart(void);
+int      gz_opt_wide(void);                              /* gz_settings.c */
+void     gz_opt_force_wide(int v);
+#define  OPTS_TAG 0x5354504Fu                           /* "OPTS" */
+int      gz_rb_tick_digest(uint32_t t, uint64_t h[16]);  /* 16 parts: pages spread by number */
+int      gz_rb_write_digests(uint32_t upto, const char *path);
 
 /* The host-side states tick 0 sends after the pages, each tagged and sized:
  * what the pages were laid out by or run beside, which pages cannot carry. */
@@ -110,9 +115,9 @@ static void st_load(int k, const void *buf)
 #define PAD      18
 #define RING     512u                   /* ticks of pads kept */
 #define MAXSEND  40u                    /* pads per packet at most */
-#define MAGIC    0x5242475Au            /* "ZGBR" */
+#define MAGIC    0x5242475Bu            /* "[GBR": a build with the desync check */
 
-enum { M_HELLO = 1, M_SETUP, M_HASHES, M_STATE, M_FILES };
+enum { M_HELLO = 1, M_SETUP, M_HASHES, M_STATE, M_FILES, M_LOBBY };
 #define MAX_TRANSFER 2000u              /* pages at tick 0, at most (about 8 MB) */
 #define REFUSED      0xFFFFFFFFu
 
@@ -134,6 +139,18 @@ static uint32_t s_peer_tick;            /* the peer's tick, from its last packet
 static double   s_peer_tick_at;         /* when that packet came */
 static double   s_ahead_avg;
 static unsigned s_stat_rb, s_stat_rb_ticks, s_stat_stall_ms;
+
+/* The desync check: each packet carries this side's digest of its last
+ * final tick (one that ran on both players' real pads and will not be
+ * played again); the other side compares it with its own of that tick. */
+static int64_t  s_final = -1;           /* this side's last final tick */
+static struct { uint32_t tick; uint64_t h[16]; } s_rdig[64];  /* the other side's, to check */
+static unsigned s_rdig_n;
+static int      s_desynced;
+/* checked; a few parts different (a word left on a stack or in a buffer that
+ * follows this PC's GPU, seen between two copies on one PC); most different */
+static unsigned s_stat_checked, s_stat_small, s_stat_bad;
+#define DESYNC_PARTS 6                  /* parts that differ, at least, for a desync */
 
 static double now_s(void)
 {
@@ -179,6 +196,81 @@ void gz_rbn_set_fight(int on)
         s_fight = on;
         fprintf(stderr, "[RBN] %s\n", on ? "fight: rollback on guesses" : "menus: waiting for both pads (lockstep)");
     }
+}
+
+/* ── straight to the Versus screen (GZ_RB_TO_VERSUS=1) ─────────────────
+ *
+ * A session started from the Multi-Player menu opens on the game's Versus
+ * screen: the host's side presses the way there (Versus on the main menu,
+ * then the host's profile), the picture stays black until it is up, and
+ * player 2 joins on it with Start, as in the game's own Versus. The
+ * presses are the host's pad, so both PCs get them; they are timed from
+ * the frame the main menu builds its lists (its "Versus" entry), which in
+ * lockstep is the same frame on both, however fast each PC is. Until then
+ * neither PC's controller counts. */
+#define TV_DOWN   120                   /* frames after the main menu: Down (to Versus) */
+#define TV_A1     180                   /* A: Versus (the Profiles screen) */
+#define TV_A2     260                   /* A: the host's profile */
+#define TV_END    300                   /* the controllers count again */
+#define TV_SHOW   400                   /* the picture is shown */
+static int     s_to_versus = -1;
+static int64_t s_tv_anchor = -1;
+
+static int to_versus(void)
+{
+    if (s_to_versus < 0) {
+        const char *e = getenv("GZ_RB_TO_VERSUS");
+        s_to_versus = e && *e == '1' && gz_rbn_session();
+    }
+    return s_to_versus;
+}
+
+/* A menu list asked an entry's name (recomp_manual.c, sub_0009B0C0). */
+void gz_rbn_menu_entry(const char *name)
+{
+    if (to_versus() && s_tv_anchor < 0 && !strcmp(name, "Versus")) {
+        s_tv_anchor = gz_rb_cur_tick();
+        fprintf(stderr, "[RBN] main menu at tick %lld: on to the Versus screen\n", (long long)s_tv_anchor);
+    }
+}
+
+/* Side `side`'s pad on the way (1 = this tick's pad is set): the host
+ * presses, player 2 nothing. Each PC works out the other's too, so neither
+ * waits for the other's pads on the way (both run as fast as they can). */
+static int tv_pad(int side, uint32_t tick, uint8_t *pad18)
+{
+    int64_t d;
+    if (!to_versus()) return 0;
+    if (s_tv_anchor < 0) { memset(pad18, 0, PAD); return 1; }
+    d = (int64_t)tick - s_tv_anchor;
+    if (d >= TV_END) return 0;
+    memset(pad18, 0, PAD);
+    if (side != 1) return 1;
+    if (d >= TV_DOWN && d < TV_DOWN + 9) pad18[0] = 0x02;              /* D-pad down */
+    if ((d >= TV_A1 && d < TV_A1 + 18) || (d >= TV_A2 && d < TV_A2 + 18))
+        pad18[2] = 0xFF;                                                /* A */
+    return 1;
+}
+
+/* The picture stays black until the Versus screen is up (gpu_d3d11.c). */
+int gz_rbn_hide_picture(void)
+{
+    static int shown;
+    int hide = to_versus() && (s_tv_anchor < 0 || (int64_t)gz_rb_cur_tick() < s_tv_anchor + TV_SHOW);
+    if (to_versus() && !hide && !shown) {
+        /* how long the restart took: since this process started */
+        FILETIME c, e, k, u, now;
+        shown = 1;
+        if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) {
+            ULARGE_INTEGER a, b;
+            GetSystemTimeAsFileTime(&now);
+            a.LowPart = c.dwLowDateTime; a.HighPart = c.dwHighDateTime;
+            b.LowPart = now.dwLowDateTime; b.HighPart = now.dwHighDateTime;
+            fprintf(stderr, "[RBN] the Versus screen is up: %.1f s after the game started again\n",
+                    (double)(b.QuadPart - a.QuadPart) / 1e7);
+        }
+    }
+    return hide;
 }
 
 /* A session (GZ_RB_SESSION=1, from the Multi-Player menu): the two PCs play
@@ -244,9 +336,12 @@ static int parse_peer(const char *v, struct sockaddr_in *a)
 
 /* Sockets up and the TCP link made: the host waits for the client to
  * connect, the client connects to the host (both retry for a minute). */
+static int s_link_done;                 /* connect_peer has run (or the lobby made the link) */
+static int s_hello_taken;               /* the host has the client's hello already (the lobby) */
+
 static int connect_peer(void)
 {
-    static int done;
+#define done s_link_done
     WSADATA w;
     struct sockaddr_in me;
     u_long nb = 1;
@@ -306,6 +401,7 @@ static int connect_peer(void)
     s_have_peer = 1;
     fprintf(stderr, "[RBN] connected (%.1f s)\n", now_s() - t0);
     return 1;
+#undef done
 }
 
 /* ── a session's start: the host's profile for both ──────────────────── */
@@ -405,12 +501,12 @@ static void unpack_files(const uint8_t *m, uint32_t len, const char *udata)
 /* At boot, before the game starts (main.c): connect, and give both PCs the
  * host's profile, so the menus (profiles, unlocks) are the same on both.
  * 0 = no session (the game then starts on its own). */
+static int exchange_profile(const char *udata, const char *from);
+
 int gz_rbn_session_boot(void)
 {
     const char *save = getenv("GZ_SAVE_DIR"), *from = getenv("GZ_RB_PROFILE_FROM");
     char udata[MAX_PATH * 2];
-    uint32_t type, len;
-    uint8_t *m;
     if (!gz_rbn_session()) return 0;
     if (!save || !*save) { s_on = 0; return 0; }
     snprintf(udata, sizeof udata, "%s\\UDATA", save);
@@ -421,6 +517,17 @@ int gz_rbn_session_boot(void)
         s_on = 0;
         return 0;
     }
+    if (!exchange_profile(udata, from)) { s_on = 0; return 0; }
+    return 1;
+}
+
+/* After the link: the host takes the client's hello (its UDP port) and
+ * sends its profile (UDATA) and the settings that change a match; both
+ * sides keep the same copy in <GZ_SAVE_DIR>\UDATA. */
+static int exchange_profile(const char *udata, const char *from)
+{
+    uint32_t type, len;
+    uint8_t *m;
     delete_tree(udata);
     CreateDirectoryA(udata, NULL);
     if (s_side == 1) {
@@ -428,8 +535,9 @@ int gz_rbn_session_boot(void)
         uint32_t blen = 4, cap = 0, count = 0;
         char src[MAX_PATH * 2];
         m = msg_recv(&type, &len);              /* the hello: its UDP port */
-        if (!m || type != M_HELLO || len < 8 || ((uint32_t *)m)[0] != MAGIC) { free(m); s_on = 0; return 0; }
+        if (!m || type != M_HELLO || len < 8 || ((uint32_t *)m)[0] != MAGIC) { free(m); return 0; }
         s_peer.sin_port = htons((uint16_t)((uint32_t *)m)[1]);
+        s_hello_taken = 1;
         free(m);
         cap = 1u << 20;
         buf = (uint8_t *)malloc(cap);
@@ -438,18 +546,263 @@ int gz_rbn_session_boot(void)
             pack_dir(src, "", &buf, &blen, &cap, &count);
         }
         memcpy(buf, &count, 4);
+        /* after the files, the host's settings that change the match:
+         * widescreen (what the game culls against) */
+        if (blen + 8 > cap) { uint8_t *nb = (uint8_t *)realloc(buf, blen + 8); if (nb) { buf = nb; cap = blen + 8; } }
+        if (blen + 8 <= cap) {
+            uint32_t tag = OPTS_TAG, wide = (uint32_t)gz_opt_wide();
+            memcpy(buf + blen, &tag, 4);
+            memcpy(buf + blen + 4, &wide, 4);
+            blen += 8;
+        }
         msg_send(M_FILES, buf, blen, NULL, 0);
         unpack_files(buf, blen, udata);         /* the same copy here */
         free(buf);
         fprintf(stderr, "[RBN] session: %u profile file(s) sent to player 2\n", count);
     } else {
         m = msg_recv(&type, &len);
-        if (!m || type != M_FILES) { free(m); s_on = 0; return 0; }
+        if (!m || type != M_FILES) { free(m); return 0; }
         unpack_files(m, len, udata);
+        if (len >= 12) {
+            uint32_t tag, wide;
+            memcpy(&tag, m + len - 8, 4);
+            memcpy(&wide, m + len - 4, 4);
+            if (tag == OPTS_TAG) gz_opt_force_wide((int)wide);
+        }
         fprintf(stderr, "[RBN] session: the host's profile received (%u bytes)\n", len);
         free(m);
     }
     return 1;
+}
+
+/* ── the lobby's link (gz_lobby.c) ─────────────────────────────────────
+ *
+ * The lobby makes the link itself, on a thread of its own while it draws:
+ * the host listens and takes one player at a time (again after one leaves),
+ * the client connects. Each link starts with the hello and the host's
+ * profile, as a session's; the lobby's messages (M_LOBBY) follow, and the
+ * match that the lobby starts goes on over the same link. */
+static SOCKET s_listen = INVALID_SOCKET;
+void gz_rbn_lobby_drop(void);
+
+static int lobby_sockets(void)
+{
+    static int up;
+    WSADATA w;
+    struct sockaddr_in me;
+    u_long nb = 1;
+    int one = 1;
+    double t0 = now_s();
+    if (up) return up > 0;
+    up = -1;
+    WSAStartup(MAKEWORD(2, 2), &w);
+    memset(&me, 0, sizeof me);
+    me.sin_family = AF_INET;
+    me.sin_port = htons(s_port);
+    me.sin_addr.s_addr = htonl(INADDR_ANY);
+    /* (the run before, which started this one, may still be closing its
+     * own: a few seconds' grace) */
+    for (;;) {
+        s_udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s_udp != INVALID_SOCKET && bind(s_udp, (struct sockaddr *)&me, sizeof me) == 0) break;
+        if (s_udp != INVALID_SOCKET) closesocket(s_udp);
+        s_udp = INVALID_SOCKET;
+        if (now_s() - t0 > 5.0) {
+            fprintf(stderr, "[RBN] UDP port %u: cannot bind (%d)\n", (unsigned)s_port, WSAGetLastError());
+            return 0;
+        }
+        Sleep(200);
+    }
+    SetHandleInformation((HANDLE)s_udp, HANDLE_FLAG_INHERIT, 0);
+    ioctlsocket(s_udp, FIONBIO, &nb);
+    if (s_side == 1) {
+        s_listen = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        setsockopt(s_listen, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+        if (s_listen == INVALID_SOCKET || bind(s_listen, (struct sockaddr *)&me, sizeof me) != 0
+                || listen(s_listen, 1) != 0) {
+            fprintf(stderr, "[RBN] TCP port %u: cannot listen (%d)\n", (unsigned)s_port, WSAGetLastError());
+            return 0;
+        }
+        SetHandleInformation((HANDLE)s_listen, HANDLE_FLAG_INHERIT, 0);
+    }
+    up = 1;
+    return 1;
+}
+
+/* Make the link (blocking; the lobby runs it on a thread). The host waits
+ * for a player for as long as it takes; the client tries for `timeout_s`.
+ * 1 = linked, 0 = no (the reason in *why). */
+int gz_rbn_lobby_link(double timeout_s, const char **why)
+{
+    const char *save = getenv("GZ_SAVE_DIR"), *from = getenv("GZ_RB_PROFILE_FROM");
+    char udata[MAX_PATH * 2];
+    int one = 1;
+    DWORD rcv = 60000;                          /* a silent peer: messages fail after a minute (the
+                                                 * other PC may take a while to load the match) */
+    double t0 = now_s();
+    *why = "";
+    if (!gz_rbn_on()) { *why = "netplay is off"; return 0; }
+    if (!lobby_sockets()) { *why = s_side == 1 ? "the port is in use on this PC" : "cannot open the port on this PC"; return 0; }
+    snprintf(udata, sizeof udata, "%s\\UDATA", save && *save ? save : ".");
+    if (s_side == 1) {
+        struct sockaddr_in a;
+        int alen = sizeof a;
+        fprintf(stderr, "[RBN] lobby: waiting for player 2 on port %u\n", (unsigned)s_port);
+        s_tcp = accept(s_listen, (struct sockaddr *)&a, &alen);
+        if (s_tcp == INVALID_SOCKET) { *why = "accept failed"; return 0; }
+        s_peer = a;
+    } else {
+        const char *v = getenv("GZ_RB_PEER");
+        if (!v || !parse_peer(v, &s_peer)) { *why = "no host address"; return 0; }
+        for (;;) {
+            s_tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (connect(s_tcp, (struct sockaddr *)&s_peer, sizeof s_peer) == 0) break;
+            closesocket(s_tcp);
+            s_tcp = INVALID_SOCKET;
+            if (now_s() - t0 > timeout_s) { *why = "no lobby at that address"; return 0; }
+            Sleep(250);
+        }
+        {
+            uint32_t hello[2] = { MAGIC, s_port };
+            msg_send(M_HELLO, hello, sizeof hello, NULL, 0);
+        }
+    }
+    setsockopt(s_tcp, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+    setsockopt(s_tcp, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rcv, sizeof rcv);
+    SetHandleInformation((HANDLE)s_tcp, HANDLE_FLAG_INHERIT, 0);
+    if (!exchange_profile(udata, from)) {
+        *why = s_side == 1 ? "player 2 runs a different version" : "the lobby is full (or the host runs a different version)";
+        gz_rbn_lobby_drop();
+        return 0;
+    }
+    s_have_peer = 1;
+    fprintf(stderr, "[RBN] lobby: linked (%.1f s)\n", now_s() - t0);
+    return 1;
+}
+
+/* The other player left (or went silent): the link goes; the host can take
+ * the next one. */
+void gz_rbn_lobby_drop(void)
+{
+    if (s_tcp != INVALID_SOCKET) { closesocket(s_tcp); s_tcp = INVALID_SOCKET; }
+    s_hello_taken = 0;
+    s_have_peer = 0;
+}
+
+/* A lobby message out; 0 = the link is gone. */
+int gz_rbn_lobby_send(const void *p, uint32_t n)
+{
+    return s_tcp != INVALID_SOCKET && msg_send(M_LOBBY, p, n, NULL, 0);
+}
+
+/* The next lobby message, if one has come (without waiting): 1 = one in
+ * out (its size in *n), 0 = none yet, -1 = the link is gone. Other messages
+ * are dropped. */
+int gz_rbn_lobby_recv(void *out, uint32_t max, uint32_t *n)
+{
+    for (;;) {
+        fd_set rd;
+        struct timeval tv = { 0, 0 };
+        uint32_t type, len;
+        uint8_t *m;
+        if (s_tcp == INVALID_SOCKET) return -1;
+        FD_ZERO(&rd);
+        FD_SET(s_tcp, &rd);
+        if (select(0, &rd, NULL, NULL, &tv) <= 0) return 0;
+        m = msg_recv(&type, &len);
+        if (!m) return -1;
+        if (type == M_LOBBY) {
+            *n = len < max ? len : max;
+            memcpy(out, m, *n);
+            free(m);
+            return 1;
+        }
+        free(m);
+    }
+}
+
+/* The host's lobby is full: anyone else who connects is turned away at
+ * once (their game then says so). Called every frame while linked. */
+void gz_rbn_lobby_refuse_extra(void)
+{
+    fd_set rd;
+    struct timeval tv = { 0, 0 };
+    if (s_listen == INVALID_SOCKET) return;
+    FD_ZERO(&rd);
+    FD_SET(s_listen, &rd);
+    if (select(0, &rd, NULL, NULL, &tv) > 0) {
+        SOCKET x = accept(s_listen, NULL, NULL);
+        if (x != INVALID_SOCKET) {
+            fprintf(stderr, "[RBN] lobby: someone else tried to join; the lobby is full\n");
+            closesocket(x);
+        }
+    }
+}
+
+/* Before the game starts again (gz_lobby_restart): every socket closed, so
+ * the next run can take the port. */
+void gz_rbn_close_all(void)
+{
+    if (s_tcp != INVALID_SOCKET) { shutdown(s_tcp, SD_BOTH); closesocket(s_tcp); s_tcp = INVALID_SOCKET; }
+    if (s_udp != INVALID_SOCKET) { closesocket(s_udp); s_udp = INVALID_SOCKET; }
+    if (s_listen != INVALID_SOCKET) { closesocket(s_listen); s_listen = INVALID_SOCKET; }
+}
+
+/* The lobby is done: the match goes on over this link. */
+void gz_rbn_lobby_done(void)
+{
+    if (s_listen != INVALID_SOCKET) { closesocket(s_listen); s_listen = INVALID_SOCKET; }
+    s_link_done = 1;
+}
+
+/* A match started from the lobby (GZ_RB_LOBBY_MATCH=1): when it ends the
+ * game goes back to the lobby (gz_lobby.c). */
+static int lobby_match(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GZ_RB_LOBBY_MATCH"); v = e && *e == '1'; }
+    return v && s_on > 0;
+}
+void gz_lobby_restart(int to_lobby, const char *notice);   /* gz_lobby.c */
+
+/* The other player is gone mid-match: the host goes back to its lobby to
+ * wait for the next, the client back to the game. */
+static void lobby_match_lost(void)
+{
+    if (s_side == 1) gz_lobby_restart(1, "Player 2 left.");
+    else gz_lobby_restart(0, "The host left.");
+}
+
+/* The match is over: the game's menus are back (their camera is set up
+ * again after the fight's: after the results, or a quit from the pause
+ * menu, which has no camera of its own). Both PCs see it at the same tick
+ * and go back to the lobby together a moment later. */
+int gz_wide_fight_active(void);                 /* recomp_manual.c */
+static int64_t s_back_at = -1;
+static int     s_fight_seen;
+static void lobby_match_menus(uint32_t cur)
+{
+    static int menus_back;
+    if (!lobby_match()) return;
+    /* (the menus after the results set up a camera of the match's kind
+     * again, so "the fight is on" is only looked at until they are seen) */
+    if (gz_wide_fight_active()) s_fight_seen = 1;
+    else if (s_fight_seen && !menus_back) {
+        menus_back = 1;
+        if (s_back_at < 0 || s_back_at > (int64_t)cur + 60) s_back_at = (int64_t)cur + 60;
+        fprintf(stderr, "[RBN] lobby match: the menus are back at tick %u; back to the lobby\n", cur);
+    }
+    if (s_back_at >= 0 && (int64_t)cur >= s_back_at) gz_lobby_restart(1, NULL);
+}
+
+/* GameResults' victory (recomp_manual.c): if no menus follow in 20 s, go
+ * back anyway. */
+void gz_rbn_match_over(void)
+{
+    if (lobby_match() && s_back_at < 0) {
+        s_back_at = (int64_t)gz_rb_cur_tick() + 1200;
+        fprintf(stderr, "[RBN] lobby match: a winner; back to the lobby by tick %lld\n", (long long)s_back_at);
+    }
 }
 
 /* ── the match setup (before the quick fight launches) ──────────────── */
@@ -462,8 +815,8 @@ int gz_rbn_launch_sync(uint8_t *gameinfo, uint32_t size)
     uint32_t type, len;
     uint8_t *m;
     if (!gz_rbn_on()) return 1;
-    if (!connect_peer()) { s_on = 0; return 0; }
-    if (s_side == 1) {
+    if (!connect_peer()) { if (lobby_match()) lobby_match_lost(); s_on = 0; return 0; }
+    if (s_side == 1 && !s_hello_taken) {
         m = msg_recv(&type, &len);              /* the hello: its UDP port */
         if (!m || type != M_HELLO || len < 8 || ((uint32_t *)m)[0] != MAGIC) {
             fprintf(stderr, "[RBN] bad hello\n");
@@ -473,6 +826,8 @@ int gz_rbn_launch_sync(uint8_t *gameinfo, uint32_t size)
         }
         s_peer.sin_port = htons((uint16_t)((uint32_t *)m)[1]);
         free(m);
+    }
+    if (s_side == 1) {
         if (!msg_send(M_SETUP, gameinfo, size, NULL, 0)) { s_on = 0; return 0; }
         fprintf(stderr, "[RBN] match setup sent\n");
     } else {
@@ -646,6 +1001,8 @@ typedef struct {
     int32_t  ack;                       /* the last of our pads it has */
     uint32_t first;                     /* the tick of pads[0] */
     uint32_t n;
+    uint32_t dtick;                     /* the desync check: a final tick + 1 (0 = none) */
+    uint32_t dig[32];                   /* and the sender's digest of it (16 x 64 bits) */
     uint8_t  pads[MAXSEND][PAD];
 } Packet;
 
@@ -681,6 +1038,15 @@ static void send_pads(uint32_t tick)
     for (t = first; t <= last; t++)
         memcpy(p.pads[t - first], s_local[t % RING], PAD);
     {
+        uint64_t h[16];
+        p.dtick = 0;
+        memset(p.dig, 0, sizeof p.dig);
+        if (s_final >= 0 && gz_rb_tick_digest((uint32_t)s_final, h)) {
+            p.dtick = (uint32_t)s_final + 1;
+            memcpy(p.dig, h, sizeof p.dig);
+        }
+    }
+    {
         int len = (int)(offsetof(Packet, pads) + p.n * PAD);
         if (s_lag_ms > 0 && s_lag_head - s_lag_tail < 256) {
             s_lagq[s_lag_head % 256].at = now_s() + s_lag_ms / 1000.0;
@@ -706,6 +1072,15 @@ static void recv_pads(uint32_t cur)
         if (p.n > MAXSEND || k < (int)(offsetof(Packet, pads) + p.n * PAD)) continue;
         if (p.ack > s_peer_acked) s_peer_acked = p.ack;
         if (p.tick >= s_peer_tick) { s_peer_tick = p.tick; s_peer_tick_at = now_s(); }
+        if (p.dtick) {
+            unsigned j;
+            for (j = 0; j < s_rdig_n && s_rdig[j].tick != p.dtick - 1; j++) {}
+            if (j == s_rdig_n && s_rdig_n < 64) {
+                s_rdig[j].tick = p.dtick - 1;
+                memcpy(s_rdig[j].h, p.dig, sizeof s_rdig[j].h);
+                s_rdig_n++;
+            }
+        }
         for (i = 0; i < (int)p.n; i++) {
             int64_t t = (int64_t)p.first + i;
             if (t != s_remote_max + 1) continue;    /* in order only; the rest comes again */
@@ -746,6 +1121,7 @@ int gz_rbn_pad(int port, uint32_t tick, uint8_t *pad18)
  * script's when testing. */
 static void read_local(uint32_t tick, uint8_t *pad18)
 {
+    if (tv_pad(s_side, tick, pad18)) return;
     if (s_script) {
         gz_rb_script_pad(gz_rbn_local_port(), tick, pad18);
         return;
@@ -765,6 +1141,7 @@ uint32_t gz_rbn_tick(uint32_t cur)
     double t0;
     static double last_report;
     lag_flush();
+    lobby_match_menus(cur);
     /* this side's pads up to cur + delay. A session's menus wait for both
      * pads every tick (no guesses there), so they get a longer delay
      * (GZ_RB_MENU_DELAY, default 6 ticks, 100 ms): with the fight's 2 they
@@ -794,6 +1171,15 @@ uint32_t gz_rbn_tick(uint32_t cur)
     }
     send_pads(cur);
     recv_pads(cur);
+    {
+        /* on the way to the Versus screen: the other side's pads are known
+         * here (tv_pad), so there is nothing to wait for */
+        while (s_remote_max < (int64_t)cur) {
+            int64_t t = s_remote_max + 1;
+            if (!tv_pad(3 - s_side, (uint32_t)t, s_remote[t % RING])) break;
+            s_remote_max = t;
+        }
+    }
 
     /* Too far ahead of what the other side has confirmed: wait for it. Out
      * of a fight (a session's menus, loading) nothing runs on a guess: a
@@ -806,8 +1192,11 @@ uint32_t gz_rbn_tick(uint32_t cur)
         lag_flush();
         recv_pads(cur);
         if (now_s() - t0 > 0.25) send_pads(cur);     /* in case ours were lost */
-        if (now_s() - t0 > 10.0) {
-            fprintf(stderr, "[RBN] nothing from the other side for 10 s: playing on predictions\n");
+        /* (out of a fight, a minute: the other PC may still be on its way
+         * to the Versus screen, or loading) */
+        if (now_s() - t0 > (s_fight ? 10.0 : 60.0)) {
+            fprintf(stderr, "[RBN] nothing from the other side for %d s: playing on predictions\n", s_fight ? 10 : 60);
+            if (lobby_match()) lobby_match_lost();
             s_remote_max = (int64_t)cur;            /* (the match is effectively over) */
             break;
         }
@@ -817,17 +1206,71 @@ uint32_t gz_rbn_tick(uint32_t cur)
     /* Time sync: ahead of the other side (its tick now, allowing for the
      * time since its packet) by more than a tick on average: give back a
      * little time, so both sides run on predictions equally. */
-    if (s_peer_tick_at > 0.0) {
+    if (s_peer_tick_at > 0.0 && !gz_rbn_hide_picture()) {
         double peer_now = (double)s_peer_tick + (now_s() - s_peer_tick_at) * 60.0;
         double ahead = (double)cur - peer_now;
         s_ahead_avg = s_ahead_avg * 0.95 + ahead * 0.05;
         if (s_ahead_avg > 1.0) Sleep(s_ahead_avg > 3.0 ? 8 : 3);
     }
 
+    /* The desync check. Final here: a tick that ran (before cur) on the
+     * other side's real pad (up to s_remote_max), and not one a rollback
+     * about to happen plays again (from s_first_bad). */
+    {
+        int64_t f = (int64_t)cur - 1;
+        unsigned j = 0;
+        if (f > s_remote_max) f = s_remote_max;
+        if (s_first_bad >= 0 && f > s_first_bad - 1) f = s_first_bad - 1;
+        if (f > s_final) s_final = f;
+        while (j < s_rdig_n) {
+            uint64_t ours[16];
+            if ((int64_t)s_rdig[j].tick > s_final) { j++; continue; }
+            /* (a lobby's match is over: what the menus after it do on each
+             * PC, saving the profile and so on, is not the match) */
+            if (lobby_match() && s_back_at >= 0) { s_rdig[j] = s_rdig[--s_rdig_n]; continue; }
+            if (gz_rb_tick_digest(s_rdig[j].tick, ours)) {
+                int k, parts = 0;
+                for (k = 0; k < 16; k++) parts += ours[k] != s_rdig[j].h[k];
+                s_stat_checked++;
+                if (parts && parts < DESYNC_PARTS) {
+                    static int said;
+                    s_stat_small++;
+                    if (!said) {
+                        said = 1;
+                        fprintf(stderr, "[RBN] tick %u: %d of 16 digest parts differ from the other PC "
+                                "(a leftover, probably; a desync makes most of them differ)\n", s_rdig[j].tick, parts);
+                    }
+                } else if (parts) {
+                    /* Kept on after the first, a few times 5 s apart: the
+                     * pages written out show how it spreads. */
+                    static uint32_t last_dump;
+                    static int dumps;
+                    s_stat_bad++;
+                    if (!s_desynced || (dumps < 4 && s_rdig[j].tick >= last_dump + 300u)) {
+                        char path[64];
+                        int n;
+                        snprintf(path, sizeof path, "rb_desync_p%d_%u.bin", s_side, dumps);
+                        n = gz_rb_write_digests(s_rdig[j].tick, path);
+                        fprintf(stderr, "[RBN] DESYNC: tick %u played differently on the two PCs (%d of 16 digest parts differ); "
+                                "the %d ticks up to it are in %s (send them with the other PC's)\n",
+                                s_rdig[j].tick, parts, n, path);
+                        fflush(stderr);
+                        last_dump = s_rdig[j].tick;
+                        dumps++;
+                    }
+                    s_desynced = 1;
+                }
+            }
+            s_rdig[j] = s_rdig[--s_rdig_n];     /* checked (or no longer kept) */
+        }
+    }
+
     if (now_s() - last_report > 10.0) {
         last_report = now_s();
-        fprintf(stderr, "[RBN] tick %u: confirmed to %lld, %u rollbacks (%u ticks replayed), stalled %u ms, ahead %.1f\n",
-                cur, (long long)s_remote_max, s_stat_rb, s_stat_rb_ticks, s_stat_stall_ms, s_ahead_avg);
+        fprintf(stderr, "[RBN] tick %u: confirmed to %lld, %u rollbacks (%u ticks replayed), stalled %u ms, ahead %.1f, "
+                "%u ticks checked against the other PC: %u alike, %u with a leftover, %u DESYNCED\n",
+                cur, (long long)s_remote_max, s_stat_rb, s_stat_rb_ticks, s_stat_stall_ms, s_ahead_avg,
+                s_stat_checked, s_stat_checked - s_stat_small - s_stat_bad, s_stat_small, s_stat_bad);
     }
 
     if (s_first_bad >= 0) {
@@ -875,12 +1318,30 @@ void gz_rbn_menu_pick(void)
     CreateDirectoryA(save, NULL);
     snprintf(peer, sizeof peer, "%s%s", ip, strchr(ip, ':') ? "" : ":7790");
 
-    /* the session's settings, for the new process */
+    /* the session's settings, for the new process (this run's own first,
+     * for going back to the game from the lobby: gz_lobby.c) */
+    {
+        extern void gz_lobby_keep_env(void);
+        gz_lobby_keep_env();
+    }
     SetEnvironmentVariableA("GZ_RB_NET", "1");
     SetEnvironmentVariableA("GZ_RB_SIDE", r == 1 ? "1" : "2");
     SetEnvironmentVariableA("GZ_RB_PEER", r == 2 ? peer : NULL);
     SetEnvironmentVariableA("GZ_SAVE_DIR", save);
-    SetEnvironmentVariableA("GZ_RB_SESSION", "1");          /* menus and fights together */
+    {
+        /* The game's own menus played together (a session), opened
+         * straight on the Versus screen; or with GZ_RB_LOBBY_UI=1 the
+         * lobby (gz_lobby.c), whose matches start the game again each time. */
+        const char *lv = getenv("GZ_RB_LOBBY_UI");
+        int menus = !(lv && *lv == '1');
+        SetEnvironmentVariableA("GZ_RB_SESSION", menus ? "1" : NULL);
+        SetEnvironmentVariableA("GZ_RB_TO_VERSUS", menus ? "1" : NULL);
+        SetEnvironmentVariableA("GZ_RB_LOBBY", menus ? NULL : "1");
+        {
+            extern void gz_lobby_keep_window_pos(void);
+            gz_lobby_keep_window_pos();
+        }
+    }
     SetEnvironmentVariableA("GZ_RB_PROFILE_FROM", base);    /* the host's profile, for both */
     SetEnvironmentVariableA("GZ_QUICK_FIGHT", NULL);
     SetEnvironmentVariableA("GZ_MOVIES", "0");
@@ -893,8 +1354,8 @@ void gz_rbn_menu_pick(void)
     si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
     si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
-    fprintf(stderr, "[RBN] Rollback Netplay: %s; starting again as a netplay session\n",
-            r == 1 ? "hosting" : peer);
+    fprintf(stderr, "[RBN] Rollback Netplay: %s; starting again in the netplay %s\n",
+            r == 1 ? "hosting" : peer, getenv("GZ_RB_LOBBY") ? "lobby" : "session");
     fflush(stderr);
     if (!CreateProcessA(exe, GetCommandLineA(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
         MessageBoxA(GetForegroundWindow(), "The game could not be started again for netplay.", "Rollback Netplay", MB_ICONWARNING);

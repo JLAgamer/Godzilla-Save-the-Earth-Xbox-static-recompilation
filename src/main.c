@@ -382,7 +382,12 @@ static void gz_refresh_disk_cache(const char *save_dir)
 static void gz_devices_audio(long long from_us, long long to_us, int mute)
 {
     extern unsigned xbox_ApuTick(unsigned frames, int mute, unsigned timeout_ms);
+    extern void xbox_ApuFramesStarted(void);
     long long a = from_us * 48 / 32000, b = to_us * 48 / 32000;
+    if (from_us < 0) {                          /* the frames start (xbox_DevicesStart) */
+        xbox_ApuFramesStarted();
+        return;
+    }
     if (b > a) xbox_ApuTick((unsigned)(b - a), mute, 100);
 }
 

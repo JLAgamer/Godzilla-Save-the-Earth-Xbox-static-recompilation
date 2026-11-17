@@ -15,7 +15,7 @@
 # each side's memory at those ticks (shot<n>_m<t>.bin, for memdiff.py).
 param(
     [string[]]$Steps = @(),
-    [int]$Settle = 25,
+    [int]$Settle = 40,               # the game is on its main menu by then (Action highlighted)
     [int]$StepWait = 3,
     [int]$After = 5,
     [int]$LagMs = 0,

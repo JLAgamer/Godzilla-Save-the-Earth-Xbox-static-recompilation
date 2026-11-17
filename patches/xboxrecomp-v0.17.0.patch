@@ -1,8 +1,8 @@
 diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
-index a6a3657..5f69fe8 100644
+index a6a3657..9530b12 100644
 --- a/src/apu/apu_core.c
 +++ b/src/apu/apu_core.c
-@@ -49,6 +49,22 @@ uint64_t g_dbg_muted_voices[4] = { 0 };
+@@ -49,6 +49,53 @@ uint64_t g_dbg_muted_voices[4] = { 0 };
  /* Global audio mute — disables all AWD/mixer sound playback */
  volatile int g_audio_muted = 0;  /* 0 = audio enabled */
  
@@ -18,14 +18,45 @@ index a6a3657..5f69fe8 100644
 + * on until the title does something (front end still trapped after the
 + * interrupt, sequencer stopped). g_apu_vtime_us: the frames granted, as
 + * time (the sequencer's hold is timed on it). */
-+static volatile int g_apu_locked;
++static volatile int g_apu_locked, g_apu_started;
 +static volatile long g_apu_grant, g_apu_stuck_at;
 +static volatile int64_t g_apu_vtime_us;
++/* Locked, the granted frames in order, each run heard or not (a rollback's
++ * replay): a replayed frame is rendered (what the title sees of the sound
++ * chip goes on) but takes no time in the output, so the sound goes on from
++ * where it was heard, with no gap and nothing heard twice. Under d->lock. */
++#define APU_SEGS 64
++static struct { long n; int mute; } g_apu_seg[APU_SEGS];
++static unsigned g_apu_seg_head, g_apu_seg_tail;
++
++static int apu_seg_mute(void)
++{
++    return g_apu_seg_head != g_apu_seg_tail && g_apu_seg[g_apu_seg_head % APU_SEGS].mute;
++}
++
++static void apu_seg_add(long n, int mute)
++{
++    if (n <= 0) return;
++    if (g_apu_seg_head != g_apu_seg_tail && g_apu_seg[(g_apu_seg_tail - 1) % APU_SEGS].mute == mute)
++        g_apu_seg[(g_apu_seg_tail - 1) % APU_SEGS].n += n;
++    else if (g_apu_seg_tail - g_apu_seg_head < APU_SEGS) {
++        g_apu_seg[g_apu_seg_tail % APU_SEGS].n = n;
++        g_apu_seg[g_apu_seg_tail % APU_SEGS].mute = mute;
++        g_apu_seg_tail++;
++    } else
++        g_apu_seg[(g_apu_seg_tail - 1) % APU_SEGS].n += n;
++}
++
++static void apu_seg_take(void)
++{
++    if (g_apu_seg_head != g_apu_seg_tail && --g_apu_seg[g_apu_seg_head % APU_SEGS].n <= 0)
++        g_apu_seg_head++;
++}
 +
  /* ============================================================
   * Debug frame markers (minimal stubs)
   * ============================================================ */
-@@ -89,7 +105,49 @@ static inline uint32_t apu_mapped_ram(void)
+@@ -89,7 +136,49 @@ static inline uint32_t apu_mapped_ram(void)
      return (uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram);
  }
  
@@ -76,7 +107,7 @@ index a6a3657..5f69fe8 100644
  {
      uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
      /* RAM above the window's 64 MB. On a 128 MB layout (a devkit) most of
-@@ -139,6 +197,49 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
+@@ -139,6 +228,49 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
   * where the host mapped RAM) or "wrap" (above the mapping, folded into the
   * low 64 MB). A voice reading noise from "wrap" or "hiwin" is the address
   * resolution, not the decoder. */
@@ -126,7 +157,7 @@ index a6a3657..5f69fe8 100644
  const char *mcpx_apu_phys_class(uint64_t addr)
  {
      uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
-@@ -232,11 +333,6 @@ extern int  xbox_IrqSafePointsOn(void);
+@@ -232,11 +364,6 @@ extern int  xbox_IrqSafePointsOn(void);
  extern void xbox_IrqSetHandler(int line, void (*run)(void));
  extern int  xbox_IrqPost(int line);
  extern void xbox_IrqNoteUngated(int line);
@@ -138,7 +169,16 @@ index a6a3657..5f69fe8 100644
  extern APU_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
  extern APU_TLS uint32_t g_fs_base;
  
-@@ -909,6 +1005,10 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
+@@ -885,6 +1012,8 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
+     if ((d->ep_frame_div + 1) % 8) {
+         return;
+     }
++    if (g_apu_locked && g_apu_ff_now)
++        return;                     /* a replayed frame takes no slot (frame thread) */
+ 
+     memcpy(period, d->monitor.frame_buf, sizeof(period));
+     /* The VP monitor point accumulates into frame_buf, so the next period
+@@ -909,6 +1038,10 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
          mix_into(period, (const int16_t (*)[2])extra, MIXER_FRAME_SAMPLES);
      }
  
@@ -149,7 +189,7 @@ index a6a3657..5f69fe8 100644
      /* A period dropped while pacing is stalled never reaches the device,
       * so it stays out of the dump too. */
      if (!(xa2_is_active() && d->pace_stalled))
-@@ -1060,6 +1160,7 @@ static void throttle(MCPXAPUState *d)
+@@ -1060,6 +1193,7 @@ static void throttle(MCPXAPUState *d)
  
  static void se_frame(MCPXAPUState *d)
  {
@@ -157,7 +197,7 @@ index a6a3657..5f69fe8 100644
      mcpx_apu_update_dsp_preference(d);
      mcpx_debug_begin_frame();
      g_dbg.gp_realtime = d->gp.realtime;
-@@ -1081,9 +1182,30 @@ static void se_frame(MCPXAPUState *d)
+@@ -1081,9 +1215,30 @@ static void se_frame(MCPXAPUState *d)
      float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
      memset(mixbins, 0, sizeof(mixbins));
  
@@ -191,7 +231,7 @@ index a6a3657..5f69fe8 100644
  
      d->ep_frame_div++;
  
-@@ -1186,7 +1308,21 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -1186,7 +1341,26 @@ static void *mcpx_apu_frame_thread(void *arg)
          /* Always run the audio output loop — the software mixer and test tone
           * need continuous frame delivery regardless of APU register state.
           * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
@@ -199,22 +239,27 @@ index a6a3657..5f69fe8 100644
 +        int ff = g_apu_ff > 0;
 +        long grant = g_apu_grant;
 +        if (g_apu_locked && !ff) {
-+            /* locked: no frame until a tick grants one. The doorbell is
-+             * still answered: it is the GP DSP acknowledging a command the
-+             * title wrote, which the title spins on without a kernel call
-+             * (so without a tick) while it starts DirectSound. */
-+            mcpx_apu_dsp_ack_poll(d);
++            /* locked: no frame until a tick grants one. Until the frames
++             * start (xbox_ApuFramesStarted) the doorbell is still answered
++             * here: it is the GP DSP acknowledging a command the title
++             * wrote, which the title spins on while it starts DirectSound,
++             * and the boot is before the two PCs agree on anything. After
++             * that it is answered in granted frames only: answered here, on
++             * this thread's clock, DirectSound's scratch and voice pages
++             * came out different on the two PCs. */
++            if (!g_apu_started)
++                mcpx_apu_dsp_ack_poll(d);
 +            g_apu_stuck_at = grant;
 +            qemu_cond_timedwait(&d->cond, &d->lock, 1);
 +            continue;
 +        }
-+        g_apu_ff_now = ff && g_apu_ff_mute;
++        g_apu_ff_now = ff && (g_apu_locked ? apu_seg_mute() : g_apu_ff_mute);
 +        if (!ff)
 +            throttle(d);
          int div0 = d->ep_frame_div;
  
          /* The doorbell ack stands in for the GP DSP, which on hardware runs
-@@ -1196,7 +1332,8 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -1196,7 +1370,8 @@ static void *mcpx_apu_frame_thread(void *arg)
           * sub_002F805E polling the same doorbell it was acked on at init. */
          mcpx_apu_dsp_ack_poll(d);
  
@@ -224,34 +269,44 @@ index a6a3657..5f69fe8 100644
          bool fe_trapped = kind == APU_FRAME_TRAPPED;
          bool seq_held = kind == APU_FRAME_HELD;
  
-@@ -1230,8 +1367,13 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -1230,8 +1405,23 @@ static void *mcpx_apu_frame_thread(void *arg)
              d->ep_frame_div++;
          }
  
 -        if (div0 % 8 == 0 && d->ep_frame_div != div0)
 -            mcpx_apu_pace_rendered(d);
-+        if (d->ep_frame_div != div0) {
++        int rendered = d->ep_frame_div != div0;
++        if (rendered && g_apu_locked && g_apu_ff_now) {
++            /* a replayed frame: out of the output altogether (its slot is
++             * the next frame's) */
++            memset(&d->monitor.frame_buf[(div0 % 8) * NUM_SAMPLES_PER_FRAME], 0,
++                   NUM_SAMPLES_PER_FRAME * sizeof d->monitor.frame_buf[0]);
++            d->ep_frame_div = div0;
++        }
++        if (rendered) {
 +            g_apu_frames++;
-+            if (ff)
++            if (ff) {
 +                g_apu_ff--;     /* off the clock: those were paced the first time */
-+            else if (div0 % 8 == 0)
++                if (g_apu_locked)
++                    apu_seg_take();
++            } else if (div0 % 8 == 0)
 +                mcpx_apu_pace_rendered(d);
 +        }
  
          /* The SSL tick: the sequencer's periodic sample-limit interrupt.
           *
-@@ -1244,7 +1386,9 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -1244,7 +1434,9 @@ static void *mcpx_apu_frame_thread(void *arg)
          {
              uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
              uint32_t ssl = qatomic_read(&d->regs[NV_PAPU_SSL]);
 -            d->sample_count += NUM_SAMPLES_PER_FRAME;
 +            /* locked (xbox_ApuLockFrames): rendered frames only, not passes */
-+            if (!g_apu_locked || d->ep_frame_div != div0)
++            if (!g_apu_locked || rendered)
 +                d->sample_count += NUM_SAMPLES_PER_FRAME;
              if (ssl
                      && d->sample_count >= ssl
                      && (sectl & NV_PAPU_SECTL_XCNTMODE)
-@@ -1284,13 +1428,28 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -1284,13 +1476,28 @@ static void *mcpx_apu_frame_thread(void *arg)
               NV_PAPU_FECTL_FEMETHMODE_TRAPPED)) {
              /* Still trapped after the delivery (held off at raised IRQL, or
               * cleared from a DPC): give the title a millisecond with the lock
@@ -283,7 +338,7 @@ index a6a3657..5f69fe8 100644
          }
      }
  
-@@ -1501,6 +1660,29 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
+@@ -1501,6 +1708,29 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
  void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)
  {
      if (!d) return;
@@ -313,7 +368,7 @@ index a6a3657..5f69fe8 100644
      mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
  }
  
-@@ -1746,3 +1928,195 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
+@@ -1746,3 +1976,229 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
      }
      LeaveCriticalSection(&g_mixer_cs);
  }
@@ -344,6 +399,15 @@ index a6a3657..5f69fe8 100644
 +    int set_irq;
 +    long ff;                /* frames granted and not yet rendered (xbox_ApuTick) */
 +    int64_t vtime_us;
++    /* The voice processor's own per-voice state: where each voice's
++     * resampler sits between two source samples, its filters' histories
++     * and its last gains. Left out, every voice went on after a rollback
++     * from the mispredicted run's phase: the voices' positions in the
++     * voice array drifted apart on the two PCs and the sound slipped by
++     * whole frames. (Each voice's libsamplerate handle stays its own.) */
++    MCPXAPUVoiceFilter filters[MCPX_HW_MAX_VOICES];
++    uint8_t voice_locked[MCPX_HW_MAX_VOICES];
++    uint8_t hrtf_headroom, hrtf_submix[4], submix_headroom[NUM_MIXBINS];
 +} ApuSnapshot;
 +
 +/* Hold the APU between frames (recursive: save and load take it again). A
@@ -401,6 +465,8 @@ index a6a3657..5f69fe8 100644
 +    return (uint64_t)g_apu_vtime_us * 0x9E3779B97F4A7C15ull ^ (uint64_t)g_apu_ff;
 +}
 +
++void xbox_ApuFramesStarted(void) { g_apu_started = 1; }
++
 +void xbox_ApuLockFrames(int on)
 +{
 +    if (on && !g_apu_locked)
@@ -427,8 +493,10 @@ index a6a3657..5f69fe8 100644
 +    long grant;
 +    qemu_mutex_lock(&d->lock);
 +    g_apu_ff += (long)frames;
-+    if (g_apu_ff > 400)
-+        g_apu_ff = 400;                 /* a long stall does not come out as a burst */
++    apu_seg_add((long)frames, mute);
++    if (g_apu_ff > 400) {               /* a long stall does not come out as a burst */
++        while (g_apu_ff > 400) { apu_seg_take(); g_apu_ff--; }
++    }
 +    g_apu_ff_mute = mute;
 +    g_apu_vtime_us += (int64_t)frames * 2000 / 3;       /* 32 samples at 48 kHz */
 +    grant = ++g_apu_grant;
@@ -468,6 +536,11 @@ index a6a3657..5f69fe8 100644
 +    s->set_irq = d->set_irq;
 +    s->ff = g_apu_locked ? g_apu_ff : 0;
 +    s->vtime_us = g_apu_vtime_us;
++    memcpy(s->filters, d->vp.filters, sizeof s->filters);
++    memcpy(s->voice_locked, (const void *)d->vp.voice_locked, sizeof s->voice_locked);
++    s->hrtf_headroom = d->vp.hrtf_headroom;
++    memcpy(s->hrtf_submix, d->vp.hrtf_submix, sizeof s->hrtf_submix);
++    memcpy(s->submix_headroom, d->vp.submix_headroom, sizeof s->submix_headroom);
 +    qemu_mutex_unlock(&d->lock);
 +    return 1;
 +}
@@ -486,9 +559,25 @@ index a6a3657..5f69fe8 100644
 +    d->vp.ssl_base_page = s->ssl_base_page;
 +    d->sample_count = s->sample_count;
 +    d->set_irq = s->set_irq != 0;
++    {
++        int v;
++        for (v = 0; v < MCPX_HW_MAX_VOICES; v++) {
++            SRC_STATE *keep = d->vp.filters[v].resampler;
++            d->vp.filters[v] = s->filters[v];
++            d->vp.filters[v].resampler = keep;
++        }
++    }
++    memcpy((void *)d->vp.voice_locked, s->voice_locked, sizeof s->voice_locked);
++    d->vp.hrtf_headroom = s->hrtf_headroom;
++    memcpy(d->vp.hrtf_submix, s->hrtf_submix, sizeof s->hrtf_submix);
++    memcpy(d->vp.submix_headroom, s->submix_headroom, sizeof s->submix_headroom);
 +    if (g_apu_locked) {
 +        g_apu_ff = s->ff;
 +        g_apu_vtime_us = s->vtime_us;
++        /* only a rollback loads this: what was left owed belongs to the
++         * ticks about to be played again, unheard */
++        g_apu_seg_head = g_apu_seg_tail = 0;
++        apu_seg_add(s->ff, 1);
 +    }
 +    update_irq(d);                      /* the line follows ISTS / IEN */
 +    qemu_cond_broadcast(&d->cond);      /* FECTL may have changed */
@@ -3342,10 +3431,18 @@ index 260fa3f..e09672d 100644
  /* The POSIX SDL presenter owns event pumping while its main-thread window is
   * active, and keeps SDL alive at shutdown while controller handles are open. */
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 9476517..7ad4abe 100644
+index 9476517..f1c4f54 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
-@@ -690,6 +690,352 @@ static uint32_t thobj_current(void)
+@@ -474,6 +474,7 @@ static int bridge_run_io_apcs(uint32_t alertable, uint32_t wait_mode);
+ struct bridge_thread_start {
+     recomp_func_t fn;
+     uint32_t ctx1, ctx2, stack_top, obj_va, tls_size;
++    uint32_t tib;           /* allocated by the creator (see bridge_spawn_thread) */
+ };
+ 
+ /* Lay out a thread's TLS the way the Xbox kernel does.
+@@ -690,6 +691,352 @@ static uint32_t thobj_current(void)
      return g_thread_obj_va;
  }
  
@@ -3698,7 +3795,16 @@ index 9476517..7ad4abe 100644
  static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
                                       uint32_t ctx2)
  {
-@@ -750,9 +1096,15 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
+@@ -727,7 +1074,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
+     g_thread_stack_top = s->stack_top;
+     g_thread_obj_va = s->obj_va;
+     {
+-        uint32_t tib = xbox_AllocThreadTib();
++        uint32_t tib = s->tib ? s->tib : xbox_AllocThreadTib();
+         if (tib)
+             g_fs_base = tib;
+         else
+@@ -750,9 +1097,15 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
       * neither. */
      xbox_DpcMarkGuestThread();
      xbox_GuestThreadPin("guest-worker");
@@ -3714,7 +3820,19 @@ index 9476517..7ad4abe 100644
  
      fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
      fflush(stderr);
-@@ -885,6 +1237,7 @@ static void bridge_PsCreateSystemThreadEx(void)
+@@ -778,6 +1131,11 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
+     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+     s->obj_va = obj_va;
+     s->tls_size = tls_size;
++    /* The new thread's TIB comes from the heap. Taken by the new thread, it
++     * raced the creator's next allocation (its next thread's stack): two
++     * PCs laid the heap out differently from there (lockstep, a game's
++     * netplay). Taken here, it is always the block after the stack. */
++    s->tib = xbox_AllocThreadTib();
+ 
+     th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
+     if (!th) free(s);
+@@ -885,6 +1243,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                  }
                  xbox_DpcMarkGuestThread();
                  xbox_GuestThreadPin("guest-main");
@@ -3722,7 +3840,7 @@ index 9476517..7ad4abe 100644
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-@@ -976,6 +1329,18 @@ static int  bridge_handle_is_async(uint32_t token);
+@@ -976,6 +1335,18 @@ static int  bridge_handle_is_async(uint32_t token);
  static void   bridge_write_handle(uint32_t handle_va, HANDLE h);
  static HANDLE bridge_take_handle(uint32_t token);
  
@@ -3741,7 +3859,7 @@ index 9476517..7ad4abe 100644
  static void bridge_NtClose(void)
  {
      uint32_t raw_handle = STACK_ARG(0);
-@@ -984,7 +1349,20 @@ static void bridge_NtClose(void)
+@@ -984,7 +1355,20 @@ static void bridge_NtClose(void)
          fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
          fflush(stderr);
      }
@@ -3762,7 +3880,7 @@ index 9476517..7ad4abe 100644
      bridge_forget_async_handle(raw_handle);
      thobj_detach_token(raw_handle);
  
-@@ -994,7 +1372,6 @@ static void bridge_NtClose(void)
+@@ -994,7 +1378,6 @@ static void bridge_NtClose(void)
          if (h && h != INVALID_HANDLE_VALUE)
              xbox_NtClose(h);   /* settles a pending overwrite; drops a dir context */
      }
@@ -3770,7 +3888,7 @@ index 9476517..7ad4abe 100644
  }
  
  /* ── MmAllocateContiguousMemory (ordinal 165) ─────────────
-@@ -1476,6 +1853,22 @@ static void bridge_NtQueryVirtualMemory(void)
+@@ -1476,6 +1859,30 @@ static void bridge_NtQueryVirtualMemory(void)
  /* True when va lies inside a heap block but not at its start; left is
   * xbox_HeapBlockSize(va). The byte before an interior address is in the same
   * block, one byte further from its end. NT refuses a release there. */
@@ -3782,18 +3900,26 @@ index 9476517..7ad4abe 100644
 + * pages that are freed or decommitted are made read/write again, once a title
 + * has protected anything. */
 +static volatile LONG s_guest_pages_protected;
++/* A game's rollback keeps guest pages write-protected to log the first write
++ * in each frame. A protection changed here behind its back let writes escape
++ * the log (a freed block made read/write, then zeroed by a decommit: the
++ * rollback could not put it back). The hook logs the pages as written first. */
++void (*xbox_guest_protect_hook)(uint32_t va, uint32_t size);
++
 +static void bridge_pages_writable(uint32_t va, uint32_t size)
 +{
 +    DWORD old;
 +    if (!s_guest_pages_protected || !size)
 +        return;
++    if (xbox_guest_protect_hook)
++        xbox_guest_protect_hook(va, size);
 +    VirtualProtect(XBOX_TO_NATIVE(va & ~0xFFFu), (SIZE_T)size + (va & 0xFFFu), PAGE_READWRITE, &old);
 +}
 +
  static int bridge_heap_interior(uint32_t va, uint32_t left)
  {
      return left && va && xbox_HeapBlockSize(va - 1) == left + 1;
-@@ -1536,6 +1929,7 @@ static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
+@@ -1536,6 +1943,7 @@ static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
              return;
          }
          size = left;
@@ -3801,7 +3927,7 @@ index 9476517..7ad4abe 100644
          xbox_HeapFree(page_base);          /* ignores what it never handed out */
          releases++;
      } else {
-@@ -1549,6 +1943,7 @@ static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
+@@ -1549,6 +1957,7 @@ static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
          if (left && end - page_base > left)
              end = page_base + left;
          size = end - page_base;
@@ -3809,7 +3935,7 @@ index 9476517..7ad4abe 100644
          if (size)
              memset(XBOX_TO_NATIVE(page_base), 0, size);
          decommits++;
-@@ -1607,6 +2002,7 @@ static void bridge_NtFreeVirtualMemory(void)
+@@ -1607,6 +2016,7 @@ static void bridge_NtFreeVirtualMemory(void)
                      g_eax = BRIDGE_FREE_VM_NOT_AT_BASE;
                      return;
                  }
@@ -3817,7 +3943,7 @@ index 9476517..7ad4abe 100644
                  xbox_HeapFree(vm_base);
                  /* NT writes back what it released: the base and the size. */
                  BRIDGE_MEM32(size_ptr) = left;
-@@ -1625,6 +2021,7 @@ static void bridge_NtFreeVirtualMemory(void)
+@@ -1625,6 +2035,7 @@ static void bridge_NtFreeVirtualMemory(void)
                      end = (uint64_t)vm_base + left;
                  if (xbox_HeapBlockSize(page_base) != left + (vm_base - page_base))
                      page_base = vm_base;
@@ -3825,7 +3951,7 @@ index 9476517..7ad4abe 100644
                  memset(XBOX_TO_NATIVE(page_base), 0, (size_t)(end - page_base));
                  BRIDGE_MEM32(base_ptr) = page_base;
                  BRIDGE_MEM32(size_ptr) = (uint32_t)(end - page_base);
-@@ -2034,6 +2431,47 @@ static void bridge_KeSetEvent(void)
+@@ -2034,6 +2445,47 @@ static void bridge_KeSetEvent(void)
          g_eax = 0;
  }
  
@@ -3873,7 +3999,7 @@ index 9476517..7ad4abe 100644
  /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
  static void bridge_KeWaitForSingleObject(void)
  {
-@@ -2050,9 +2488,14 @@ static void bridge_KeWaitForSingleObject(void)
+@@ -2050,9 +2502,14 @@ static void bridge_KeWaitForSingleObject(void)
          int type;
          HANDLE ge = ke_guest_event_prepare(object, &type);
          if (ge) {
@@ -3891,7 +4017,7 @@ index 9476517..7ad4abe 100644
              if (g_eax == 0 && type == 1)               /* synchronization: consumed */
                  BRIDGE_MEM32(object + 4) = 0;
              return;
-@@ -2065,6 +2508,14 @@ static void bridge_KeWaitForSingleObject(void)
+@@ -2065,6 +2522,14 @@ static void bridge_KeWaitForSingleObject(void)
      if (!h)
          h = XBOX_TO_NATIVE(object);
  
@@ -3906,7 +4032,7 @@ index 9476517..7ad4abe 100644
      g_eax = (uint32_t)xbox_KeWaitForSingleObject(
          h, wait_reason, wait_mode,
          (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
-@@ -2085,6 +2536,14 @@ static void bridge_NtWaitForSingleObject(void)
+@@ -2085,6 +2550,14 @@ static void bridge_NtWaitForSingleObject(void)
  
      if (bridge_run_io_apcs(alertable, 1))
          return;
@@ -3921,7 +4047,7 @@ index 9476517..7ad4abe 100644
      g_eax = (uint32_t)xbox_NtWaitForSingleObject(
          handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
  }
-@@ -2149,6 +2608,14 @@ static void bridge_NtWaitForSingleObjectEx(void)
+@@ -2149,6 +2622,14 @@ static void bridge_NtWaitForSingleObjectEx(void)
  
      if (bridge_run_io_apcs(alertable, wait_mode))
          return;
@@ -3936,7 +4062,7 @@ index 9476517..7ad4abe 100644
      g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
          handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
          XBOX_TO_NATIVE(timeout_ptr));
-@@ -2222,6 +2689,14 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
+@@ -2222,6 +2703,14 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
  
      if (bridge_run_io_apcs(alertable, wait_mode))
          return;
@@ -3951,7 +4077,7 @@ index 9476517..7ad4abe 100644
      g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
          count, handles, wait_type, (BOOLEAN)alertable,
          XBOX_TO_NATIVE(timeout_ptr));
-@@ -2332,6 +2807,14 @@ static void bridge_KeDelayExecutionThread(void)
+@@ -2332,6 +2821,14 @@ static void bridge_KeDelayExecutionThread(void)
  
      if (bridge_run_io_apcs(alertable, wait_mode))
          return;
@@ -3966,7 +4092,7 @@ index 9476517..7ad4abe 100644
      g_eax = (uint32_t)xbox_KeDelayExecutionThread(
          (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
          XBOX_TO_NATIVE(interval_ptr));
-@@ -2480,6 +2963,7 @@ static void bridge_PsTerminateSystemThread(void)
+@@ -2480,6 +2977,7 @@ static void bridge_PsTerminateSystemThread(void)
          g_thread_stack_top = 0;
          thobj_exit(g_thread_obj_va, exit_status);
          g_thread_obj_va = 0;
@@ -3974,7 +4100,7 @@ index 9476517..7ad4abe 100644
          ExitThread(exit_status);
      }
  }
-@@ -3625,8 +4109,12 @@ static int kernel_timer_paced(void)
+@@ -3625,8 +4123,12 @@ static int kernel_timer_paced(void)
  
  /* The clock the kernel timers' due times are kept on, the same one the loop
   * that fires them reads. */
@@ -3987,7 +4113,7 @@ index 9476517..7ad4abe 100644
      return kernel_timer_paced() ? kernel_clock_ms()
                                  : (long long)GetTickCount64();
  }
-@@ -3698,6 +4186,208 @@ static int kernel_fire_timers(long long now, long long *next_due_ms)
+@@ -3698,6 +4200,212 @@ static int kernel_fire_timers(long long now, long long *next_due_ms)
   * vblank or the 10 ms tick, and the title's vblank callback, which runs in
   * such a DPC, came up to 10 ms late -- the flip landed late with it. Now the
   * next pass comes within 1 ms while DPCs wait on the gate. */
@@ -4055,6 +4181,8 @@ index 9476517..7ad4abe 100644
 +            s_dev_clock_us = boot;
 +        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = (uint32_t)(s_dev_clock_us / 1000);
 +        InterlockedExchange(&s_dev_frames, 1);
++        if (s_dev_audio)
++            s_dev_audio(-1, -1, 0);         /* the sound chip: the frames start */
 +    }
 +}
 +
@@ -4081,7 +4209,7 @@ index 9476517..7ad4abe 100644
 + * the timer thread waiting for the next). */
 +typedef struct {
 +    long long clock_us;
-+    LONG frames;
++    LONG frames;            /* (a client takes the host's: see xbox_DevicesStateLoad) */
 +    XboxTimer timers[XBOX_MAX_TIMERS];
 +    PendingDpc dpc[XBOX_MAX_PENDING_DPC];
 +    LONG head, tail, vbl_busy;
@@ -4110,6 +4238,8 @@ index 9476517..7ad4abe 100644
 +{
 +    const DevSnap *s = (const DevSnap *)buf;
 +    s_dev_clock_us = s->clock_us;
++    if (s->frames && !s_dev_frames && s_dev_audio)
++        s_dev_audio(-1, -1, 0);             /* the frames start here too */
 +    InterlockedExchange(&s_dev_frames, s->frames);
 +    if (g_timer_started) EnterCriticalSection(&g_timer_lock);
 +    memcpy(g_timers, s->timers, sizeof g_timers);
@@ -4196,7 +4326,7 @@ index 9476517..7ad4abe 100644
  static void kernel_timer_loop_ns(void)
  {
      const uint64_t ms = 1000000u;
-@@ -3709,6 +4399,10 @@ static void kernel_timer_loop_ns(void)
+@@ -3709,6 +4417,10 @@ static void kernel_timer_loop_ns(void)
          long long now_ms, timer_due;
          int ran, busy;
  
@@ -4207,7 +4337,7 @@ index 9476517..7ad4abe 100644
          /* Wakeable: KeInsertQueueDpc ends it, so a DPC that no guest thread
           * drains at a raise runs now rather than at the next edge. */
          xbox_HostTimerSleepNs(wait);
-@@ -3775,6 +4469,8 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -3775,6 +4487,8 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
              long long timer_due;
              int ran;
  
@@ -4216,7 +4346,7 @@ index 9476517..7ad4abe 100644
              Sleep(10);
              kernel_vblank_tick();  /* the GPU's frame clock */
              kernel_drain_dpcs(&ran);
-@@ -3801,6 +4497,18 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -3801,6 +4515,18 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
      return 0;
  }
  
@@ -4235,7 +4365,7 @@ index 9476517..7ad4abe 100644
  /* Shared by KeSetTimer and KeSetTimerEx; period is 0 for the former. */
  static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
                               long period_ms, uint32_t dpc_va)
-@@ -3809,11 +4517,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+@@ -3809,11 +4535,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
      int i, free_slot = -1;
      uint32_t was_set = 0;
  
@@ -4248,7 +4378,7 @@ index 9476517..7ad4abe 100644
  
      EnterCriticalSection(&g_timer_lock);
      for (i = 0; i < XBOX_MAX_TIMERS; i++) {
-@@ -4116,6 +4820,32 @@ static HANDLE bridge_take_handle(uint32_t token)
+@@ -4116,6 +4838,32 @@ static HANDLE bridge_take_handle(uint32_t token)
      return NULL;   /* untagged -> not a table handle, do not close */
  }
  
@@ -4281,7 +4411,7 @@ index 9476517..7ad4abe 100644
  /* Build a native OBJECT_ATTRIBUTES wrapping the translated Xbox path. */
  static void bridge_build_oa(uint32_t obj_attrs_va,
                              XBOX_OBJECT_ATTRIBUTES* oa, XBOX_ANSI_STRING* name)
-@@ -5910,11 +6640,19 @@ static void bridge_KeWaitForMultipleObjects(void)
+@@ -5910,11 +6658,19 @@ static void bridge_KeWaitForMultipleObjects(void)
          }
      }
  
@@ -4306,7 +4436,7 @@ index 9476517..7ad4abe 100644
  
      /* Only a successful wait consumes synchronization events. WaitAny's
       * result selects one member; WaitAll consumes every signalled member. */
-@@ -7755,11 +8493,16 @@ static void bridge_MmGlobalData(void)
+@@ -7755,11 +8511,16 @@ static void bridge_MmGlobalData(void)
      g_eax = XBOX_KERNEL_DATA_BASE + KDATA_MMGLOBAL;
  }
  
@@ -4324,7 +4454,7 @@ index 9476517..7ad4abe 100644
      BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 0) = (uint32_t)t;
      BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 4) = (uint32_t)(t >> 32);
      g_eax = XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME;
-@@ -7771,6 +8514,11 @@ static void bridge_KeSystemTime(void)
+@@ -7771,6 +8532,11 @@ static void bridge_KeSystemTime(void)
      /* Refresh the 100ns-since-1601 clock before handing out the pointer. */
      FILETIME ft;
      GetSystemTimeAsFileTime(&ft);
@@ -4336,16 +4466,19 @@ index 9476517..7ad4abe 100644
      BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = ft.dwLowDateTime;
      BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = ft.dwHighDateTime;
      g_eax = XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME;
-@@ -9000,6 +9748,8 @@ static void bridge_NtProtectVirtualMemory(void)
+@@ -8999,7 +9765,11 @@ static void bridge_NtProtectVirtualMemory(void)
+     uint32_t size    = size_ptr ? BRIDGE_MEM32(size_ptr) : 0;
      DWORD old = 0;
  
++    if (xbox_guest_protect_hook && size)
++        xbox_guest_protect_hook(base_va, size);
      if (VirtualProtect(XBOX_TO_NATIVE(base_va), size, (DWORD)new_prot, &old)) {
 +        if ((new_prot & 0xFFu) != 0x04u && (new_prot & 0xFFu) != 0x40u)
 +            InterlockedExchange(&s_guest_pages_protected, 1);
          if (old_ptr)
              BRIDGE_MEM32(old_ptr) = (uint32_t)old;
          g_eax = 0;  /* STATUS_SUCCESS */
-@@ -9289,6 +10039,7 @@ static void bridge_PsCreateSystemThread(void)
+@@ -9289,6 +10059,7 @@ static void bridge_PsCreateSystemThread(void)
              if (is_first_call) {
                  xbox_DpcMarkGuestThread();
                  xbox_GuestThreadPin("guest-main");
@@ -4353,7 +4486,7 @@ index 9476517..7ad4abe 100644
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                  g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-@@ -10864,10 +11615,30 @@ void guest_cpu_part(void)
+@@ -10864,10 +11635,30 @@ void guest_cpu_part(void)
  static void kernel_thunk_dispatch(void)
  {
      int slot = g_kernel_dispatch_slot;

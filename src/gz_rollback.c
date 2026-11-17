@@ -281,10 +281,39 @@ static LONG CALLBACK rb_veh(EXCEPTION_POINTERS *ep)
         }
         s_dirty[i] = 1;
         s_stat_faults++;
-        VirtualProtect(p, RB_PAGE, PAGE_READWRITE, &old);
     }
+    /* (also a page logged already that the title made read-only since: the
+     * history owns the protection while it is on) */
+    VirtualProtect(page_ptr((uint32_t)i), RB_PAGE, PAGE_READWRITE, &old);
     ReleaseSRWLockExclusive(&s_lock);
     return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+/* The kernel is about to change guest pages' protection (a free, a
+ * decommit, NtProtectVirtualMemory: xbox_guest_protect_hook): log them as
+ * written in this tick first, as a write would, so nothing that follows
+ * escapes the history. */
+static void rb_guest_protect(uint32_t va, uint32_t size)
+{
+    uint32_t p0, p1, i;
+    DWORD old;
+    if (!s_tracking || !size) return;
+    p0 = (va & 0x0FFFFFFFu) / RB_PAGE;
+    p1 = (uint32_t)((((uint64_t)(va & 0x0FFFFFFFu)) + size + RB_PAGE - 1) / RB_PAGE);
+    if (va >= 0x80000000u) { p0 += RB_WPAGES; p1 += RB_WPAGES; }
+    if (p1 > RB_NPAGES) p1 = RB_NPAGES;
+    AcquireSRWLockExclusive(&s_lock);
+    for (i = p0; i < p1; i++) {
+        if (!s_tracked[i] || s_dirty[i]) continue;
+        if (!log_entry(&s_frames[s_cur % RB_FRAMES], i, page_ptr(i))) {
+            s_lost = 1;
+            if (s_nunlogged < sizeof s_unlogged / sizeof s_unlogged[0])
+                s_unlogged[s_nunlogged++] = i;
+        }
+        s_dirty[i] = 1;
+        VirtualProtect(page_ptr(i), RB_PAGE, PAGE_READWRITE, &old);
+    }
+    ReleaseSRWLockExclusive(&s_lock);
 }
 
 /* The sound chip's state: s_apu_shadow is what it was at the last boundary,
@@ -313,7 +342,11 @@ static void apu_init(void)
     }
     if (!s_apu_shadow || !s_apu_live || !xbox_ApuStateSave(s_apu_shadow)) return;
     xbox_Nv2aStateSave(s_apu_shadow + s_gpu_at);
-    xbox_DevicesStateSave(s_apu_shadow + s_dev_at);
+    /* the devices only when they tick with the frame (netplay): otherwise
+     * the timer thread and the sound chip's interrupt run beside this one,
+     * and one of them can hold the DPC queue while it waits on s_lock (its
+     * guest write in KeInsertQueueDpc faulted into rb_veh) */
+    if (xbox_DevicesLocked()) xbox_DevicesStateSave(s_apu_shadow + s_dev_at);
     s_apu_chunks = n;
 }
 
@@ -325,7 +358,7 @@ static void apu_capture(RbFrame *f)
     uint32_t k;
     if (!s_apu_chunks || !xbox_ApuStateSave(s_apu_live)) return;
     xbox_Nv2aStateSave(s_apu_live + s_gpu_at);
-    xbox_DevicesStateSave(s_apu_live + s_dev_at);
+    if (xbox_DevicesLocked()) xbox_DevicesStateSave(s_apu_live + s_dev_at);
     for (k = 0; k < s_apu_chunks; k++) {
         uint8_t *now = s_apu_live + (size_t)k * RB_PAGE, *was = s_apu_shadow + (size_t)k * RB_PAGE;
         if (!memcmp(now, was, RB_PAGE)) continue;
@@ -541,6 +574,10 @@ static int history_start(void)
         fprintf(stderr, "[RB] %d worker(s) did not park: their state is not exact\n", ns);
     AddVectoredExceptionHandler(1, rb_veh);
     xbox_SetCloseDefer(rb_close_defer);
+    {
+        extern void (*xbox_guest_protect_hook)(uint32_t va, uint32_t size);   /* kernel_bridge.c */
+        xbox_guest_protect_hook = rb_guest_protect;
+    }
     xbox_file_conflict_hook = rb_closes_release_all;
     /* The USB controller model stops: pads come through gz_rb_pad() now, and
      * the driver's queues in guest memory must not go back in time under a
@@ -797,7 +834,9 @@ static void hashlog_tick(const RbFrame *f)
         uint32_t i, rec[4];
         uint64_t h;
         memcpy(&i, e, 4);
-        if (i >= RB_NPAGES || rb_local_page(i)) continue;
+        /* the low window less this machine's own pages, and the contiguous
+         * window (the sound chip's voices, D3D's push buffers) */
+        if (i >= 2u * RB_WPAGES || (i < RB_WPAGES && rb_local_page(i))) continue;
         h = page_hash64(page_ptr(i));
         rec[0] = s_cur; rec[1] = i; rec[2] = (uint32_t)h; rec[3] = (uint32_t)(h >> 32);
         fwrite(rec, sizeof rec, 1, s_hashlog);

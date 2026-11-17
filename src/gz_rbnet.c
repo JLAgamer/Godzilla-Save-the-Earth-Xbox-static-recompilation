@@ -55,6 +55,57 @@ uint64_t gz_rb_tick0_clock(void);
 void     gz_rb_park_workers(void);
 int      gz_rb_script_pad(int port, uint32_t tick, uint8_t *pad18);
 int      usb_gamepad_report(int pad, uint8_t *out, int max);  /* usb_gamepad.c */
+size_t   xbox_HeapStateSize(void);                      /* the heap's tables (host side) */
+size_t   xbox_HeapStateSave(void *buf);
+void     xbox_HeapStateLoad(const void *buf);
+size_t   xbox_DevicesStateSize(void);                   /* vblank, timers, DPCs, their clock */
+void     xbox_DevicesStateSave(void *buf);
+void     xbox_DevicesStateLoad(const void *buf);
+size_t   xbox_ApuStateSize(void);                       /* the sound chip */
+int      xbox_ApuStateSave(void *buf);
+int      xbox_ApuStateLoad(const void *buf);
+size_t   xbox_Nv2aStateSize(void);                      /* the GPU's method state */
+void     xbox_Nv2aStateSave(void *buf);
+void     xbox_Nv2aStateLoad(const void *buf);
+int      xbox_Nv2aPause(int want_idle);
+void     xbox_Nv2aResume(void);
+void     xbox_DevicesStart(void);
+
+/* The host-side states tick 0 sends after the pages, each tagged and sized:
+ * what the pages were laid out by or run beside, which pages cannot carry. */
+enum { ST_HEAP, ST_DEVICES, ST_APU, ST_GPU, ST_COUNT };
+static const uint32_t s_st_tag[ST_COUNT] = { 0x50414548u, 0x53564544u, 0x20555041u, 0x20555047u };
+static const char *s_st_name[ST_COUNT] = { "heap", "devices", "sound chip", "GPU" };
+
+static size_t st_size(int k)
+{
+    switch (k) {
+    case ST_HEAP: return xbox_HeapStateSize();
+    case ST_DEVICES: return xbox_DevicesStateSize();
+    case ST_APU: return xbox_ApuStateSize();
+    default: return xbox_Nv2aStateSize();
+    }
+}
+
+static int st_save(int k, void *buf)
+{
+    switch (k) {
+    case ST_HEAP: xbox_HeapStateSave(buf); return 1;
+    case ST_DEVICES: xbox_DevicesStateSave(buf); return 1;
+    case ST_APU: return xbox_ApuStateSave(buf);
+    default: xbox_Nv2aPause(1); xbox_Nv2aStateSave(buf); xbox_Nv2aResume(); return 1;
+    }
+}
+
+static void st_load(int k, const void *buf)
+{
+    switch (k) {
+    case ST_HEAP: xbox_HeapStateLoad(buf); break;
+    case ST_DEVICES: xbox_DevicesStateLoad(buf); break;
+    case ST_APU: xbox_ApuStateLoad(buf); break;
+    default: xbox_Nv2aPause(1); xbox_Nv2aStateLoad(buf); xbox_Nv2aResume(); break;
+    }
+}
 
 #define PAD      18
 #define RING     512u                   /* ticks of pads kept */
@@ -465,12 +516,16 @@ int gz_rbn_tick0_sync(void)
     double t0 = now_s();
     if (!hash) return 0;
     gz_rb_park_workers();
+    /* the host: the frames' clock from here, for both (in the pages hashed
+     * below and the devices' state sent after them) */
+    if (s_side == 1) xbox_DevicesStart();
     for (i = 0; i < n; i++) {
         const uint8_t *p = gz_rb_shareable_page(i);
         hash[i] = p ? page_hash(p) : 0;
     }
     if (s_side == 2) {
         uint32_t k = 0;
+        int took = 0;
         msg_send(M_HASHES, hash, (uint32_t)n * 8u, NULL, 0);
         m = msg_recv(&type, &len);
         if (!m || type != M_STATE || len < 12) { free(m); free(hash); return 0; }
@@ -487,7 +542,30 @@ int gz_rbn_tick0_sync(void)
                 free(hash);
                 return -1;
             }
-            for (j = 0; j < cnt && q + 4 + 4096 <= m + len; j++, q += 4 + 4096) {
+            const uint8_t *pages = q;
+            /* The host-side states (the heap's tables, the devices, the
+             * sound chip, the GPU), after the pages in the message but taken
+             * first: the pages were laid out by the host's heap and run
+             * beside its devices, and with this side's own a client that had
+             * booted a little differently ran on garbage function pointers
+             * from its first frame. First, so that nothing of this side's
+             * (its KeTickCount keeper, say) writes over a page once taken. */
+            q = pages + (size_t)cnt * (4 + 4096);
+            if (q > m + len) q = m + len;
+            while (q + 8 <= m + len) {
+                uint32_t tag, hs;
+                int s;
+                memcpy(&tag, q, 4);
+                memcpy(&hs, q + 4, 4);
+                if (q + 8 + hs > m + len) break;
+                for (s = 0; s < ST_COUNT; s++)
+                    if (tag == s_st_tag[s]) {
+                        if (hs == (uint32_t)st_size(s)) { st_load(s, q + 8); took |= 1 << s; }
+                        else fprintf(stderr, "[RBN] tick 0: the host's %s is not this build's size\n", s_st_name[s]);
+                    }
+                q += 8 + hs;
+            }
+            for (j = 0, q = pages; j < cnt && q + 4 + 4096 <= m + len; j++, q += 4 + 4096) {
                 uint32_t pi;
                 uint8_t *dst;
                 memcpy(&pi, q, 4);
@@ -496,10 +574,12 @@ int gz_rbn_tick0_sync(void)
             gz_rb_set_vbase(vb);
         }
         free(m);
-        fprintf(stderr, "[RBN] tick 0: %u pages taken from the host (%.2f s)\n", k, now_s() - t0);
+        fprintf(stderr, "[RBN] tick 0: %u pages and the host's %s%s%s%s taken (%.2f s)\n", k,
+                took & 1 ? "heap" : "-", took & 2 ? ", devices" : ", -", took & 4 ? ", sound chip" : ", -",
+                took & 8 ? ", GPU" : ", -", now_s() - t0);
     } else {
         uint8_t *out;
-        uint32_t cnt = 0, j;
+        uint32_t cnt = 0, j, heap_bytes = 0;
         uint64_t vb = gz_rb_tick0_clock();
         m = msg_recv(&type, &len);
         if (!m || type != M_HASHES || len != (uint32_t)n * 8u) { free(m); free(hash); return 0; }
@@ -520,8 +600,24 @@ int gz_rbn_tick0_sync(void)
             free(hash);
             return -1;
         }
-        out = (uint8_t *)malloc(12 + (size_t)cnt * (4 + 4096));
-        if (!out) { free(m); free(hash); return 0; }
+        {
+            size_t extra = 0;
+            int s;
+            for (s = 0; s < ST_COUNT; s++) extra += 8 + st_size(s);
+            out = (uint8_t *)malloc(12 + (size_t)cnt * (4 + 4096) + extra);
+            if (!out) { free(m); free(hash); return 0; }
+            {
+                uint8_t *hp = out + 12 + (size_t)cnt * 4100;
+                for (s = 0; s < ST_COUNT; s++) {
+                    uint32_t h32 = (uint32_t)st_size(s);
+                    if (!st_save(s, hp + 8)) continue;
+                    memcpy(hp, &s_st_tag[s], 4);
+                    memcpy(hp + 4, &h32, 4);
+                    hp += 8 + h32;
+                }
+                heap_bytes = (uint32_t)(hp - (out + 12 + (size_t)cnt * 4100));
+            }
+        }
         memcpy(out, &vb, 8);
         memcpy(out + 8, &cnt, 4);
         for (i = 0, j = 0; i < n; i++)
@@ -531,11 +627,12 @@ int gz_rbn_tick0_sync(void)
                 memcpy(out + 12 + (size_t)j * 4100 + 4, gz_rb_shareable_page(i), 4096);
                 j++;
             }
-        msg_send(M_STATE, out, 12 + cnt * 4100u, NULL, 0);
+        msg_send(M_STATE, out, 12 + cnt * 4100u + heap_bytes, NULL, 0);
         free(out);
         free(m);
         gz_rb_set_vbase(vb);
-        fprintf(stderr, "[RBN] tick 0: %u pages sent to player 2 (%.2f s)\n", cnt, now_s() - t0);
+        fprintf(stderr, "[RBN] tick 0: %u pages and the heap, devices, sound chip and GPU sent to player 2 (%.2f s)\n",
+                cnt, now_s() - t0);
     }
     free(hash);
     return 1;
@@ -669,18 +766,17 @@ uint32_t gz_rbn_tick(uint32_t cur)
     static double last_report;
     lag_flush();
     /* this side's pads up to cur + delay. A session's menus wait for both
-     * pads every tick (no guesses there); GZ_RB_MENU_DELAY (experimental)
-     * gives them a longer delay so they stall less on a slow connection.
-     * Not the default: with 6 ticks in the menus and 2 in the fight, two
-     * copies on one PC (40 ms each way) played different fights after the
-     * fight's first rollbacks, every time, and the same with 2 and 2 did
-     * not. The cause is not found yet. */
+     * pads every tick (no guesses there), so they get a longer delay
+     * (GZ_RB_MENU_DELAY, default 6 ticks, 100 ms): with the fight's 2 they
+     * stalled on every tick a packet was late. (6 used to give the two PCs
+     * different fights after the first rollbacks; the cause was the devices
+     * running on each PC's own clock, see xbox_DevicesLock.) */
     {
         static int menu_delay = -1;
         int delay = s_delay;
         if (menu_delay < 0) {
             const char *v = getenv("GZ_RB_MENU_DELAY");
-            menu_delay = v && *v ? atoi(v) : s_delay;
+            menu_delay = v && *v ? atoi(v) : 6;
             if (menu_delay < s_delay) menu_delay = s_delay;
             if (menu_delay > 30) menu_delay = 30;
         }

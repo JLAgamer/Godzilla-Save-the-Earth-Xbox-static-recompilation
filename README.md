@@ -114,7 +114,9 @@ while another program's window is in front (`RECOMP_PAD_BACKGROUND=1` reads them
   player picks *Host a match*, the other types the host's IP and picks *Join*. Both games restart together
   as one session with the host's profile: the host's controller is player 1 and drives the menus (Versus,
   rules, city), the friend's is player 2 (press Start on the monster select to join), and each picks a
-  monster. The menus wait for both controllers every frame; fights run with rollback. Saves made in a
+  monster. The menus wait for both controllers every frame (with 6 frames of input delay, `GZ_RB_MENU_DELAY`,
+  so a slow connection does not stall them); fights run with rollback. Pausing and quitting a fight goes
+  back to the menus together, and the next fight starts in step again. Saves made in a
   session go to a separate `netplay` folder, not your profile. A one-off match without the menus can also
   be started on both PCs (the host's last Versus setup, monsters, city and seed are used on both):
 
@@ -127,8 +129,11 @@ while another program's window is in front (`RECOMP_PAD_BACKGROUND=1` reads them
 
   The host needs TCP and UDP port 7790 reachable (`GZ_RB_PORT` changes it). `GZ_RB_DELAY` (default 2) is
   the input delay in frames; more delay means fewer corrections on a slow connection. Each PC plays with its
-  first controller. `.\rb_net_test.ps1` plays a scripted match between two copies on one PC and compares
-  them; `.\rb_test.ps1` tests rollbacks in a single copy.
+  first controller. `.\rb_session_test.ps1 -Steps (Get-Content rb_session_fight.txt)` plays two copies on
+  one PC as a session through the menus into a Versus fight and logs a hash of every page each frame
+  wrote (`recomp_config\tools\rb_hashdiff.py` then names the first frame the two played differently);
+  `.\rb_menu_test.ps1` goes through the Rollback Netplay prompt; `.\rb_net_test.ps1` plays a scripted
+  quick-fight match; `.\rb_test.ps1` tests rollbacks in a single copy.
 
 Logs go to `play.log` next to the launcher; include it when reporting a problem.
 
@@ -163,9 +168,9 @@ next to the program, it keeps saves in the program's `saves\` folder too. `.\pac
 - Online play has been tested between two copies on one PC (including simulated lag and loss), not yet
   between two PCs over the internet.
 - Rollback netplay: tested between two copies on one PC (scripted input, 40 ms each way), from the
-  Multi-Player menu through Versus, monster and city select into a fight; not yet between two PCs. Some
-  particle effects can show as solid boxes after a rollback, rolled-back moments are heard twice, and the
-  menus slow down on a slow connection (they wait for both controllers every frame).
+  Multi-Player prompt through Versus, monster and city select into a fight with rollbacks, and back to
+  the menus; the two copies' memories match frame for frame. Not yet tested between two PCs over the
+  internet, nor a match played to its natural end.
 
 ## How it works
 

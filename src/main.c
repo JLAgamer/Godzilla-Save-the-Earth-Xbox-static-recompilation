@@ -375,6 +375,17 @@ static void gz_refresh_disk_cache(const char *save_dir)
     fprintf(stderr, "[CACHE] menu mod changed: %u cached file(s) removed from %s\n", n, dir);
 }
 
+/* A devices tick's sound (xbox_SetDevicesAudio): the sound chip's 32-sample
+ * frames at 48 kHz that end between the device clock's two times (a frame,
+ * 1/60 s: 25). A function of the clock only, so a rollback, which puts the
+ * clock back, grants the same frames again. */
+static void gz_devices_audio(long long from_us, long long to_us, int mute)
+{
+    extern unsigned xbox_ApuTick(unsigned frames, int mute, unsigned timeout_ms);
+    long long a = from_us * 48 / 32000, b = to_us * 48 / 32000;
+    if (b > a) xbox_ApuTick((unsigned)(b - a), mute, 100);
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
 {
@@ -453,6 +464,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
          * controller API (recomp_manual.c), from the shared inputs. */
         extern int gz_rbn_session_boot(void);
         if (gz_rbn_session_boot()) _putenv("RECOMP_USB=");
+        {
+            /* GZ_RB_SKEW_HEAP=n (a test): this side takes n bytes of the
+             * heap first, so it boots laid out differently from the other
+             * and tick 0 has to put it right (gz_rbn_tick0_sync). */
+            extern uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
+            const char *sk = getenv("GZ_RB_SKEW_HEAP");
+            if (sk && atoi(sk) > 0) {
+                uint32_t va = xbox_HeapAlloc((uint32_t)atoi(sk), 16);
+                fprintf(stderr, "[RBN] test: %d heap bytes taken at boot (0x%08X)\n", atoi(sk), va);
+            }
+        }
     }
 
     /* USB controller model (OHCI + gamepad). The game's statically linked XAPI
@@ -507,9 +529,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             extern void xbox_LockstepSet(int on);
             extern void xbox_VirtualTscSet(uint64_t value);
             extern uint64_t xbox_ReadTimeStampCounter(void);
+            extern void xbox_DevicesLock(int on);
+            extern void xbox_SetDevicesAudio(void (*fn)(long long from_us, long long to_us, int mute));
+            extern void xbox_ApuLockFrames(int on);
             xbox_LockstepSet(1);
             xbox_VirtualTscSet(xbox_ReadTimeStampCounter());
-            printf("Rollback netplay: deterministic from boot (lockstep workers, virtual clock)\n");
+            /* the vblank, DPCs, timers and the sound chip tick with the
+             * frame, not the host's clock (xbox_DevicesLock) */
+            xbox_ApuLockFrames(1);
+            xbox_SetDevicesAudio(gz_devices_audio);
+            xbox_DevicesLock(1);
+            printf("Rollback netplay: deterministic from boot (lockstep workers, virtual clock, devices on the frame)\n");
         }
     }
 

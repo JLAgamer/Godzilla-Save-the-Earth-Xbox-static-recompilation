@@ -103,6 +103,11 @@ uint32_t xbox_HandleTokenOf(void *h);
 int      xbox_HandleSlotPut(uint32_t token, void *h);
 unsigned long long xbox_ApuFrames(void);                       /* apu_core.c */
 unsigned xbox_ApuCatchUp(unsigned frames, unsigned timeout_ms);
+void   xbox_DevicesTick(int frame, int mute);                  /* kernel_bridge.c: the devices with the frame */
+int    xbox_DevicesLocked(void);
+size_t xbox_DevicesStateSize(void);
+void   xbox_DevicesStateSave(void *buf);
+void   xbox_DevicesStateLoad(const void *buf);
 size_t xbox_Nv2aStateSize(void);                               /* nv2a_pb_exec.c: the GPU's method state */
 void   xbox_Nv2aStateSave(void *buf);
 void   xbox_Nv2aStateLoad(const void *buf);
@@ -289,7 +294,7 @@ static LONG CALLBACK rb_veh(EXCEPTION_POINTERS *ep)
  * states of the tick it came from (particles drawn as solid boxes). */
 static uint8_t *s_apu_shadow, *s_apu_live;
 static uint32_t s_apu_chunks;                  /* 0 = not kept */
-static size_t   s_gpu_at;
+static size_t   s_gpu_at, s_dev_at;              /* the GPU's part, the devices' part (netplay) */
 
 static void apu_init(void)
 {
@@ -298,7 +303,8 @@ static void apu_init(void)
     s_apu_chunks = 0;
     if (!size) return;
     s_gpu_at = (size + RB_PAGE - 1) / RB_PAGE * RB_PAGE;
-    size = s_gpu_at + xbox_Nv2aStateSize();
+    s_dev_at = s_gpu_at + xbox_Nv2aStateSize();
+    size = s_dev_at + xbox_DevicesStateSize();
     n = (uint32_t)((size + RB_PAGE - 1) / RB_PAGE);
     if (n > RB_APU_MAX) return;
     if (!s_apu_shadow) {
@@ -307,6 +313,7 @@ static void apu_init(void)
     }
     if (!s_apu_shadow || !s_apu_live || !xbox_ApuStateSave(s_apu_shadow)) return;
     xbox_Nv2aStateSave(s_apu_shadow + s_gpu_at);
+    xbox_DevicesStateSave(s_apu_shadow + s_dev_at);
     s_apu_chunks = n;
 }
 
@@ -318,6 +325,7 @@ static void apu_capture(RbFrame *f)
     uint32_t k;
     if (!s_apu_chunks || !xbox_ApuStateSave(s_apu_live)) return;
     xbox_Nv2aStateSave(s_apu_live + s_gpu_at);
+    xbox_DevicesStateSave(s_apu_live + s_dev_at);
     for (k = 0; k < s_apu_chunks; k++) {
         uint8_t *now = s_apu_live + (size_t)k * RB_PAGE, *was = s_apu_shadow + (size_t)k * RB_PAGE;
         if (!memcmp(now, was, RB_PAGE)) continue;
@@ -797,6 +805,25 @@ static void hashlog_tick(const RbFrame *f)
     if (s_cur % 60 == 0) fflush(s_hashlog);     /* the test harness kills the process */
 }
 
+uint64_t xbox_DevicesDigest(void);             /* kernel_bridge.c */
+uint64_t xbox_ApuDigest(void);                 /* apu_core.c */
+
+/* Two more "pages" per tick, numbered past the real ones: the devices'
+ * state and the sound chip's frames, at the tick's end. */
+static void hashlog_devices(void)
+{
+    uint64_t v[2];
+    int k;
+    if (s_hashlog_on <= 0 || !xbox_DevicesLocked()) return;
+    v[0] = xbox_DevicesDigest();
+    v[1] = xbox_ApuDigest();
+    for (k = 0; k < 2; k++) {
+        uint32_t rec[4];
+        rec[0] = s_cur; rec[1] = 0xFFFFFF00u + (uint32_t)k; rec[2] = (uint32_t)v[k]; rec[3] = (uint32_t)(v[k] >> 32);
+        fwrite(rec, sizeof rec, 1, s_hashlog);
+    }
+}
+
 static void hashlog_rollback(uint32_t target)
 {
     if (s_hashlog_on > 0) {
@@ -813,13 +840,19 @@ static void boundary(void)
     RbFrame *f = &s_frames[s_cur % RB_FRAMES];
     InterlockedIncrement(&s_progress);
     rb_pump();
-    if (s_replay_until && s_cur < s_replay_until && rb_sound_catch_up_on()) rb_apu_catch_up();
+    if (xbox_DevicesLocked())
+        /* the devices' frame (netplay): the same on both PCs, and in a
+         * replay the same again, without the sound being heard twice */
+        xbox_DevicesTick(1, s_replay_until && s_cur < s_replay_until);
+    else if (s_replay_until && s_cur < s_replay_until && rb_sound_catch_up_on())
+        rb_apu_catch_up();
     xbox_DispatchGateEnter();           /* sound and other device code: not in flight */
     xbox_Nv2aPause(1);
     xbox_ApuLock();                     /* before s_lock: see xbox_ApuLock */
     AcquireSRWLockExclusive(&s_lock);
     apu_capture(f);
     hashlog_tick(f);
+    hashlog_devices();
     if (f->npages > s_stat_pages_max) s_stat_pages_max = f->npages;
     reprotect(f);
     s_cur++;
@@ -930,6 +963,7 @@ static int rollback(uint32_t n)
     /* the shadow is now the sound chip at the target boundary */
     if (s_apu_chunks) xbox_ApuStateLoad(s_apu_shadow);
     if (s_apu_chunks) xbox_Nv2aStateLoad(s_apu_shadow + s_gpu_at);
+    if (s_apu_chunks && xbox_DevicesLocked()) xbox_DevicesStateLoad(s_apu_shadow + s_dev_at);
     s_cur = target;
     verify_check();                         /* GZ_RB_VERIFY */
     {
@@ -1331,6 +1365,7 @@ static void net_pre_match_frame(void)
     static uint32_t frames;
     if (!base) base = xbox_ReadTimeStampCounter();
     rb_pump();
+    xbox_DevicesTick(1, 0);
     frames++;
     xbox_VirtualTscSet(base + (uint64_t)frames * (RB_TSC_HZ / 60ull));
 }

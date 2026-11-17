@@ -34,6 +34,10 @@ def load(path):
 
 
 def va(page):
+    if page == 0xFFFFFF00:
+        return "<devices: clock, timers, DPCs>"
+    if page == 0xFFFFFF01:
+        return "<sound chip: frames granted>"
     if page < WPAGES:
         return "%08X" % (page * 4096)
     if page < 2 * WPAGES:

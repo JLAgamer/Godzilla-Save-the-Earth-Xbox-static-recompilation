@@ -21,7 +21,8 @@ param(
     [int]$LagMs = 0,
     [string]$DumpAt = "",
     [string]$Profile = "",
-    [hashtable]$Env = @{}
+    [hashtable]$Env = @{},
+    [hashtable]$Env2 = @{}          # the client (player 2) only
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
@@ -48,6 +49,7 @@ function Start-Side([int]$n) {
         GZ_SHOT_FILE = (Join-Path $work "shot$n"); GZ_RB_HASHLOG = (Join-Path $work "hash$n.bin")
     }
     foreach ($k in $Env.Keys) { $vars[$k] = [string]$Env[$k] }
+    if ($n -eq 2) { foreach ($k in $Env2.Keys) { $vars[$k] = [string]$Env2[$k] } }
     $log = Join-Path $work "p$n.log"
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "cmd.exe"; $psi.Arguments = "/c `"`"$exe`" > `"$log`" 2>&1`""

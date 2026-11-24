@@ -132,8 +132,14 @@
     {
       "id": "frame_rate",
       "label": "Frame rate",
-      "help": "60 is the console's rate. Game speed stays real time at every rate; 120 and 144 need a fast PC and a screen that shows them.",
+      "help": "60 is the console's rate. Game speed stays real time at every rate; 30 is for PCs that cannot hold 60 in fights (choppy sound and slowdown), 120 and 144 need a fast PC and a screen that shows them.",
       "choices": [
+        {
+          "label": "30 (slow PCs)",
+          "set": {
+            "frame_rate": "30"
+          }
+        },
         {
           "label": "60 (console)",
           "set": {

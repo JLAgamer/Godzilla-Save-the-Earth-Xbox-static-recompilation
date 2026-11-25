@@ -32,7 +32,7 @@ Windows 10/11 (64-bit) with a Direct3D 11 graphics card. Movies need `ffmpeg.exe
 - Runs natively on Windows with a D3D11 renderer for the Xbox GPU's command stream
 - Higher internal resolution (up to 6x), mip-mapped 16x anisotropic filtering, borderless fullscreen
 - **Widescreen 16:9**: a wider view at the camera (culling follows), HUD kept in shape and pinned to the corners
-- **Frame rate 60 / 120 / 144**, at the game's own speed. Pick a rate your PC can hold: the game steps by frames, so a PC that falls short of 120 or 144 plays a little slow, as the console did when it dropped frames
+- **Frame rate 30 / 60 / 120 / 144**, at the game's own speed. Pick a rate your PC can hold (30 for a PC that slows down in fights): the game steps by frames, so a PC that falls short of 120 or 144 plays a little slow, as the console did when it dropped frames
 - **In-game Options entries**: tournament mode, PlayStation or Xbox button icons (with a PlayStation controller picture), frame rate, aspect ratio, game speed
 - **Turbo game speed**: the whole game runs 1.2x faster (a player suggestion; System Link stays at normal speed)
 - **Tournament mode**: every monster and city unlocked, whatever the profile holds (cheats stay as you set them)
@@ -133,7 +133,8 @@ next to the program, it keeps saves in the program's `saves\` folder too. `.\pac
 ## Known issues
 
 - Not every stage and mode has been played through; the recompilation can still hit untranslated paths.
-- The frame rate setting goes up to 144. The first run compiles shaders into `shader_cache\` and is
+- The frame rate setting goes from 30 to 144. If fights slow down and the sound breaks up, the PC can't hold
+  the rate: pick 30 (Options > Frame rate). The first run compiles shaders into `shader_cache\` and is
   less smooth than later ones.
 - Fixed since v0.1.7: a crash at startup, while the main menu loaded, after a file had gone missing
   from the game's disk cache (`%LOCALAPPDATA%\GodzillaSTE\Cache`). The game rebuilds the cache itself.

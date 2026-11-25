@@ -7,7 +7,10 @@
  *   ps_prompts  button pictures: 1 = cross/circle/square/triangle, 0 = Xbox
  *   widescreen  1 = 16:9 picture with a wider view, 0 = the original 4:3
  *   frame_rate  the game's frame rate setting (60 on the console); the menu
- *               entry steps through 60 / 120 / 144. Higher rates were too
+ *               entry steps through 30 / 60 / 120 / 144. 30 is for slow PCs:
+ *               the game steps twice as far per frame (as the console did
+ *               when it dropped to 30), so game speed and sound keep real
+ *               time on a PC that cannot hold 60. Higher rates were too
  *               unstable in play; a saved or GZ_RATE value above 144 is
  *               treated as 144.
  *   turbo       1 = the game runs 1.2x faster (a player suggestion: the pace
@@ -38,7 +41,7 @@ int xbox_InputPadIsPlayStation(unsigned long port);
 enum { OPT_TOURNAMENT, OPT_PROMPTS, OPT_RATE, OPT_WIDE, OPT_TURBO, OPT_COUNT };
 
 static int s_val[OPT_COUNT] = { 0, 1, 60, 0, 0 };
-static const int s_rates[] = { 60, 120, 144 };
+static const int s_rates[] = { 30, 60, 120, 144 };
 #define GZ_RATE_MAX 144
 static const char *const s_key[OPT_COUNT] = { "tournament", "ps_prompts", "frame_rate", "widescreen", "turbo" };
 static const char *const s_env[OPT_COUNT] = { "GZ_TOURNAMENT", "GZ_PS_PROMPTS", "GZ_RATE", "GZ_WIDE", "GZ_TURBO" };
@@ -52,7 +55,7 @@ static const char *const s_header[] = {
     ";",
     "; tournament   1 = every monster and city unlocked, 0 = what your profile has earned",
     "; ps_prompts   button icons: 1 = PlayStation, 0 = Xbox",
-    "; frame_rate   60 (the console's), 120 or 144; game speed stays real time",
+    "; frame_rate   30 (slow PCs), 60 (the console's), 120 or 144; game speed stays real time",
     "; widescreen   1 = 16:9 with a wider view, 0 = the original 4:3",
     "; turbo        1 = the game runs 1.2x faster (not in System Link), 0 = normal speed",
     "; online       1 = System Link over the network (Multi-Player > System Link)",
@@ -227,7 +230,7 @@ void gz_opt_toggle(int which)
     load();
     if (which < 0 || which >= OPT_COUNT) return;
     if (which == OPT_RATE) {
-        /* next entry of the list above the current value, wrapping to 60 */
+        /* next entry of the list above the current value, wrapping to 30 */
         int i, n = (int)(sizeof s_rates / sizeof s_rates[0]), next = s_rates[0];
         for (i = 0; i < n; i++) if (s_rates[i] > s_val[which]) { next = s_rates[i]; break; }
         s_val[which] = next;

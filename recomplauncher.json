@@ -20,7 +20,8 @@
   },
   "start": {
     "program": [
-      "godzilla_ste_recomp.exe"
+      "godzilla_ste_recomp.exe",
+      "godzilla_ste_recomp"
     ],
     "args": [
       "--game",
@@ -31,7 +32,8 @@
   },
   "prepare": {
     "program": [
-      "godzilla_ste_recomp.exe"
+      "godzilla_ste_recomp.exe",
+      "godzilla_ste_recomp"
     ],
     "args": [
       "--prepare",
@@ -466,5 +468,10 @@
       "help": "Shaders the game has built, so later starts don't stutter. Clearing only helps if graphics look wrong after an update.",
       "clear": "install/shader_cache"
     }
-  ]
+  ],
+  "system": {
+    "linux": {
+      "glibc": "2.31"
+    }
+  }
 }

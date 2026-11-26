@@ -44,8 +44,8 @@ What was Windows-only is **this repo's own `src/`**:
 | `gz_movie.c` | `CreateProcess` ffmpeg, pipes, `PlaySound` | `posix_spawn`/`popen` ffmpeg, audio through SDL2 | stubbed (movies off; also the default) |
 | `gz_profile.c` | thread suspend + `GetThreadContext` | `SIGPROF`/`perf`, or leave Windows-only | stubbed |
 | `gz_ach.c` | none | RecompAchievements SDK already builds on POSIX | as is |
-| `play.bat` | cmd | `play.sh`: the same env, `exec ./godzilla_ste_recomp --game ...` | todo |
-| `package.ps1` | PowerShell zip | `package.sh`: tar.gz with the binary, `play.sh`, licences, and a note on SDL2/OpenSSL (SteamOS has both) | todo |
+| `play.bat` | cmd | `play.sh`: remembers the copy in `game_path.txt` like Play.bat, then `exec ./godzilla_ste_recomp --game ...` (gz_launch sets the env) | done |
+| `package.ps1` | PowerShell zip | `package_linux.py`: `…-Linux-x64.tar.gz` with the binary, `play.sh`, `recomplauncher.json`, textures and licences. SDL2/OpenSSL 3/libepoxy come from the system (SteamOS has them). `recomplauncher.json` lists `godzilla_ste_recomp` after the `.exe` and declares glibc 2.31 | done (v0.3.0-beta.1) |
 | `setup.ps1` | PowerShell, `py` | `setup.sh` (git, `python3`, the same steps). Translating the XBE is OS-independent: the generated C can be copied over from Windows | todo |
 
 ## Things that differ on Linux

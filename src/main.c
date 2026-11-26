@@ -504,6 +504,24 @@ static int gz_run_game(void)
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
 
+#ifdef _WIN32
+    /* Under Wine / Proton (the Steam Deck), the fixed base list leaves the
+     * tiled aperture at guest 0xF0000000 on host memory Wine already holds
+     * (error 487), and the game's movie player crashed on its first frame
+     * writing there. RECOMP_WIN_PLACEHOLDER reserves the whole 4 GB guest
+     * window first, so every aperture maps. Native Windows is unchanged. */
+    {
+        HMODULE nt = GetModuleHandleA("ntdll.dll");
+        const char *(CDECL *wine_ver)(void) = nt ? (const char *(CDECL *)(void))(void (*)(void))
+            GetProcAddress(nt, "wine_get_version") : NULL;
+        /* Proton can hide wine_get_version; its own variable still shows. */
+        if (wine_ver || getenv("STEAM_COMPAT_DATA_PATH")) {
+            fprintf(stderr, "[BOOT] running under Wine %s\n", wine_ver ? wine_ver() : "(Proton)");
+            if (!getenv("RECOMP_WIN_PLACEHOLDER")) _putenv("RECOMP_WIN_PLACEHOLDER=1");
+        }
+    }
+#endif
+
     /* Step 2: Initialize Xbox memory layout */
     printf("Initializing Xbox memory layout...\n");
     if (!xbox_MemoryLayoutInit(xbe_data, xbe_size)) {

@@ -91,6 +91,16 @@ extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 extern ptrdiff_t g_xbox_mem_offset;
 
+#ifdef _WIN32
+/* Laptops with two GPUs: ask for the dedicated one. NVIDIA's (Optimus) and
+ * AMD's (PowerXpress) drivers read these exports from the program; without
+ * them Windows gave D3D11 the integrated GPU (on an RTX 5050 laptop the
+ * Intel UHD ran 90% busy while the RTX idled). A choice the player makes in
+ * the NVIDIA/AMD control panel or Windows' graphics settings still wins. */
+__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+#endif
+
 /* ── XBE Constants ─────────────────────────────────────────── */
 
 /*

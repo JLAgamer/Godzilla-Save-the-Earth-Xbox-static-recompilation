@@ -947,6 +947,21 @@ static int init_device(void)
         return 0;
     }
     create_back_rtv();
+    {
+        /* Which GPU Windows gave us (two-GPU laptops: see main.c). */
+        IDXGIDevice *xd = NULL;
+        IDXGIAdapter *ad = NULL;
+        DXGI_ADAPTER_DESC desc;
+        if (SUCCEEDED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice, (void **)&xd))) {
+            if (SUCCEEDED(IDXGIDevice_GetAdapter(xd, &ad))) {
+                if (SUCCEEDED(IDXGIAdapter_GetDesc(ad, &desc)))
+                    fprintf(stderr, "[GPU-D3D11] adapter: %ls (%u MB video memory)\n", desc.Description,
+                            (unsigned)(desc.DedicatedVideoMemory >> 20));
+                IDXGIAdapter_Release(ad);
+            }
+            IDXGIDevice_Release(xd);
+        }
+    }
 
     if (!compile("vs_main", "vs_5_0", &vsb) || !compile("ps_main", "ps_5_0", &psb)
         || !compile("vs_blit", "vs_5_0", &vbb) || !compile("ps_blit", "ps_5_0", &pbb))

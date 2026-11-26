@@ -160,21 +160,43 @@ Checked on Windows (RTX 5050, NVIDIA driver 32.0.16.2124), against D3D11:
 - the main menu matches;
 - a quick fight (Godzilla 2000 vs Gigan, New Tokyo) draws monsters, city,
   water, HUD, atomic breath and explosions alike;
-- one frame in 11 showed a hard-edged translucent grey rectangle over the
-  lower left, not seen in 8 later frames. Unknown yet whether it is a real
-  hit effect.
+- translucent buildings in some frames are the game fading out a building
+  near the camera, not a renderer fault.
 
-Speed: 35–58 fps in a fight where D3D11 holds 60, because two things D3D11
-does are not ported yet. Not yet done:
+Both of D3D11's speed-ups are ported:
 
-1. **GPU vertex programs** (`draw_program`): the executor runs them on the
-   CPU for now. `vs_prog` is already in the SPIR-V; it needs the 16-attribute
-   input layout and the three program buffers (bindings 1–3).
-2. **Specialised pixel shaders**: one combiner setup baked in per shader.
-   This can be done with specialisation constants instead of recompiling.
-3. Frame readback (`RECOMP_FB_DUMP`), traces, F9/F10, `GZ_SHOT_BURST`, and a
+- **GPU vertex programs** (`draw_program`): `vs_prog` with a vertex layout
+  per packed-input mask (binding 0 per vertex, binding 1 the per-draw
+  values), the program, constants and per-draw buffers at bindings 1–3, and
+  culling by the rasterizer with dynamic cull mode / front face
+  (`GZ_GPU_VSH=0`, `GZ_PROG_CULL=0` as in D3D11).
+- **Specialised pixel shaders:** `ps_spec` is `ps_main` built through its
+  `SPEC` path with 48 specialisation constants. `build_vk_shaders.py`
+  prepends the constants, so the shared HLSL is unchanged. Each combiner
+  setup gets a pipeline built on a worker thread, with the generic shader
+  drawing until it is ready (`GZ_PS_SPEC=0`: generic only). The driver keeps
+  the compiled pipelines in `shader_cache/vk_pipelines.bin`.
+
+Quick fight, RTX 5050, average of the window title's fps over 40 s:
+
+| | render scale 2 | render scale 3 |
+|---|---|---|
+| D3D11 | 60 | – |
+| Vulkan before (CPU vertex programs, generic shader) | 47 | 43 |
+| + GPU vertex programs | 57 | – |
+| + specialised pixel shaders | 60 | 60 |
+
+60 is the game's frame cap. For comparison, D3D11 with only its generic
+shader manages 26, and 42 with vertex programs on the CPU.
+
+Not yet done:
+
+1. Frame readback (`RECOMP_FB_DUMP`), traces, F9/F10, `GZ_SHOT_BURST`, and a
    Linux F12 key.
-4. Running it on Linux at all: it compiles and links there, but has only run
+2. Pre-building the specialised pipelines an earlier run used, as D3D11
+   preloads its variants. Until then each run draws a new setup with the
+   generic shader for its first few frames.
+3. Running it on Linux at all: it compiles and links there, but has only run
    on Windows.
 
 ## Build (Linux)

@@ -445,16 +445,22 @@ static void gz_refresh_disk_cache(const char *save_dir)
     fprintf(stderr, "[CACHE] menu mod changed: %u cached file(s) removed from %s\n", del.n, dir);
 }
 
+static int gz_run_game(void);
+
 static int gz_run(void)
+{
+    /* Launcher options (--game, --prepare, --log, ...); none = as before. */
+    int rc = gz_launch_init();
+    if (rc >= 0) return rc;
+    return gz_run_game();
+}
+
+/* Everything after the launcher options: on POSIX this is the guest thread
+ * the toolkit's SDL window starts (main() below). */
+static int gz_run_game(void)
 {
     void *xbe_data = NULL;
     size_t xbe_size = 0;
-
-    /* Launcher options (--game, --prepare, --log, ...); none = as before. */
-    {
-        int rc = gz_launch_init();
-        if (rc >= 0) return rc;
-    }
 
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -682,9 +688,30 @@ int main(int argc, char **argv)
     return WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOW);
 }
 #else
+/* POSIX: the toolkit's SDL window (video/fb_present_sdl.c) must own the
+ * process main thread -- it pumps the one SDL event loop, which is also what
+ * the keyboard and the game controllers are read from -- and runs the game
+ * on a thread of its own. It only opens with RECOMP_FB_WINDOW set; without
+ * it the game ran headless, with no window at all (v0.3.0-beta.1). The
+ * window options the launcher passes (GZ_FULLSCREEN, GZ_WINDOW_SCALE) map to
+ * the toolkit's names here. */
+extern int xbox_HostWindowMain(int (*guest_main)(void));
+
+static void env_default(const char *name, const char *value)
+{
+    const char *e = getenv(name);
+    if (!e || !*e) setenv(name, value, 1);
+}
+
 int main(int argc, char **argv)
 {
+    const char *e;
+    int rc;
     gz_host_set_args(argc, argv);
-    return gz_run();
+    if ((rc = gz_launch_init()) >= 0) return rc;
+    env_default("RECOMP_FB_WINDOW", "1");
+    if ((e = getenv("GZ_FULLSCREEN")) && *e) env_default("RECOMP_FULLSCREEN", e);
+    if ((e = getenv("GZ_WINDOW_SCALE")) && *e) env_default("RECOMP_WINDOW_SCALE", e);
+    return xbox_HostWindowMain(gz_run_game);
 }
 #endif

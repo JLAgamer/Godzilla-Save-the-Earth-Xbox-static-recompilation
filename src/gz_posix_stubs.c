@@ -4,10 +4,9 @@
  * the rest of the program calls and reports the feature as off, the same as
  * the Windows build does when the feature is switched off:
  *
- *   gpu_d3d11.c   (Direct3D 11 renderer)  -> GZ_GPU=0: the pushbuffer
- *                 executor's CPU rasteriser, shown by the toolkit's SDL2
- *                 window (fb_present_sdl.c). The port plan's next step is an
- *                 OpenGL / Vulkan back end on the same nv2a_backend.h.
+ *   gpu_d3d11.c   (Direct3D 11 renderer)  -> src/gpu_vk.c, the Vulkan back
+ *                 end, when the PC has Vulkan 1.3; else the executor's CPU
+ *                 rasteriser in the toolkit's SDL2 window (fb_present_sdl.c).
  *   gz_movie.c    (ffmpeg + PlaySound)    -> GZ_MOVIES=0: movies skipped.
  *   gz_profile.c  (thread sampling)       -> GZ_PROFILE ignored.
  *
@@ -23,9 +22,18 @@
  * Nothing decodes on this host yet, so they stay 0. */
 volatile int32_t gz_stat_decode_us, gz_stat_decode_n, gz_stat_decode_px;
 
+/* The Vulkan back end (src/gpu_vk.c) when this PC can run it, else the CPU
+ * rasteriser in the toolkit's window. GZ_GPU=0: always the CPU. main.c makes
+ * the same choice first, to decide who owns the window. */
+int gz_gpu_vk_available(void);
+int gz_gpu_vk_register(void);
+
 int gz_gpu_register(void)
 {
-    fprintf(stderr, "[GPU] no GPU back end on this host yet: CPU rasteriser\n");
+    const char *e = getenv("GZ_GPU");
+    if (!(e && *e == '0') && gz_gpu_vk_available())
+        return gz_gpu_vk_register();
+    fprintf(stderr, "[GPU] no GPU back end (GZ_GPU=0, or no Vulkan 1.3 here): CPU rasteriser\n");
     return 0;
 }
 

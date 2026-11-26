@@ -709,7 +709,15 @@ int main(int argc, char **argv)
     int rc;
     gz_host_set_args(argc, argv);
     if ((rc = gz_launch_init()) >= 0) return rc;
-    env_default("RECOMP_FB_WINDOW", "1");
+    {
+        /* With the Vulkan back end, it opens and pumps its own window (on
+         * the executor's thread, like the D3D11 one on Windows); the
+         * toolkit's window only shows the CPU rasteriser's frames. */
+        extern int gz_gpu_vk_available(void);
+        const char *g = getenv("GZ_GPU");
+        int vk = !(g && *g == '0') && gz_gpu_vk_available();
+        env_default("RECOMP_FB_WINDOW", vk ? "0" : "1");
+    }
     if ((e = getenv("GZ_FULLSCREEN")) && *e) env_default("RECOMP_FULLSCREEN", e);
     if ((e = getenv("GZ_WINDOW_SCALE")) && *e) env_default("RECOMP_WINDOW_SCALE", e);
     return xbox_HostWindowMain(gz_run_game);

@@ -3078,6 +3078,13 @@ int gz_gpu_register(void)
 {
     const char *e = getenv("GZ_GPU");
 
+    /* GZ_GPU=vulkan: the Vulkan back end (src/gpu_vk.c) instead, the one
+     * Linux uses -- here to test it on Windows. */
+    if (e && !_stricmp(e, "vulkan")) {
+        extern int gz_gpu_vk_register(void);
+        return gz_gpu_vk_register();
+    }
+
     if (e && *e == '0') {
         fprintf(stderr, "[GPU-D3D11] disabled (GZ_GPU=0): CPU rasteriser\n");
         return 0;

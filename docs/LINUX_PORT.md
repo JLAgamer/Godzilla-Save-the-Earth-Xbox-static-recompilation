@@ -40,7 +40,7 @@ What was Windows-only is **this repo's own `src/`**:
 | `gz_net.c` | Winsock, iphlpapi | BSD sockets. The guest's Winsock option numbers, FIONBIO/FIONREAD and error codes are translated. `getifaddrs` for the broadcast address. `select(maxfd+1)` | done, not run |
 | `recomp_manual.c` | `<windows.h>`, `<xinput.h>` | Toolkit's `xbox_winnt.h` (Sleep, QPC, `CreateThread`, `VirtualQuery`, `XInputGetState` over SDL2) | done |
 | `gz_settings.c`, `gz_controls.c` | `_putenv_s`, `_stricmp` | Mapped in `gz_host.h` | done |
-| `gpu_d3d11.c` (3.1k lines) | Direct3D 11, HLSL, Win32 window, hotkeys, screenshots, shader cache | **New back end on `nv2a_backend.h`**: OpenGL 3.3/4.x (or Vulkan) with SDL2. Until then: stub → CPU rasteriser + SDL2 window | stubbed (`gz_posix_stubs.c`) |
+| `gpu_d3d11.c` (3.1k lines) | Direct3D 11, HLSL, Win32 window, hotkeys, screenshots, shader cache | `src/gpu_vk.c`: Vulkan 1.3 on the same `nv2a_backend.h`, same HLSL compiled to SPIR-V, SDL2 window. CPU rasteriser + the toolkit's window when the PC has no Vulkan 1.3 | first version (see "Vulkan renderer") |
 | `gz_movie.c` | `CreateProcess` ffmpeg, pipes, `PlaySound` | `posix_spawn`/`popen` ffmpeg, audio through SDL2 | stubbed (movies off; also the default) |
 | `gz_profile.c` | thread suspend + `GetThreadContext` | `SIGPROF`/`perf`, or leave Windows-only | stubbed |
 | `gz_ach.c` | none | RecompAchievements SDK already builds on POSIX | as is |
@@ -106,11 +106,9 @@ What was Windows-only is **this repo's own `src/`**:
    `fb_present_sdl.c`, with sound through `apu_sdl2.c` and a pad through SDL2.
    Fix whatever the toolkit's patch or our `recomp_manual.c` assume about
    Windows at run time.
-3. **GPU back end** `src/gpu_gl.c` on `nv2a_backend.h` (clear / draw / flip /
-   draw_program). Port `gpu_d3d11.c`: its HLSL becomes GLSL 330 (or SPIR-V
-   for Vulkan), the D3D11 state objects become GL state, and the SDL2 window
-   (fullscreen, scale, widescreen) replaces the Win32 window. Keep the hotkey,
-   screenshot and shader-cache features behind the same `GZ_*` switches.
+3. **GPU back end**: `src/gpu_vk.c`, Vulkan. *First version done: menus and
+   fights draw like D3D11 on Windows (`GZ_GPU=vulkan`).* Still to come is
+   listed under "Vulkan renderer" below.
 4. **Movies**: `gz_movie.c` on `posix_spawn` + pipe (ffmpeg is the same), and
    audio through an SDL2 audio stream in place of `PlaySound`.
 5. **Scripts and packaging**: `play.sh`, `setup.sh`, `package.sh`, a
@@ -119,6 +117,65 @@ What was Windows-only is **this repo's own `src/`**:
 6. **Deck polish**: default to fullscreen at 1280x800, a Steam Input
    template, frame pacing at 30/60 on the Deck's 60 Hz panel (and 90 Hz on
    the OLED), suspend/resume.
+
+## Vulkan renderer
+
+`src/gpu_vk.c` is the GPU renderer for Linux and the Steam Deck. It follows
+`gpu_d3d11.c` function for function:
+
+- **Same shaders.** `recomp_config/tools/build_vk_shaders.py` takes `s_hlsl`
+  out of `gpu_d3d11.c` and compiles it with Microsoft's DXC (`-spirv`,
+  `-HV 2018`, `-fvk-invert-y`, bindings b→0, t→16, s→32) into
+  `src/gpu_vk_spirv.h`, which is committed. Run the script again after any
+  change to `s_hlsl`. The header records the source's hash
+  (`GZ_VK_HLSL_HASH`).
+- **Same rules:** render targets per surface address, grown and never
+  shrunk, and one depth buffer per depth surface; the texture cache, content
+  hashing and replacement textures (`textures_ps/`); the widescreen HUD rules;
+  the blend, depth and stencil mapping; per-channel clears; letterboxing.
+- **Vulkan 1.3:** dynamic rendering, plus dynamic depth and stencil state.
+  A pipeline is just a blend state plus a colour mask, so there are few of
+  them, cached in `shader_cache/vk_pipelines.bin`. Depth clamp stands in for
+  D3D11's `DepthClipEnable = FALSE`. D24S8 is used where the GPU has it, and
+  D32S8 otherwise (AMD, so the Steam Deck).
+- **No link dependency:** `libvulkan.so.1` / `vulkan-1.dll` is loaded at run
+  time. At startup `main()` checks for a usable GPU
+  (`gz_gpu_vk_available()`); without one the game falls back to the CPU
+  rasteriser in the toolkit's window.
+- **Window:** the renderer opens its own window on the executor thread (SDL2
+  on Linux, Win32 on Windows), as the D3D11 one does, and pumps its events in
+  `flip()`, keyboard included. On Linux the toolkit's window then stays
+  closed (`RECOMP_FB_WINDOW=0`); controllers update themselves without it.
+- **Build:** CMake compiles it whenever Vulkan headers are found:
+  `third_party/Vulkan-Headers/include`, `-DGZ_VULKAN_INCLUDE=…`, or a
+  system/SDK copy (`libvulkan-dev` on Debian/Ubuntu, `vulkan-headers` on
+  Arch/SteamOS). Without headers the build still works, with only the CPU
+  rasteriser on Linux.
+- **Testing on Windows:** `GZ_GPU=vulkan` uses it instead of D3D11.
+  `GZ_SHOT_FILE=<path>` (create the file `<path>` and the next flip writes
+  `<path>.bmp`) and F12 take screenshots. `GZ_VK_DEVICE=<n>` picks a GPU.
+
+Checked on Windows (RTX 5050, NVIDIA driver 32.0.16.2124), against D3D11:
+
+- the main menu matches;
+- a quick fight (Godzilla 2000 vs Gigan, New Tokyo) draws monsters, city,
+  water, HUD, atomic breath and explosions alike;
+- one frame in 11 showed a hard-edged translucent grey rectangle over the
+  lower left, not seen in 8 later frames. Unknown yet whether it is a real
+  hit effect.
+
+Speed: 35–58 fps in a fight where D3D11 holds 60, because two things D3D11
+does are not ported yet. Not yet done:
+
+1. **GPU vertex programs** (`draw_program`): the executor runs them on the
+   CPU for now. `vs_prog` is already in the SPIR-V; it needs the 16-attribute
+   input layout and the three program buffers (bindings 1–3).
+2. **Specialised pixel shaders**: one combiner setup baked in per shader.
+   This can be done with specialisation constants instead of recompiling.
+3. Frame readback (`RECOMP_FB_DUMP`), traces, F9/F10, `GZ_SHOT_BURST`, and a
+   Linux F12 key.
+4. Running it on Linux at all: it compiles and links there, but has only run
+   on Windows.
 
 ## Build (Linux)
 

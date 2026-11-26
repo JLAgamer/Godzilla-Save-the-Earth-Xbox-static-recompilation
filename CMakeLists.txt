@@ -99,6 +99,22 @@ else()
     list(APPEND GAME_SOURCES src/gz_posix_stubs.c)
 endif()
 
+# Vulkan back end (src/gpu_vk.c): the Linux / Steam Deck renderer, and on
+# Windows GZ_GPU=vulkan. Needs only the Khronos headers at build time (the
+# library is loaded at run time): third_party/Vulkan-Headers, or a system /
+# SDK copy found by find_package(Vulkan).
+set(GZ_VULKAN_INCLUDE "" CACHE PATH "Vulkan headers (folder holding vulkan/vulkan.h)")
+if(NOT GZ_VULKAN_INCLUDE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Headers/include/vulkan/vulkan.h")
+    set(GZ_VULKAN_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Headers/include")
+endif()
+if(NOT GZ_VULKAN_INCLUDE)
+    find_package(Vulkan QUIET)
+    if(Vulkan_INCLUDE_DIRS)
+        list(GET Vulkan_INCLUDE_DIRS 0 GZ_VULKAN_INCLUDE)
+    endif()
+endif()
+list(APPEND GAME_SOURCES src/gpu_vk.c)
+
 # The recomp pipeline also generates a dispatch header and function declarations.
 # These are included by the generated .c files:
 #   src/recomp/gen/recomp_funcs.h    - extern declarations for all recompiled functions
@@ -109,6 +125,14 @@ add_executable(${PROJECT_NAME} WIN32
     ${GAME_SOURCES}
     ${RECOMP_GEN_SOURCES}
 )
+
+if(GZ_VULKAN_INCLUDE)
+    target_include_directories(${PROJECT_NAME} PRIVATE "${GZ_VULKAN_INCLUDE}")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE GZ_HAVE_VULKAN)
+    message(STATUS "Vulkan back end: on (${GZ_VULKAN_INCLUDE})")
+else()
+    message(STATUS "Vulkan back end: off (no Vulkan headers; see docs/LINUX_PORT.md)")
+endif()
 
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)

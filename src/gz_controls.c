@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include "gz_host.h"   /* _stricmp on POSIX */
 #include "input_map.h"
 
 void xbox_InputSetPadMap(const struct InputPadMap *m);

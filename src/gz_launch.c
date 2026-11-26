@@ -32,51 +32,25 @@
  * this game, 3 default.xbe is not the one this build was made from, 4 the
  * program's folder can't be written.
  */
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#include <shellapi.h>
-#include <bcrypt.h>
+#include "gz_host.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <wchar.h>
 
 #define GZ_EXIT_BAD_COPY   2
 #define GZ_EXIT_WRONG_XBE  3
 #define GZ_EXIT_NO_WRITE   4
 
-static char  s_game_dir_utf8[MAX_PATH * 3] = "game\\GodzillaSTE";
-static WCHAR s_exe_dir[MAX_PATH];
+static char  s_game_dir_utf8[GZ_PATH_MAX * 3] = "game" GZ_SEP_A "GodzillaSTE";
+static gzch s_exe_dir[GZ_PATH_MAX];
 
 const char *gz_launch_game_dir(void) { return s_game_dir_utf8; }
 
-static void to_utf8(const WCHAR *w, char *out, int n)
-{
-    if (!WideCharToMultiByte(CP_UTF8, 0, w, -1, out, n, NULL, NULL)) out[0] = 0;
-}
-
-static int file_exists(const WCHAR *p)
-{
-    DWORD a = GetFileAttributesW(p);
-    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
-}
-
-static int dir_exists(const WCHAR *p)
-{
-    DWORD a = GetFileAttributesW(p);
-    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
-}
-
-static void make_dirs(const WCHAR *path)       /* every folder in path */
-{
-    WCHAR tmp[MAX_PATH], *p;
-    wcsncpy_s(tmp, MAX_PATH, path, _TRUNCATE);
-    for (p = tmp + 3; *p; p++)
-        if (*p == L'\\' || *p == L'/') { WCHAR c = *p; *p = 0; CreateDirectoryW(tmp, NULL); *p = c; }
-    CreateDirectoryW(tmp, NULL);
-}
+#ifdef _WIN32
+#define GZ_PLAY_SCRIPT GZT("Play.bat")
+#else
+#define GZ_PLAY_SCRIPT GZT("play.sh")
+#endif
 
 static void progress(double f, const char *text)
 {
@@ -85,22 +59,19 @@ static void progress(double f, const char *text)
 }
 
 /* A short text identifying a file's contents well enough to notice a change. */
-static void file_stamp(const WCHAR *path, char *out, size_t n)
+static void file_stamp(const gzch *path, char *out, size_t n)
 {
-    WIN32_FILE_ATTRIBUTE_DATA fa;
-    char p8[MAX_PATH * 3];
-    memset(&fa, 0, sizeof fa);
-    GetFileAttributesExW(path, GetFileExInfoStandard, &fa);
-    to_utf8(path, p8, sizeof p8);
-    snprintf(out, n, "%s|%llu|%08lX%08lX", p8,
-             ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow,
-             (unsigned long)fa.ftLastWriteTime.dwHighDateTime, (unsigned long)fa.ftLastWriteTime.dwLowDateTime);
+    unsigned long long size, mtime;
+    char p8[GZ_PATH_MAX * 3];
+    gz_file_info(path, &size, &mtime);
+    gz_to_utf8(path, p8, sizeof p8);
+    snprintf(out, n, "%s|%llu|%016llX", p8, size, mtime);
 }
 
-static int stamp_matches(const WCHAR *stamp_file, const char *want)
+static int stamp_matches(const gzch *stamp_file, const char *want)
 {
-    char have[MAX_PATH * 3 + 64] = "";
-    FILE *f = _wfopen(stamp_file, L"rb");
+    char have[GZ_PATH_MAX * 3 + 64] = "";
+    FILE *f = gz_fopen(stamp_file, GZT("rb"));
     size_t got;
     if (!f) return 0;
     got = fread(have, 1, sizeof have - 1, f);
@@ -109,9 +80,9 @@ static int stamp_matches(const WCHAR *stamp_file, const char *want)
     return !strcmp(have, want);
 }
 
-static int stamp_write(const WCHAR *stamp_file, const char *text)
+static int stamp_write(const gzch *stamp_file, const char *text)
 {
-    FILE *f = _wfopen(stamp_file, L"wb");
+    FILE *f = gz_fopen(stamp_file, GZT("wb"));
     if (!f) return 0;
     fwrite(text, 1, strlen(text), f);
     return fclose(f) == 0;
@@ -121,27 +92,11 @@ static int stamp_write(const WCHAR *stamp_file, const char *text)
  * The program is default.xbe translated to C, so it only runs the exact
  * default.xbe it was made from. CMake records that file's SHA-1 (GZ_XBE_SHA1)
  * when it can; a build without one skips the check. */
-static void sha1_hex(const void *data, size_t n, char out[41])
-{
-    BCRYPT_ALG_HANDLE alg = NULL;
-    BCRYPT_HASH_HANDLE h = NULL;
-    unsigned char d[20];
-    int i;
-    out[0] = 0;
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA1_ALGORITHM, NULL, 0) != 0) return;
-    if (BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0) == 0) {
-        if (BCryptHashData(h, (PUCHAR)data, (ULONG)n, 0) == 0 && BCryptFinishHash(h, d, 20, 0) == 0)
-            for (i = 0; i < 20; i++) sprintf(out + i * 2, "%02x", d[i]);
-        BCryptDestroyHash(h);
-    }
-    BCryptCloseAlgorithmProvider(alg, 0);
-}
-
 static int xbe_ok(const void *data, size_t n)
 {
 #ifdef GZ_XBE_SHA1
     char got[41];
-    sha1_hex(data, n, got);
+    gz_sha1_hex(data, n, got);
     if (_stricmp(got, GZ_XBE_SHA1)) {
         fprintf(stderr, "[LAUNCH] default.xbe SHA-1 %s, this build needs %s "
                 "(Godzilla: Save the Earth, USA/Europe)\n", got, GZ_XBE_SHA1);
@@ -155,15 +110,15 @@ static int xbe_ok(const void *data, size_t n)
     return 1;
 }
 
-static void *read_whole(const WCHAR *path, size_t *n)
+static void *read_whole(const gzch *path, size_t *n)
 {
-    FILE *f = _wfopen(path, L"rb");
+    FILE *f = gz_fopen(path, GZT("rb"));
     void *buf = NULL;
     long long sz;
     if (!f) return NULL;
-    _fseeki64(f, 0, SEEK_END);
-    sz = _ftelli64(f);
-    _fseeki64(f, 0, SEEK_SET);
+    gz_fseek(f, 0, SEEK_END);
+    sz = gz_ftell(f);
+    gz_fseek(f, 0, SEEK_SET);
     if (sz > 0 && sz < (1LL << 30) && (buf = malloc((size_t)sz)) != NULL) {
         if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); buf = NULL; }
         else *n = (size_t)sz;
@@ -172,9 +127,9 @@ static void *read_whole(const WCHAR *path, size_t *n)
     return buf;
 }
 
-static int write_whole(const WCHAR *path, const void *data, size_t n)
+static int write_whole(const gzch *path, const void *data, size_t n)
 {
-    FILE *f = _wfopen(path, L"wb");
+    FILE *f = gz_fopen(path, GZT("wb"));
     int ok;
     if (!f) return 0;
     ok = fwrite(data, 1, n, f) == n;
@@ -197,14 +152,14 @@ typedef struct {
     int counting, failed;
 } Xiso;
 
-static int xiso_open(Xiso *x, const WCHAR *path)
+static int xiso_open(Xiso *x, const gzch *path)
 {
     unsigned char desc[0x1C];
     size_t i;
     memset(x, 0, sizeof *x);
-    if ((x->f = _wfopen(path, L"rb")) == NULL) return 0;
+    if ((x->f = gz_fopen(path, GZT("rb"))) == NULL) return 0;
     for (i = 0; i < sizeof k_bases / sizeof k_bases[0]; i++) {
-        if (_fseeki64(x->f, k_bases[i] + 32LL * XSECTOR, SEEK_SET)) continue;
+        if (gz_fseek(x->f, k_bases[i] + 32LL * XSECTOR, SEEK_SET)) continue;
         if (fread(desc, 1, sizeof desc, x->f) == sizeof desc && !memcmp(desc, "MICROSOFT*XBOX*MEDIA", 20)) {
             x->base = k_bases[i];
             memcpy(&x->root_sector, desc + 0x14, 4);
@@ -221,18 +176,18 @@ static unsigned char *xiso_read(Xiso *x, unsigned sector, unsigned size)
 {
     unsigned char *b = (unsigned char *)malloc(size ? size : 1);
     if (!b) return NULL;
-    if (_fseeki64(x->f, x->base + (long long)sector * XSECTOR, SEEK_SET) || fread(b, 1, size, x->f) != size) {
+    if (gz_fseek(x->f, x->base + (long long)sector * XSECTOR, SEEK_SET) || fread(b, 1, size, x->f) != size) {
         free(b);
         return NULL;
     }
     return b;
 }
 
-typedef int (*xiso_fn)(Xiso *x, const WCHAR *rel, unsigned sector, unsigned size, void *ctx);
+typedef int (*xiso_fn)(Xiso *x, const gzch *rel, unsigned sector, unsigned size, void *ctx);
 
 /* Calls fn for every file under the directory (sector, size); rel is the path
  * below the root, with backslashes. */
-static int xiso_walk(Xiso *x, unsigned sector, unsigned size, const WCHAR *rel, xiso_fn fn, void *ctx)
+static int xiso_walk(Xiso *x, unsigned sector, unsigned size, const gzch *rel, xiso_fn fn, void *ctx)
 {
     unsigned char *d = xiso_read(x, sector, size);
     unsigned base;
@@ -243,16 +198,16 @@ static int xiso_walk(Xiso *x, unsigned sector, unsigned size, const WCHAR *rel, 
             const unsigned char *e = d + base + off;
             unsigned short l, r;
             unsigned sec, sz, nlen = e[0x0D], k;
-            WCHAR sub[MAX_PATH];
+            gzch sub[GZ_PATH_MAX];
             int ok;
             memcpy(&l, e, 2); memcpy(&r, e + 2, 2);
             memcpy(&sec, e + 4, 4); memcpy(&sz, e + 8, 4);
             if ((l == 0xFFFF && r == 0xFFFF) || nlen == 0 || off + 0x0E + nlen > lim) break;
             for (k = 0; k < nlen; k++) if (e[0x0E + k] >= 0x80) break;
             if (k < nlen) break;
-            if (wcslen(rel) + nlen + 2 >= MAX_PATH) { free(d); return 0; }
-            swprintf_s(sub, MAX_PATH, L"%s%s", rel, rel[0] ? L"\\" : L"");
-            for (k = 0; k < nlen; k++) { size_t q = wcslen(sub); sub[q] = (WCHAR)e[0x0E + k]; sub[q + 1] = 0; }
+            if (gz_strlen(rel) + nlen + 2 >= GZ_PATH_MAX) { free(d); return 0; }
+            gz_sprintf(sub, GZ_PATH_MAX, GZT("%s%s"), rel, rel[0] ? GZ_SEP : GZT(""));
+            for (k = 0; k < nlen; k++) { size_t q = gz_strlen(sub); sub[q] = (gzch)e[0x0E + k]; sub[q + 1] = 0; }
             ok = (e[0x0C] & 0x10) ? xiso_walk(x, sec, sz, sub, fn, ctx) : fn(x, sub, sec, sz, ctx);
             if (!ok) { free(d); return 0; }
             off += (0x0E + nlen + 3) & ~3u;
@@ -262,24 +217,24 @@ static int xiso_walk(Xiso *x, unsigned sector, unsigned size, const WCHAR *rel, 
     return 1;
 }
 
-static int xiso_count(Xiso *x, const WCHAR *rel, unsigned sector, unsigned size, void *ctx)
+static int xiso_count(Xiso *x, const gzch *rel, unsigned sector, unsigned size, void *ctx)
 {
     (void)rel; (void)sector; (void)ctx;
     x->total += size;
     return 1;
 }
 
-static int xiso_extract_one(Xiso *x, const WCHAR *rel, unsigned sector, unsigned size, void *ctx)
+static int xiso_extract_one(Xiso *x, const gzch *rel, unsigned sector, unsigned size, void *ctx)
 {
-    const WCHAR *dest = (const WCHAR *)ctx;
-    WCHAR out[MAX_PATH], *slash;
+    const gzch *dest = (const gzch *)ctx;
+    gzch out[GZ_PATH_MAX], *slash;
     static unsigned char buf[1 << 20];
     unsigned left = size;
     FILE *f;
-    swprintf_s(out, MAX_PATH, L"%s\\%s", dest, rel);
-    if ((slash = wcsrchr(out, L'\\')) != NULL) { *slash = 0; make_dirs(out); *slash = L'\\'; }
-    if ((f = _wfopen(out, L"wb")) == NULL) { x->failed = GZ_EXIT_NO_WRITE; return 0; }
-    if (_fseeki64(x->f, x->base + (long long)sector * XSECTOR, SEEK_SET)) { fclose(f); x->failed = GZ_EXIT_BAD_COPY; return 0; }
+    gz_sprintf(out, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("%s"), dest, rel);
+    if ((slash = gz_strrchr(out, GZ_SEPC)) != NULL) { *slash = 0; gz_make_dirs(out); *slash = GZ_SEPC; }
+    if ((f = gz_fopen(out, GZT("wb"))) == NULL) { x->failed = GZ_EXIT_NO_WRITE; return 0; }
+    if (gz_fseek(x->f, x->base + (long long)sector * XSECTOR, SEEK_SET)) { fclose(f); x->failed = GZ_EXIT_BAD_COPY; return 0; }
     while (left) {
         unsigned n = left < sizeof buf ? left : (unsigned)sizeof buf;
         double p;
@@ -294,12 +249,12 @@ static int xiso_extract_one(Xiso *x, const WCHAR *rel, unsigned sector, unsigned
     return 1;
 }
 
-typedef struct { const WCHAR *want; unsigned sector, size; int found; } XisoFind;
-static int xiso_find_one(Xiso *x, const WCHAR *rel, unsigned sector, unsigned size, void *ctx)
+typedef struct { const gzch *want; unsigned sector, size; int found; } XisoFind;
+static int xiso_find_one(Xiso *x, const gzch *rel, unsigned sector, unsigned size, void *ctx)
 {
     XisoFind *q = (XisoFind *)ctx;
     (void)x;
-    if (!_wcsicmp(rel, q->want)) { q->sector = sector; q->size = size; q->found = 1; }
+    if (!gz_stricmp(rel, q->want)) { q->sector = sector; q->size = size; q->found = 1; }
     return 1;
 }
 
@@ -515,22 +470,22 @@ static int patch_biollante(const char *b, size_t n, int shift, Buf *out)
 
 /* Builds mods\menu and mods\biollante_slot next to the program from the copy's
  * ControlRoom.bdl, unless they were already built from that file. */
-static int build_menu_mods(const WCHAR *game_dir)
+static int build_menu_mods(const gzch *game_dir)
 {
-    WCHAR src[MAX_PATH], dst[MAX_PATH], stamp[MAX_PATH];
-    char want[MAX_PATH * 3 + 64];
+    gzch src[GZ_PATH_MAX], dst[GZ_PATH_MAX], stamp[GZ_PATH_MAX];
+    char want[GZ_PATH_MAX * 3 + 64];
     size_t n = 0;
     char *b;
     Buf menu = {0}, bio = {0};
     int rc = 0;
-    swprintf_s(src, MAX_PATH, L"%s\\ShellData\\ControlRoom.bdl", game_dir);
-    swprintf_s(stamp, MAX_PATH, L"%s\\mods\\gz_built_from.txt", s_exe_dir);
+    gz_sprintf(src, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("ShellData") GZ_SEP GZT("ControlRoom.bdl"), game_dir);
+    gz_sprintf(stamp, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("mods") GZ_SEP GZT("gz_built_from.txt"), s_exe_dir);
     file_stamp(src, want, sizeof want);
     /* The layout version: menus built by an older release (four Options
      * entries, before Game speed) are built again. */
-    strncat_s(want, sizeof want, "|options5", _TRUNCATE);
-    swprintf_s(dst, MAX_PATH, L"%s\\mods\\biollante_slot\\ShellData\\ControlRoom.bdl", s_exe_dir);
-    if (stamp_matches(stamp, want) && file_exists(dst)) return 0;
+    strncat(want, "|options5", sizeof want - strlen(want) - 1);
+    gz_sprintf(dst, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("mods") GZ_SEP GZT("biollante_slot") GZ_SEP GZT("ShellData") GZ_SEP GZT("ControlRoom.bdl"), s_exe_dir);
+    if (stamp_matches(stamp, want) && gz_file_exists(dst)) return 0;
     progress(0.96, "Adding the Options entries and the Biollante cell");
     if ((b = (char *)read_whole(src, &n)) == NULL) {
         fprintf(stderr, "[LAUNCH] can't read ShellData\\ControlRoom.bdl in the game's copy\n");
@@ -540,13 +495,13 @@ static int build_menu_mods(const WCHAR *game_dir)
         fprintf(stderr, "[LAUNCH] ControlRoom.bdl is not the one the menu additions were made for\n");
         rc = GZ_EXIT_BAD_COPY;
     } else {
-        swprintf_s(dst, MAX_PATH, L"%s\\mods\\menu\\ShellData", s_exe_dir);
-        make_dirs(dst);
-        wcscat_s(dst, MAX_PATH, L"\\ControlRoom.bdl");
+        gz_sprintf(dst, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("mods") GZ_SEP GZT("menu") GZ_SEP GZT("ShellData"), s_exe_dir);
+        gz_make_dirs(dst);
+        gz_strcat(dst, GZ_PATH_MAX, GZ_SEP GZT("ControlRoom.bdl"));
         if (!write_whole(dst, menu.p, menu.n)) rc = GZ_EXIT_NO_WRITE;
-        swprintf_s(dst, MAX_PATH, L"%s\\mods\\biollante_slot\\ShellData", s_exe_dir);
-        make_dirs(dst);
-        wcscat_s(dst, MAX_PATH, L"\\ControlRoom.bdl");
+        gz_sprintf(dst, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("mods") GZ_SEP GZT("biollante_slot") GZ_SEP GZT("ShellData"), s_exe_dir);
+        gz_make_dirs(dst);
+        gz_strcat(dst, GZ_PATH_MAX, GZ_SEP GZT("ControlRoom.bdl"));
         if (!rc && !write_whole(dst, bio.p, bio.n)) rc = GZ_EXIT_NO_WRITE;
         if (!rc && !stamp_write(stamp, want)) rc = GZ_EXIT_NO_WRITE;
     }
@@ -556,16 +511,16 @@ static int build_menu_mods(const WCHAR *game_dir)
 
 /* Gets the player's copy ready: picks the folder the game reads (unpacking a
  * disc image if needed), checks default.xbe, builds the menu additions. */
-static int prepare_copy(const WCHAR *game)
+static int prepare_copy(const gzch *game)
 {
-    WCHAR dir[MAX_PATH], xbe[MAX_PATH], stamp[MAX_PATH];
+    gzch dir[GZ_PATH_MAX], xbe[GZ_PATH_MAX], stamp[GZ_PATH_MAX];
     int rc;
     progress(0.0, "Checking your copy");
-    if (dir_exists(game)) {
+    if (gz_dir_exists(game)) {
         size_t n = 0;
         void *d;
-        wcsncpy_s(dir, MAX_PATH, game, _TRUNCATE);
-        swprintf_s(xbe, MAX_PATH, L"%s\\default.xbe", dir);
+        gz_strcpy(dir, GZ_PATH_MAX, game);
+        gz_sprintf(xbe, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("default.xbe"), dir);
         if ((d = read_whole(xbe, &n)) == NULL) {
             printf("There is no default.xbe in that folder.\n");
             return GZ_EXIT_BAD_COPY;
@@ -575,14 +530,14 @@ static int prepare_copy(const WCHAR *game)
         if (rc) return rc;
     } else {
         Xiso x;
-        XisoFind q = { L"default.xbe", 0, 0, 0 };
-        char want[MAX_PATH * 3 + 64];
+        XisoFind q = { GZT("default.xbe"), 0, 0, 0 };
+        char want[GZ_PATH_MAX * 3 + 64];
         unsigned char *d;
         if (!xiso_open(&x, game)) {
             printf("That file is not an Xbox disc image.\n");
             return GZ_EXIT_BAD_COPY;
         }
-        xiso_walk(&x, x.root_sector, x.root_size, L"", xiso_find_one, &q);
+        xiso_walk(&x, x.root_sector, x.root_size, GZT(""), xiso_find_one, &q);
         if (!q.found || (d = xiso_read(&x, q.sector, q.size)) == NULL) {
             fclose(x.f);
             printf("That disc image has no default.xbe.\n");
@@ -591,16 +546,16 @@ static int prepare_copy(const WCHAR *game)
         rc = xbe_ok(d, q.size) ? 0 : GZ_EXIT_WRONG_XBE;
         free(d);
         if (rc) { fclose(x.f); return rc; }
-        swprintf_s(dir, MAX_PATH, L"%s\\game\\GodzillaSTE", s_exe_dir);
-        swprintf_s(stamp, MAX_PATH, L"%s\\game\\gz_unpacked_from.txt", s_exe_dir);
+        gz_sprintf(dir, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("game") GZ_SEP GZT("GodzillaSTE"), s_exe_dir);
+        gz_sprintf(stamp, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("game") GZ_SEP GZT("gz_unpacked_from.txt"), s_exe_dir);
         file_stamp(game, want, sizeof want);
-        swprintf_s(xbe, MAX_PATH, L"%s\\default.xbe", dir);
-        if (!(stamp_matches(stamp, want) && file_exists(xbe))) {
-            DeleteFileW(stamp);
-            make_dirs(dir);
-            xiso_walk(&x, x.root_sector, x.root_size, L"", xiso_count, NULL);
+        gz_sprintf(xbe, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("default.xbe"), dir);
+        if (!(stamp_matches(stamp, want) && gz_file_exists(xbe))) {
+            gz_delete_file(stamp);
+            gz_make_dirs(dir);
+            xiso_walk(&x, x.root_sector, x.root_size, GZT(""), xiso_count, NULL);
             x.p0 = 0.05; x.p1 = 0.95; x.last = 0.0;
-            if (!xiso_walk(&x, x.root_sector, x.root_size, L"", xiso_extract_one, dir)) {
+            if (!xiso_walk(&x, x.root_sector, x.root_size, GZT(""), xiso_extract_one, dir)) {
                 fclose(x.f);
                 printf(x.failed == GZ_EXIT_NO_WRITE ? "Could not write the unpacked game next to the program (is the disk full?).\n"
                                                     : "The disc image ended early; it may be incomplete.\n");
@@ -610,7 +565,7 @@ static int prepare_copy(const WCHAR *game)
         }
         fclose(x.f);
     }
-    to_utf8(dir, s_game_dir_utf8, sizeof s_game_dir_utf8);
+    gz_to_utf8(dir, s_game_dir_utf8, sizeof s_game_dir_utf8);
     if ((rc = build_menu_mods(dir)) != 0) {
         if (rc == GZ_EXIT_NO_WRITE) printf("Could not write the menu additions next to the program.\n");
         else printf("The copy's menu file is not the one this build expects.\n");
@@ -627,68 +582,65 @@ static void set_env_default(const char *name, const char *value)
 }
 
 /* The last log is renamed <file>.1, the one before <file>.2. */
-static void open_log(const WCHAR *path)
+static void open_log(const gzch *path)
 {
-    WCHAR p[MAX_PATH], a[MAX_PATH], b[MAX_PATH], dir[MAX_PATH], *c, *slash;
+    gzch p[GZ_PATH_MAX], a[GZ_PATH_MAX], b[GZ_PATH_MAX], dir[GZ_PATH_MAX], *c, *slash;
     FILE *f;
     /* RecompLauncher writes "{install}/logs/x.log": a backslash path with
      * forward slashes after it. One kind, so the folder is found. */
-    wcsncpy_s(p, MAX_PATH, path, _TRUNCATE);
-    for (c = p; *c; c++) if (*c == L'/') *c = L'\\';
-    wcsncpy_s(dir, MAX_PATH, p, _TRUNCATE);
-    if ((slash = wcsrchr(dir, L'\\')) != NULL) { *slash = 0; make_dirs(dir); }
-    swprintf_s(a, MAX_PATH, L"%s.1", p);
-    swprintf_s(b, MAX_PATH, L"%s.2", p);
-    MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING);
-    MoveFileExW(p, a, MOVEFILE_REPLACE_EXISTING);
+    gz_strcpy(p, GZ_PATH_MAX, path);
+#ifdef _WIN32
+    for (c = p; *c; c++) if (*c == L'/') *c = GZ_SEPC;
+#else
+    for (c = p; *c; c++) if (*c == '\\') *c = GZ_SEPC;
+#endif
+    gz_strcpy(dir, GZ_PATH_MAX, p);
+    if ((slash = gz_strrchr(dir, GZ_SEPC)) != NULL) { *slash = 0; gz_make_dirs(dir); }
+    gz_sprintf(a, GZ_PATH_MAX, GZT("%s.1"), p);
+    gz_sprintf(b, GZ_PATH_MAX, GZT("%s.2"), p);
+    gz_move_replace(a, b);
+    gz_move_replace(p, a);
     /* Only redirect when the file opens: a failed freopen closes the stream,
      * and the next line written to it ends the program. */
-    if ((f = _wfopen(p, L"w")) == NULL) return;
+    if ((f = gz_fopen(p, GZT("w"))) == NULL) return;
     fclose(f);
-    _wfreopen(p, L"a", stderr);            /* both streams append to one file */
-    _wfreopen(p, L"a", stdout);
+    gz_freopen(p, GZT("a"), stderr);            /* both streams append to one file */
+    gz_freopen(p, GZT("a"), stdout);
 }
 
-static int folder_writable(const WCHAR *dir)
+typedef struct { const gzch *from, *to; unsigned *files; } CopyCtx;
+static void copy_tree(const gzch *from, const gzch *to, unsigned *files);
+
+static void copy_one(const gzch *name, int is_dir, void *ctx)
 {
-    WCHAR p[MAX_PATH];
-    HANDLE h;
-    swprintf_s(p, MAX_PATH, L"%s\\gz_write_test.tmp", dir);
-    h = CreateFileW(p, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    CloseHandle(h);
-    return 1;
+    const CopyCtx *c = (const CopyCtx *)ctx;
+    gzch a[GZ_PATH_MAX], b[GZ_PATH_MAX];
+    gz_sprintf(a, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("%s"), c->from, name);
+    gz_sprintf(b, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("%s"), c->to, name);
+    if (is_dir) copy_tree(a, b, c->files);
+    else if (gz_copy_file_new(a, b)) (*c->files)++;
 }
 
-static void copy_tree(const WCHAR *from, const WCHAR *to, unsigned *files)
+static void copy_tree(const gzch *from, const gzch *to, unsigned *files)
 {
-    WCHAR pat[MAX_PATH], a[MAX_PATH], b[MAX_PATH];
-    WIN32_FIND_DATAW fd;
-    HANDLE h;
-    swprintf_s(pat, MAX_PATH, L"%s\\*", from);
-    if ((h = FindFirstFileW(pat, &fd)) == INVALID_HANDLE_VALUE) return;
-    make_dirs(to);
-    do {
-        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-        swprintf_s(a, MAX_PATH, L"%s\\%s", from, fd.cFileName);
-        swprintf_s(b, MAX_PATH, L"%s\\%s", to, fd.cFileName);
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) copy_tree(a, b, files);
-        else if (CopyFileW(a, b, TRUE)) (*files)++;
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
+    CopyCtx c;
+    if (!gz_dir_exists(from)) return;
+    c.from = from; c.to = to; c.files = files;
+    gz_make_dirs(to);
+    gz_list_dir(from, copy_one, &c);
 }
 
 /* This game's folders (title id 49470073) from the toolkit's shared save
  * folder into its own. */
-static void migrate_saves(const WCHAR *localappdata, const WCHAR *to)
+static void migrate_saves(const gzch *localappdata, const gzch *to)
 {
-    static const WCHAR *const parts[] = { L"UDATA\\49470073", L"TDATA\\49470073" };
-    WCHAR a[MAX_PATH], b[MAX_PATH];
+    static const gzch *const parts[] = { GZT("UDATA") GZ_SEP GZT("49470073"), GZT("TDATA") GZ_SEP GZT("49470073") };
+    gzch a[GZ_PATH_MAX], b[GZ_PATH_MAX];
     unsigned files = 0, i;
     for (i = 0; i < 2; i++) {
-        swprintf_s(a, MAX_PATH, L"%s\\xboxrecomp\\%s", localappdata, parts[i]);
-        swprintf_s(b, MAX_PATH, L"%s\\%s", to, parts[i]);
-        if (dir_exists(a)) copy_tree(a, b, &files);
+        gz_sprintf(a, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("xboxrecomp") GZ_SEP GZT("%s"), localappdata, parts[i]);
+        gz_sprintf(b, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("%s"), to, parts[i]);
+        if (gz_dir_exists(a)) copy_tree(a, b, &files);
     }
     if (files) fprintf(stderr, "[LAUNCH] copied %u save file(s) from %%LOCALAPPDATA%%\\xboxrecomp\n", files);
 }
@@ -700,27 +652,26 @@ extern void gz_controls_load(void);
 int gz_launch_init(void)
 {
     int argc = 0, i, prepare = 0, window_opt = 0;
-    WCHAR **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    const WCHAR *game = NULL, *log = NULL;
-    WCHAR *slash, portable[MAX_PATH];
+    gzch **argv = gz_host_args(&argc);
+    const gzch *game = NULL, *log = NULL;
+    gzch portable[GZ_PATH_MAX];
     const char *mode;
 
-    GetModuleFileNameW(NULL, s_exe_dir, MAX_PATH);
-    if ((slash = wcsrchr(s_exe_dir, L'\\')) != NULL) *slash = 0;
+    gz_exe_dir(s_exe_dir, GZ_PATH_MAX);
 
     for (i = 1; argv && i < argc; i++) {
-        const WCHAR *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
+        const gzch *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         char v8[64] = "";
-        if (v) to_utf8(v, v8, sizeof v8);
-        if (!wcscmp(a, L"--game") && v) { game = v; i++; }
-        else if (!wcscmp(a, L"--prepare")) prepare = 1;
-        else if (!wcscmp(a, L"--log") && v) { log = v; i++; }
-        else if (!wcscmp(a, L"--fullscreen")) { _putenv_s("GZ_FULLSCREEN", "1"); window_opt = 1; }
-        else if (!wcscmp(a, L"--windowed")) { _putenv_s("GZ_FULLSCREEN", "0"); window_opt = 1; }
-        else if (!wcscmp(a, L"--window-scale") && v) { _putenv_s("GZ_WINDOW_SCALE", v8); i++; }
-        else if (!wcscmp(a, L"--render-scale") && v) { _putenv_s("GZ_RENDER_SCALE", v8); i++; }
-        else if (!wcscmp(a, L"--aniso") && v) { _putenv_s("GZ_ANISO", v8); i++; }
-        else if (!wcscmp(a, L"--movies") && v) { _putenv_s("GZ_MOVIES", v8); i++; }
+        if (v) gz_to_utf8(v, v8, sizeof v8);
+        if (!gz_strcmp(a, GZT("--game")) && v) { game = v; i++; }
+        else if (!gz_strcmp(a, GZT("--prepare"))) prepare = 1;
+        else if (!gz_strcmp(a, GZT("--log")) && v) { log = v; i++; }
+        else if (!gz_strcmp(a, GZT("--fullscreen"))) { _putenv_s("GZ_FULLSCREEN", "1"); window_opt = 1; }
+        else if (!gz_strcmp(a, GZT("--windowed"))) { _putenv_s("GZ_FULLSCREEN", "0"); window_opt = 1; }
+        else if (!gz_strcmp(a, GZT("--window-scale")) && v) { _putenv_s("GZ_WINDOW_SCALE", v8); i++; }
+        else if (!gz_strcmp(a, GZT("--render-scale")) && v) { _putenv_s("GZ_RENDER_SCALE", v8); i++; }
+        else if (!gz_strcmp(a, GZT("--aniso")) && v) { _putenv_s("GZ_ANISO", v8); i++; }
+        else if (!gz_strcmp(a, GZT("--movies")) && v) { _putenv_s("GZ_MOVIES", v8); i++; }
     }
 
     /* Started on its own (the exe double-clicked: no options, and not from
@@ -728,37 +679,36 @@ int gz_launch_init(void)
      * Play.bat remembered, or the unpacked one next to the program. Before,
      * this ran without the setup play.bat makes and never opened a window. */
     if (!game && !prepare && !getenv("RECOMP_USB")) {
-        static WCHAR found[MAX_PATH], logp[MAX_PATH];
-        WCHAR p[MAX_PATH];
-        char line[MAX_PATH * 2];
+        static gzch found[GZ_PATH_MAX], logp[GZ_PATH_MAX];
+        gzch p[GZ_PATH_MAX];
+        char line[GZ_PATH_MAX * 2];
         FILE *f;
-        swprintf_s(p, MAX_PATH, L"%s\\game_path.txt", s_exe_dir);
-        if ((f = _wfopen(p, L"r")) != NULL) {
+        gz_sprintf(p, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("game_path.txt"), s_exe_dir);
+        if ((f = gz_fopen(p, GZT("r"))) != NULL) {
             if (fgets(line, sizeof line, f)) {
                 size_t n = strlen(line);
                 while (n && (line[n - 1] == '\n' || line[n - 1] == '\r' || line[n - 1] == ' ')) line[--n] = 0;
-                if (n && MultiByteToWideChar(CP_OEMCP, 0, line, -1, found, MAX_PATH)
-                        && GetFileAttributesW(found) != INVALID_FILE_ATTRIBUTES)
+                if (n && gz_from_text(line, found, GZ_PATH_MAX) && gz_path_exists(found))
                     game = found;
             }
             fclose(f);
         }
         if (!game) {
-            swprintf_s(p, MAX_PATH, L"%s\\game\\GodzillaSTE\\default.xbe", s_exe_dir);
-            if (file_exists(p)) {
-                swprintf_s(found, MAX_PATH, L"%s\\game\\GodzillaSTE", s_exe_dir);
+            gz_sprintf(p, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("game") GZ_SEP GZT("GodzillaSTE") GZ_SEP GZT("default.xbe"), s_exe_dir);
+            if (gz_file_exists(p)) {
+                gz_sprintf(found, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("game") GZ_SEP GZT("GodzillaSTE"), s_exe_dir);
                 game = found;
             }
         }
         if (!game) {
-            MessageBoxW(NULL, L"Drag your Godzilla: Save the Earth disc image or game folder onto Play.bat "
-                              L"(next to this program), or start the game from RecompLauncher.",
-                        L"Godzilla: Save the Earth", MB_ICONINFORMATION);
-            LocalFree(argv);
+            gz_message_box(GZT("Drag your Godzilla: Save the Earth disc image or game folder onto ") GZ_PLAY_SCRIPT
+                           GZT(" (next to this program), or start the game from RecompLauncher."),
+                           GZT("Godzilla: Save the Earth"), 0);
+            gz_host_free_args(argv);
             return 1;
         }
         if (!log) {
-            swprintf_s(logp, MAX_PATH, L"%s\\logs\\godzilla.log", s_exe_dir);
+            gz_sprintf(logp, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("logs") GZ_SEP GZT("godzilla.log"), s_exe_dir);
             log = logp;
         }
     }
@@ -775,29 +725,29 @@ int gz_launch_init(void)
 
     if (game) {
         int rc;
-        char ov[MAX_PATH * 3];
-        WCHAR w[MAX_PATH];
-        static WCHAR full[MAX_PATH];
+        char ov[GZ_PATH_MAX * 3];
+        gzch w[GZ_PATH_MAX];
+        static gzch full[GZ_PATH_MAX];
         /* one spelling of the path (the unpack stamp compares it), resolved
          * against the folder the program was started in */
-        if (GetFullPathNameW(game, MAX_PATH, full, NULL)) game = full;
-        SetCurrentDirectoryW(s_exe_dir);
+        if (gz_full_path(game, full, GZ_PATH_MAX)) game = full;
+        gz_chdir(s_exe_dir);
         rc = prepare_copy(game);
         /* Started by Play.bat or a shortcut, a copy it can't use would
          * otherwise close without a word (RecompLauncher shows its own
          * message for these exit codes). */
         if (rc && !prepare && !getenv("RECOMPLAUNCHER")) {
-            const WCHAR *why =
-                rc == GZ_EXIT_WRONG_XBE ? L"Your copy's default.xbe is a different version from the one this build was "
-                                          L"made from. It needs Godzilla: Save the Earth for Xbox, USA/Europe release."
-              : rc == GZ_EXIT_NO_WRITE  ? L"The game couldn't unpack your disc next to the program. Put the game's folder "
-                                          L"somewhere you can write to (not Program Files) with about 1 GB free."
-              :                           L"Your copy couldn't be read, or it isn't Godzilla: Save the Earth for Xbox. "
-                                          L"Use the disc image (.iso / .xiso.iso) or the extracted folder with default.xbe.";
-            MessageBoxW(NULL, why, L"Godzilla: Save the Earth", MB_ICONWARNING);
+            const gzch *why =
+                rc == GZ_EXIT_WRONG_XBE ? GZT("Your copy's default.xbe is a different version from the one this build was ")
+                                          GZT("made from. It needs Godzilla: Save the Earth for Xbox, USA/Europe release.")
+              : rc == GZ_EXIT_NO_WRITE  ? GZT("The game couldn't unpack your disc next to the program. Put the game's folder ")
+                                          GZT("somewhere you can write to (not Program Files) with about 1 GB free.")
+              :                           GZT("Your copy couldn't be read, or it isn't Godzilla: Save the Earth for Xbox. ")
+                                          GZT("Use the disc image (.iso / .xiso.iso) or the extracted folder with default.xbe.");
+            gz_message_box(why, GZT("Godzilla: Save the Earth"), 1);
         }
         if (prepare || rc) {
-            LocalFree(argv);
+            gz_host_free_args(argv);
             return rc;
         }
         /* what play.bat sets for normal play (see the comments there) */
@@ -814,8 +764,8 @@ int gz_launch_init(void)
         set_env_default("RECOMP_AUDIO_HOST", "1");
         set_env_default("GZ_BIOLLANTE_SLOT", "1");
         set_env_default("GZ_MOVIES", "0");
-        swprintf_s(w, MAX_PATH, L"%s\\mods\\biollante_slot", s_exe_dir);
-        to_utf8(w, ov, sizeof ov);
+        gz_sprintf(w, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("mods") GZ_SEP GZT("biollante_slot"), s_exe_dir);
+        gz_to_utf8(w, ov, sizeof ov);
         set_env_default("RECOMP_OVERLAY_DIR", ov);
     }
 
@@ -830,24 +780,23 @@ int gz_launch_init(void)
     {
         const char *sd = getenv("GZ_SAVE_DIR");
         if (!sd || !*sd) {
-            WCHAR w[MAX_PATH];
-            char sv[MAX_PATH * 3];
-            swprintf_s(portable, MAX_PATH, L"%s\\portable.txt", s_exe_dir);
-            if (file_exists(portable) || (game && folder_writable(s_exe_dir))) {
-                swprintf_s(w, MAX_PATH, L"%s\\saves", s_exe_dir);
+            gzch w[GZ_PATH_MAX];
+            char sv[GZ_PATH_MAX * 3];
+            gz_sprintf(portable, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("portable.txt"), s_exe_dir);
+            if (gz_file_exists(portable) || (game && gz_folder_writable(s_exe_dir))) {
+                gz_sprintf(w, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("saves"), s_exe_dir);
             } else {
-                WCHAR la[MAX_PATH];
-                DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", la, MAX_PATH);
-                if (!n || n >= MAX_PATH) { LocalFree(argv); gz_settings_apply_env(); gz_controls_load(); return -1; }
-                swprintf_s(w, MAX_PATH, L"%s\\GodzillaSTE", la);
-                if (!dir_exists(w)) migrate_saves(la, w);
+                gzch la[GZ_PATH_MAX];
+                if (!gz_user_data_dir(la, GZ_PATH_MAX)) { gz_host_free_args(argv); gz_settings_apply_env(); gz_controls_load(); return -1; }
+                gz_sprintf(w, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("GodzillaSTE"), la);
+                if (!gz_dir_exists(w)) migrate_saves(la, w);
             }
-            to_utf8(w, sv, sizeof sv);
+            gz_to_utf8(w, sv, sizeof sv);
             _putenv_s("GZ_SAVE_DIR", sv);
         }
     }
     gz_settings_apply_env();
     gz_controls_load();
-    LocalFree(argv);
+    gz_host_free_args(argv);
     return -1;
 }

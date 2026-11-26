@@ -57,6 +57,14 @@ find_package(SDL3 CONFIG QUIET)   # here too, for copying SDL3.dll below
 
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
+# nv2a_vsh_interp.h (as patches/xboxrecomp-v0.17.0.patch leaves it) uses
+# size_t without <stddef.h>; on Windows <windows.h> got there first. The real
+# fix is that include in the patch; until then, force it on POSIX only.
+if(NOT WIN32)
+    set_source_files_properties("${XBOXRECOMP_DIR}/src/kernel/nv2a_vsh_interp.c"
+        TARGET_DIRECTORY xbox_kernel PROPERTIES COMPILE_OPTIONS "-include;stddef.h")
+endif()
+
 # ── Recompiled game executable ──────────────────────────────────
 
 # Collect generated recompiled code.
@@ -72,18 +80,24 @@ file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
-    src/gpu_d3d11.c          # D3D11 render back end for the NV2A pushbuffer executor
-    src/gz_net.c             # System Link on Winsock (GZ_NET=1)
+    src/gz_host.c            # host services (paths, files, args, SHA-1) for Windows and POSIX
+    src/gz_net.c             # System Link on Winsock / BSD sockets (GZ_NET=1)
     src/gz_settings.c        # in-game switches (Options menu), gz_settings.ini
-    src/gz_movie.c           # host XMV playback through ffmpeg
-    src/gz_profile.c         # GZ_PROFILE sampling profiler (started mid-fight by the back end)
     src/gz_launch.c          # --game / --prepare / --log for launchers (recomplauncher.json)
     src/gz_controls.c        # controller remapping and deadzones (gz_controls.ini)
     src/gz_ach.c             # Recomp Achievements events (match results)
-    # Add game-specific sources here, e.g.:
-    # src/asset_loader.c
-    # src/custom_renderer.c
 )
+if(WIN32)
+    list(APPEND GAME_SOURCES
+        src/gpu_d3d11.c      # D3D11 render back end for the NV2A pushbuffer executor
+        src/gz_movie.c       # host XMV playback through ffmpeg
+        src/gz_profile.c     # GZ_PROFILE sampling profiler (started mid-fight by the back end)
+    )
+else()
+    # Linux / Steam Deck (docs/LINUX_PORT.md): those three are Windows only
+    # for now; the CPU rasteriser draws and movies are skipped.
+    list(APPEND GAME_SOURCES src/gz_posix_stubs.c)
+endif()
 
 # The recomp pipeline also generates a dispatch header and function declarations.
 # These are included by the generated .c files:
@@ -107,6 +121,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 )
 
 # Windows SDK libraries needed at link time
+if(WIN32)
 target_link_libraries(${PROJECT_NAME} PRIVATE
     d3d11
     dxgi
@@ -119,9 +134,26 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     # Lets the fault handler resolve the host RIP back to the generated
     # function's symbol, i.e. to the guest function that faulted.
     dbghelp
-    shell32              # gz_launch.c: CommandLineToArgvW
-    bcrypt               # gz_launch.c: SHA-1 of the player's default.xbe
+    shell32              # gz_host.c: CommandLineToArgvW
+    bcrypt               # gz_host.c: SHA-1 of the player's default.xbe
 )
+else()
+    # Linux / Steam Deck. The toolkit brings SDL2, epoxy, OpenSSL and
+    # pthreads with its libraries; these are what the game-side files use.
+    find_package(SDL2 REQUIRED)          # gz_host.c: message boxes
+    find_package(OpenSSL REQUIRED)       # gz_host.c: SHA-1 of default.xbe
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        SDL2::SDL2 OpenSSL::Crypto ${CMAKE_DL_LIBS} m)
+    # Export the generated sub_XXXXXXXX symbols, so the crash handler's dladdr
+    # names the guest function a fault happened in (main.c).
+    set_target_properties(${PROJECT_NAME} PROPERTIES ENABLE_EXPORTS ON)
+    # The translated code relies on x86 integer behaviour: signed overflow
+    # wraps, and guest memory is read through any pointer type. MSVC gives
+    # both; GCC and Clang only with these. The generated files are large and
+    # machine-written, so their warnings are not useful.
+    target_compile_options(${PROJECT_NAME} PRIVATE -fwrapv -fno-strict-aliasing)
+    set_source_files_properties(${RECOMP_GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
+endif()
 
 # The program only runs the default.xbe it was translated from: record its
 # SHA-1 so --game can tell a player when their copy is a different one.

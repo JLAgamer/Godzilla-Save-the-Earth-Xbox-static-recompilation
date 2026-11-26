@@ -22,7 +22,19 @@
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>   /* getenv */
+#ifdef _WIN32
 #include <windows.h>  /* Sleep, GetTickCount (fence wait) */
+#else
+#include "platform/xbox_winnt.h"   /* the toolkit's POSIX Sleep, GetTickCount, ... */
+#include <emmintrin.h>
+/* Two the toolkit's Win32 layer does not carry. */
+#ifndef PAGE_GUARD
+#define PAGE_GUARD 0x100            /* never set on POSIX pages: VirtualQuery has no guard pages */
+#endif
+#ifndef YieldProcessor
+#define YieldProcessor() _mm_pause()
+#endif
+#endif
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -895,7 +907,9 @@ static void gz_qf_str(uint32_t va, const char *s, size_t max)
  * sub_0009AA20), a player holding BOTH triggers on their controller gets
  * Biollante instead of the monster they picked. GZ_BIOLLANTE=<players>, e.g.
  * "1" or "12", forces it for those players (2 can be the computer). */
+#ifdef _WIN32
 #include <xinput.h>
+#endif   /* POSIX: XINPUT_STATE / XInputGetState come from the toolkit (SDL2) */
 extern void sub_0009AA20_gen(void);
 int usb_gamepad_report(int pad, uint8_t *out, int max);
 

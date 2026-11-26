@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include "gz_host.h"   /* _putenv_s on POSIX */
 
 /* the toolkit's input layer: which pad is plugged in */
 int xbox_InputPadIsPlayStation(unsigned long port);

@@ -25,10 +25,100 @@
  *                       the other side.
  *   GZ_NET_LOG=1        log every call.
  */
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#else
+/* POSIX (Linux / Steam Deck): BSD sockets. The guest speaks Winsock numbers
+ * (option names, ioctl commands, error codes), so they are translated here;
+ * on Windows they go to Winsock as they are. */
+#include <stdint.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <sys/ioctl.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <errno.h>
+#include <time.h>
+#include <unistd.h>
+typedef int SOCKET;
+typedef unsigned long u_long;
+typedef int BOOL;
+typedef uint32_t DWORD;
+#define TRUE 1
+#define INVALID_SOCKET (-1)
+#define closesocket close
+#define WSAEFAULT        10014
+#define WSAEINVAL        10022
+#define WSAEMFILE        10024
+#define WSAEWOULDBLOCK   10035
+#define WSAENOTSOCK      10038
+#define WSAEMSGSIZE      10040
+#define WSAEADDRINUSE    10048
+#define WSAEADDRNOTAVAIL 10049
+#define WSAENETUNREACH   10051
+#define WSAECONNRESET    10054
+#define WSAENOBUFS       10055
+#define WSAECONNREFUSED  10061
+#define WSAEHOSTUNREACH  10065
+
+static int WSAGetLastError(void)
+{
+    switch (errno) {
+    case EWOULDBLOCK:   return WSAEWOULDBLOCK;
+    case EFAULT:        return WSAEFAULT;
+    case EMFILE:        return WSAEMFILE;
+    case EBADF:
+    case ENOTSOCK:      return WSAENOTSOCK;
+    case EMSGSIZE:      return WSAEMSGSIZE;
+    case EADDRINUSE:    return WSAEADDRINUSE;
+    case EADDRNOTAVAIL: return WSAEADDRNOTAVAIL;
+    case ENETUNREACH:   return WSAENETUNREACH;
+    case ECONNRESET:    return WSAECONNRESET;
+    case ENOBUFS:       return WSAENOBUFS;
+    case ECONNREFUSED:  return WSAECONNREFUSED;
+    case EHOSTUNREACH:  return WSAEHOSTUNREACH;
+    default:            return WSAEINVAL;
+    }
+}
+
+/* Winsock's FIONBIO / FIONREAD to the host's. */
+static int ioctlsocket(SOCKET s, long cmd, u_long *v)
+{
+    int iv = (int)*v, r;
+    if ((unsigned long)(uint32_t)cmd == 0x8004667Eul) return ioctl(s, FIONBIO, &iv);
+    if ((unsigned long)(uint32_t)cmd == 0x4004667Ful) { r = ioctl(s, FIONREAD, &iv); *v = (u_long)iv; return r; }
+    errno = EINVAL;
+    return -1;
+}
+
+/* Winsock SOL_SOCKET (0xFFFF) options to the host's; others pass as they are
+ * (the IPPROTO_IP / IPPROTO_UDP levels share their numbers). 0 = unknown. */
+static int map_sockopt(int *level, int *name)
+{
+    if (*level != 0xFFFF) return 1;
+    *level = SOL_SOCKET;
+    switch (*name) {
+    case 0x0004: *name = SO_REUSEADDR; return 1;
+    case 0x0020: *name = SO_BROADCAST; return 1;
+    case 0x0080: *name = SO_LINGER;    return 1;
+    case 0x1001: *name = SO_SNDBUF;    return 1;
+    case 0x1002: *name = SO_RCVBUF;    return 1;
+    default:     return 0;
+    }
+}
+
+static DWORD GetTickCount(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (DWORD)((uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u);
+}
+#endif
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -72,15 +162,19 @@ int gz_net_on(void)
 {
     if (s_on < 0) {
         const char *e = getenv("GZ_NET"), *ip = getenv("GZ_NET_IP"), *peer = getenv("GZ_NET_PEER");
+#ifdef _WIN32
         WSADATA wd;
+#endif
         char b[32];
         s_on = e && *e == '1';
         if (!s_on) return 0;
         s_log = getenv("GZ_NET_LOG") != NULL;
+#ifdef _WIN32
         if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) {
             fprintf(stderr, "[NET] WSAStartup failed; networking stays off\n");
             return s_on = 0;
         }
+#endif
         if (ip && *ip) {
             s_ip = inet_addr(ip);
             s_ip_forced = 1;
@@ -89,7 +183,11 @@ int gz_net_on(void)
              * (nothing is sent by connect() on a datagram socket). */
             SOCKET t = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             struct sockaddr_in a;
+#ifdef _WIN32
             int n = sizeof a;
+#else
+            socklen_t n = sizeof a;
+#endif
             memset(&a, 0, sizeof a);
             a.sin_family = AF_INET; a.sin_port = htons(53); a.sin_addr.s_addr = inet_addr("8.8.8.8");
             if (t != INVALID_SOCKET && connect(t, (struct sockaddr *)&a, sizeof a) == 0
@@ -116,6 +214,7 @@ int gz_net_on(void)
          * other player is on, and neither side saw the other's game. The
          * broadcast address of the adapter holding our own address
          * (10.0.0.255 for 10.0.0.46/24) is routed out of that adapter. */
+#ifdef _WIN32
         {
             ULONG size = 0;
             MIB_IPADDRTABLE *t = NULL;
@@ -128,6 +227,19 @@ int gz_net_on(void)
                         s_bcast = s_ip | ~t->table[k].dwMask;
             free(t);
         }
+#else
+        {
+            struct ifaddrs *ifs = NULL, *i;
+            if (getifaddrs(&ifs) == 0)
+                for (i = ifs; i; i = i->ifa_next)
+                    if (i->ifa_addr && i->ifa_netmask && i->ifa_addr->sa_family == AF_INET
+                            && ((struct sockaddr_in *)i->ifa_addr)->sin_addr.s_addr == s_ip) {
+                        uint32_t m = ((struct sockaddr_in *)i->ifa_netmask)->sin_addr.s_addr;
+                        if (m && m != 0xFFFFFFFFu) s_bcast = s_ip | ~m;
+                    }
+            if (ifs) freeifaddrs(ifs);
+        }
+#endif
         if (s_npeer)
             fprintf(stderr, "[NET] System Link on real sockets: local %s, %d peer(s)\n", ipstr(s_ip, b), s_npeer);
         else {
@@ -216,21 +328,29 @@ uint32_t gz_net_ioctlsocket(uint32_t h, uint32_t cmd, uint32_t *arg)
 
 uint32_t gz_net_setsockopt(uint32_t h, uint32_t level, uint32_t name, const void *val, uint32_t len)
 {
-    if (setsockopt(host(h), (int)level, (int)name, (const char *)val, (int)len) != 0) {
+    int lv = (int)level, nm = (int)name;
+#ifndef _WIN32
+    if (!map_sockopt(&lv, &nm)) {
+        nlog("setsockopt(%X, %X, %X) has no host equivalent; ignored", h, level, name);
+        return 0;
+    }
+#endif
+    if (setsockopt(host(h), lv, nm, (const char *)val, (int)len) != 0) {
         nlog("setsockopt(%X, %X, %X) not supported by the host; ignored", h, level, name);
     }
     return 0;
 }
 
-/* Guest fd_set: u32 count, u32 handles[64]. */
-static void fds_in(const uint32_t *g, fd_set *f)
+/* Guest fd_set: u32 count, u32 handles[64]. *maxfd: the highest host
+ * descriptor seen, for POSIX select's first argument (Winsock ignores it). */
+static void fds_in(const uint32_t *g, fd_set *f, int *maxfd)
 {
     uint32_t i;
     FD_ZERO(f);
     if (!g) return;
     for (i = 0; i < g[0] && i < 64; i++) {
         SOCKET s = host(g[1 + i]);
-        if (s != INVALID_SOCKET) FD_SET(s, f);
+        if (s != INVALID_SOCKET) { FD_SET(s, f); if ((int)s > *maxfd) *maxfd = (int)s; }
     }
 }
 
@@ -250,11 +370,11 @@ uint32_t gz_net_select(uint32_t *r, uint32_t *w, uint32_t *e, const uint32_t *ti
 {
     fd_set fr, fw, fe;
     struct timeval tv;
-    int n;
+    int n, maxfd = -1;
     if (s_lag_ms > 0) lag_flush();
-    fds_in(r, &fr); fds_in(w, &fw); fds_in(e, &fe);
+    fds_in(r, &fr, &maxfd); fds_in(w, &fw, &maxfd); fds_in(e, &fe, &maxfd);
     if (timeout) { tv.tv_sec = (long)timeout[0]; tv.tv_usec = (long)timeout[1]; }
-    n = select(0, r ? &fr : NULL, w ? &fw : NULL, e ? &fe : NULL, timeout ? &tv : NULL);
+    n = select(maxfd + 1, r ? &fr : NULL, w ? &fw : NULL, e ? &fe : NULL, timeout ? &tv : NULL);
     if (n < 0) return fail();
     fds_out(r, &fr); fds_out(w, &fw); fds_out(e, &fe);
     return (uint32_t)n;
@@ -263,7 +383,12 @@ uint32_t gz_net_select(uint32_t *r, uint32_t *w, uint32_t *e, const uint32_t *ti
 uint32_t gz_net_recvfrom(uint32_t h, void *buf, uint32_t len, uint32_t flags, void *from, uint32_t *fromlen)
 {
     struct sockaddr_in a;
+#ifdef _WIN32
     int al = sizeof a, n;
+#else
+    socklen_t al = sizeof a;
+    int n;
+#endif
     char b[32];
     if (s_lag_ms > 0) lag_flush();
     n = recvfrom(host(h), (char *)buf, (int)len, (int)flags, (struct sockaddr *)&a, &al);
@@ -365,9 +490,15 @@ void gz_net_random(uint8_t *p, uint32_t n)
     static uint64_t s;
     uint32_t i;
     if (!s) {
+#ifdef _WIN32
         LARGE_INTEGER t;
         QueryPerformanceCounter(&t);
         s = (uint64_t)t.QuadPart ^ ((uint64_t)GetCurrentProcessId() << 32) ^ 0x9E3779B97F4A7C15ull;
+#else
+        struct timespec t;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        s = ((uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec) ^ ((uint64_t)getpid() << 32) ^ 0x9E3779B97F4A7C15ull;
+#endif
     }
     for (i = 0; i < n; i++) {
         s ^= s << 13; s ^= s >> 7; s ^= s << 17;

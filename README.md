@@ -25,7 +25,7 @@ stages, movies) from your copy.
 3. Or let [RecompLauncher](https://recomplauncher.com) install and set it up.
 
 Windows 10/11 (64-bit) with a Direct3D 11 graphics card. Movies need `ffmpeg.exe` next to the program or on
-`PATH`; without it they are skipped.
+`PATH` (`ffmpeg` on Linux); without it they are skipped.
 
 ## Features
 

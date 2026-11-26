@@ -86,16 +86,16 @@ set(GAME_SOURCES
     src/gz_launch.c          # --game / --prepare / --log for launchers (recomplauncher.json)
     src/gz_controls.c        # controller remapping and deadzones (gz_controls.ini)
     src/gz_ach.c             # Recomp Achievements events (match results)
+    src/gz_movie.c           # host XMV playback through ffmpeg (PlaySound / SDL2 audio)
 )
 if(WIN32)
     list(APPEND GAME_SOURCES
         src/gpu_d3d11.c      # D3D11 render back end for the NV2A pushbuffer executor
-        src/gz_movie.c       # host XMV playback through ffmpeg
         src/gz_profile.c     # GZ_PROFILE sampling profiler (started mid-fight by the back end)
     )
 else()
-    # Linux / Steam Deck (docs/LINUX_PORT.md): those three are Windows only
-    # for now; the CPU rasteriser draws and movies are skipped.
+    # Linux / Steam Deck (docs/LINUX_PORT.md): those two are Windows only;
+    # src/gpu_vk.c draws, and the profiler is off.
     list(APPEND GAME_SOURCES src/gz_posix_stubs.c)
 endif()
 

@@ -411,17 +411,17 @@
       "help": "The intro, story and credits movies, played by the game's own movie player.",
       "choices": [
         {
-          "label": "Skip",
-          "args": [
-            "--movies",
-            "0"
-          ]
-        },
-        {
           "label": "Play",
           "args": [
             "--movies",
             "1"
+          ]
+        },
+        {
+          "label": "Skip",
+          "args": [
+            "--movies",
+            "0"
           ]
         }
       ]

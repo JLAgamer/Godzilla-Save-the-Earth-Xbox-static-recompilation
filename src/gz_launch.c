@@ -777,7 +777,7 @@ int gz_launch_init(void)
         set_env_default("RECOMP_AUDIO_BUF_COUNT", "4");
         set_env_default("RECOMP_AUDIO_HOST", "1");
         set_env_default("GZ_BIOLLANTE_SLOT", "1");
-        set_env_default("GZ_MOVIES", "0");
+        set_env_default("GZ_MOVIES", "1");
         gz_sprintf(w, GZ_PATH_MAX, GZT("%s") GZ_SEP GZT("mods") GZ_SEP GZT("biollante_slot"), s_exe_dir);
         gz_to_utf8(w, ov, sizeof ov);
         set_env_default("RECOMP_OVERLAY_DIR", ov);

@@ -311,7 +311,8 @@ void sub_002237F0(void)
  *   ffmpeg  host playback through ffmpeg (src/gz_movie.c), when found;
  *   0       skipped: each movie is marked finished after a few Updates and
  *           the game moves on as if it had ended.
- * GZ_PLAY_MOVIES=1 also selects the title's player (the old switch). */
+ * 1 is the default. GZ_QUICK_FIGHT=1 skips them anyway (its boot waits for
+ * the intro movies to be skipped); GZ_PLAY_MOVIES=1 plays them regardless. */
 extern GZ_TLS uint32_t g_ecx;
 extern void sub_001F05B0_gen(void);
 
@@ -321,8 +322,9 @@ static int gz_play_movies(void)
 {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("GZ_PLAY_MOVIES"), *m = getenv("GZ_MOVIES");
-        on = (e && *e == '1') || (m && m[0] == '1' && !m[1]);
+        const char *e = getenv("GZ_PLAY_MOVIES"), *m = getenv("GZ_MOVIES"), *q = getenv("GZ_QUICK_FIGHT");
+        on = (e && *e == '1')
+          || (m && m[0] == '1' && !m[1] && !(q && *q == '1'));   /* quick fight counts skipped intros */
         if (on) fprintf(stderr, "[MOVIE] movies play through the game's own XMV player\n");
     }
     return on;

@@ -20,6 +20,11 @@
  *   --fullscreen, --windowed, --window-scale N, --render-scale N, --aniso N,
  *   --movies 0|1      the same as GZ_FULLSCREEN, GZ_WINDOW_SCALE,
  *                     GZ_RENDER_SCALE, GZ_ANISO and GZ_MOVIES.
+ *   --renderer vulkan|software
+ *                     GZ_GPU=vulkan (Vulkan instead of D3D11 on Windows), or
+ *                     GZ_GPU=0 with the framebuffer window (CPU drawing).
+ *                     Any other value, or none: D3D11 on Windows, Vulkan on
+ *                     Linux.
  *
  * Also: RECOMPLAUNCHER_MODE=bigpicture starts full screen unless a window
  * option says otherwise. Saves (unless GZ_SAVE_DIR is set) go to the
@@ -672,6 +677,15 @@ int gz_launch_init(void)
         else if (!gz_strcmp(a, GZT("--render-scale")) && v) { _putenv_s("GZ_RENDER_SCALE", v8); i++; }
         else if (!gz_strcmp(a, GZT("--aniso")) && v) { _putenv_s("GZ_ANISO", v8); i++; }
         else if (!gz_strcmp(a, GZT("--movies")) && v) { _putenv_s("GZ_MOVIES", v8); i++; }
+        else if (!gz_strcmp(a, GZT("--renderer")) && v) {
+            /* vulkan: the Vulkan back end (gpu_vk.c; on Windows instead of
+             * D3D11, on Linux already the default). software: the CPU
+             * rasteriser in the toolkit's framebuffer window, slow but needs
+             * no GPU driver. Anything else: this system's default. */
+            if (!_stricmp(v8, "vulkan")) _putenv_s("GZ_GPU", "vulkan");
+            else if (!_stricmp(v8, "software")) { _putenv_s("GZ_GPU", "0"); _putenv_s("RECOMP_FB_WINDOW", "1"); }
+            i++;
+        }
     }
 
     /* Started on its own (the exe double-clicked: no options, and not from

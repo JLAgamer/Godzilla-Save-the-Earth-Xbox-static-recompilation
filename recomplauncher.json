@@ -379,6 +379,32 @@
       "in": "args"
     },
     {
+      "id": "renderer",
+      "label": "Renderer",
+      "in": "args",
+      "help": "How the game draws. Default is Direct3D 11 on Windows and Vulkan on Linux and the Steam Deck. Vulkan on Windows is new and for testing. Software draws on the processor: slow, but it works when the graphics driver doesn't.",
+      "choices": [
+        {
+          "label": "Default",
+          "args": []
+        },
+        {
+          "label": "Vulkan",
+          "args": [
+            "--renderer",
+            "vulkan"
+          ]
+        },
+        {
+          "label": "Software (slow)",
+          "args": [
+            "--renderer",
+            "software"
+          ]
+        }
+      ]
+    },
+    {
       "id": "movies",
       "label": "Movies",
       "in": "args",

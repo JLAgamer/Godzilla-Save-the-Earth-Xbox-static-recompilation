@@ -408,7 +408,7 @@
       "id": "movies",
       "label": "Movies",
       "in": "args",
-      "help": "The intro, story and credits movies. Playing them needs ffmpeg (ffmpeg.exe on Windows) in the game's folder or on PATH; without it they are skipped.",
+      "help": "The intro, story and credits movies, played by the game's own movie player.",
       "choices": [
         {
           "label": "Skip",

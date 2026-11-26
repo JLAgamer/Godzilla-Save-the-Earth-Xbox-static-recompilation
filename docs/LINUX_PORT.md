@@ -41,7 +41,7 @@ What was Windows-only is **this repo's own `src/`**:
 | `recomp_manual.c` | `<windows.h>`, `<xinput.h>` | Toolkit's `xbox_winnt.h` (Sleep, QPC, `CreateThread`, `VirtualQuery`, `XInputGetState` over SDL2) | done |
 | `gz_settings.c`, `gz_controls.c` | `_putenv_s`, `_stricmp` | Mapped in `gz_host.h` | done |
 | `gpu_d3d11.c` (3.1k lines) | Direct3D 11, HLSL, Win32 window, hotkeys, screenshots, shader cache | `src/gpu_vk.c`: Vulkan 1.3 on the same `nv2a_backend.h`, same HLSL compiled to SPIR-V, SDL2 window. CPU rasteriser + the toolkit's window when the PC has no Vulkan 1.3 | first version (see "Vulkan renderer") |
-| `gz_movie.c` | `CreateProcess` ffmpeg, pipes, `PlaySound` | `posix_spawn` ffmpeg with its frames on a pipe; the soundtrack WAV queued on its own SDL2 audio device. `ffmpeg` is looked up in `GZ_FFMPEG`, next to the program, then on `PATH` | done, not run |
+| `gz_movie.c` | `CreateProcess` ffmpeg, pipes, `PlaySound` | Movies now play through the game's own XMV player on both systems (`GZ_MOVIES=1`, see `recomp_manual.c`), which needs nothing from the host. `gz_movie.c` is the `GZ_MOVIES=ffmpeg` fallback: `posix_spawn` ffmpeg with its frames on a pipe, the soundtrack WAV on its own SDL2 audio device | done; the ffmpeg fallback not run on Linux |
 | `gz_profile.c` | thread suspend + `GetThreadContext` | `SIGPROF`/`perf`, or leave Windows-only | stubbed |
 | `gz_ach.c` | none | RecompAchievements SDK already builds on POSIX | as is |
 | `play.bat` | cmd | `play.sh`: remembers the copy in `game_path.txt` like Play.bat, then `exec ./godzilla_ste_recomp --game ...` (gz_launch sets the env) | done |
@@ -92,10 +92,8 @@ What was Windows-only is **this repo's own `src/`**:
 - **Performance.** The CPU rasteriser will be too slow on the Deck's Zen 2
   cores at render scale 2, so the GPU back end is the step that makes it
   playable. The 30 fps option already exists for slow machines.
-- **Movies.** They play through an `ffmpeg` program, as on Windows. SteamOS
-  does not come with one, so put a static Linux build of `ffmpeg` next to
-  `godzilla_ste_recomp` (or point `GZ_FFMPEG` at one); without it the movies
-  are skipped.
+- **Movies.** The game's own movie player plays them (picture and sound),
+  so nothing has to be installed on SteamOS.
 - **Libraries.** SteamOS ships SDL2, OpenSSL 3 and Mesa. Build in the Steam
   Linux Runtime "sniper" SDK container (Debian 11 based) for a binary that
   runs on SteamOS and desktop distros alike.
@@ -114,8 +112,9 @@ What was Windows-only is **this repo's own `src/`**:
    fights draw like D3D11 on Windows (`GZ_GPU=vulkan`).* Still to come is
    listed under "Vulkan renderer" below.
 4. **Movies**: `gz_movie.c` on `posix_spawn` + pipe (ffmpeg is the same), and
-   audio through an SDL2 audio device in place of `PlaySound`. *Done, not run
-   yet on Linux.*
+   audio through an SDL2 audio device in place of `PlaySound`. *Done, and
+   then superseded: the game's own XMV player works now (it only lacked the
+   vblank clock it paces by), on every system.*
 5. **Scripts and packaging**: `play.sh`, `setup.sh`, `package.sh`, a
    `recomplauncher.json` entry for the Linux program name, and Deck
    instructions in the README.

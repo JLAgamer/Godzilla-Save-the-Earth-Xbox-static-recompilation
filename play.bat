@@ -39,7 +39,8 @@ set GZ_NET=0
 set GZ_NET_PEER=
 rem In game: F12 = screenshot to screenshots\, F9 = trace a frame into the log,
 rem F10 = water reflection on/off.
-rem Intro and story movies: 1 = play (needs ffmpeg.exe on PATH), 0 = skip.
+rem Intro and story movies: 1 = play (the game's own movie player), 0 = skip,
+rem ffmpeg = play through ffmpeg.exe instead (next to the program or on PATH).
 set GZ_MOVIES=0
 rem ----------------------------------------------------------------------------
 

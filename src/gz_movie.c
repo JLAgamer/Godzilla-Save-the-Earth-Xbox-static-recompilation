@@ -1,9 +1,10 @@
 /*
- * gz_movie.c - play the game's XMV movies on the host.
+ * gz_movie.c - play the game's XMV movies on the host (GZ_MOVIES=ffmpeg).
  *
- * The title's own XMV decoder never consumes its read buffers in the recomp,
- * so the movie texture stays black. FFmpeg reads XMV (WMV2 video, PCM audio),
- * so instead: when the game opens a movie, start "ffmpeg -i <file> -f rawvideo
+ * The usual way is now the game's own XMV player (GZ_MOVIES=1, see the
+ * Movies section of recomp_manual.c). This is the fallback that does not use
+ * it. FFmpeg reads XMV (WMV2 video, PCM audio), so: when the game opens a
+ * movie, start "ffmpeg -i <file> -f rawvideo
  * -pix_fmt yuyv422 -s 640x480 -r 30 -" with its output on a pipe and extract
  * the audio to a temporary WAV, played with PlaySound on Windows and through
  * an SDL2 audio device on Linux. Each time the game updates the movie, the
@@ -11,8 +12,7 @@
  * the game draws as usual.
  *
  * ffmpeg (ffmpeg.exe on Windows) is looked up in GZ_FFMPEG, then next to the
- * executable, then on PATH. Without it (or with GZ_MOVIES=0) the caller falls
- * back to skipping.
+ * executable, then on PATH. Without it the caller falls back to skipping.
  */
 #ifdef _WIN32
 #include <windows.h>
@@ -333,8 +333,10 @@ int gz_movie_enabled(void)
         const char *e = getenv("GZ_MOVIES"), *f = getenv("GZ_FFMPEG");
         reset();
         s_enabled = 0;
-        if (e && *e == '0') {
-            fprintf(stderr, "[MOVIE] GZ_MOVIES=0: movies are skipped\n");
+        if (!e || strcmp(e, "ffmpeg") != 0) {
+            /* 1: the game's own player (recomp_manual.c); 0 or unset: skipped. */
+            if (!(e && e[0] == '1' && !e[1]))
+                fprintf(stderr, "[MOVIE] GZ_MOVIES=%s: movies are skipped\n", e ? e : "(unset)");
         } else if (f && *f && file_exists(f)) {
             strncpy(s_ffmpeg, f, sizeof s_ffmpeg - 1);
             s_enabled = 1;

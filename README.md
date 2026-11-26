@@ -24,8 +24,7 @@ stages, movies) from your copy.
    the program (about 800 MB) and remembers where it is; after that, double-click `Play.bat`.
 3. Or let [RecompLauncher](https://recomplauncher.com) install and set it up.
 
-Windows 10/11 (64-bit) with a Direct3D 11 graphics card. Movies need `ffmpeg.exe` next to the program or on
-`PATH` (`ffmpeg` on Linux); without it they are skipped.
+Windows 10/11 (64-bit) with a Direct3D 11 graphics card.
 
 ## Features
 
@@ -37,7 +36,7 @@ Windows 10/11 (64-bit) with a Direct3D 11 graphics card. Movies need `ffmpeg.exe
 - **Turbo game speed**: the whole game runs 1.2x faster (a player suggestion; System Link stays at normal speed)
 - **Tournament mode**: every monster and city unlocked, whatever the profile holds (cheats stay as you set them)
 - **Biollante**: the cut monster (complete on the disc) gets a cell on the monster select screen
-- **FMV movies** (intro, story, credits) decoded with ffmpeg
+- **FMV movies** (intro, story, credits) played by the game's own movie player, nothing extra to install
 - **System Link over the internet/LAN** (the game's own Xbox LAN multiplayer, on UDP sockets)
 - Texture replacement packs (drop BMPs into a folder), screenshots (F12)
 
@@ -53,7 +52,7 @@ Estimates from what has been checked in game so far. Overall is the average of t
 | Stages | 80% | The ten city and arena stages and the Mothership are checked in fights; the challenge stages are not |
 | Graphics | 93% | Combiners, cube maps, water reflections, fog, point-sprite particles; rare effects may still be wrong. Fixed: MechaGodzilla 2 and 3's missiles now show in flight with their trails |
 | Audio | 95% | Music, effects and voices sound right in play; fixed: menu crackle, corrupted voice lines and UI sounds (memory and timing bugs in the sound emulation) |
-| Movies | 100% | Intro, story and credits play through ffmpeg; skipping them (GZ_MOVIES=0) is silent |
+| Movies | 100% | Intro, story and credits play through the game's own XMV player (GZ_MOVIES=1; `ffmpeg` plays them through ffmpeg instead); skipping them (GZ_MOVIES=0) is silent |
 | Widescreen | 97% | Wider view with matching culling in fights and menus, HUD in the corners. Fixed: the round-end screen dims the whole picture, and the Action results screen keeps its layout. The pause menu's dimming may still cover only the middle (not rechecked) |
 | High frame rate | 95% | Up to 144 fps (higher rates were too unstable in play); game speed correct at a rate the PC holds (it used to run up to 30% fast at 120/144) |
 | Online (System Link) | 60% | Works between two copies on one PC; not yet tested PC to PC over the internet |
@@ -66,7 +65,6 @@ Estimates from what has been checked in game so far. Overall is the average of t
   `c2ef3448786662e5797a1d9e545b3859967c01ed`; setup warns if yours differs.
 - [Git](https://git-scm.com/), [Python 3.10+](https://www.python.org/) with `py -3 -m pip install capstone`
 - Visual Studio 2022 or newer (Community or Build Tools) with **Desktop development with C++**
-- Optional: [ffmpeg](https://ffmpeg.org/) on `PATH` for the movies (without it they are skipped)
 
 ## Build
 

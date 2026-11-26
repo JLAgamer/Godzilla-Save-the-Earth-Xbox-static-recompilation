@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>   /* getenv */
+#include <string.h>   /* memset */
 #ifdef _WIN32
 #include <windows.h>  /* Sleep, GetTickCount (fence wait) */
 #else
@@ -296,7 +297,7 @@ void sub_002237F0(void)
     sub_002237F0_gen();
 }
 
-/* ── Movie skip (bring-up) ──
+/* ── Movies ──
  *
  * The game's movie class (vtable 0x00342300): decoder at +0x14C, texture at
  * +0x150, "finished" byte at +0x145. sub_001F05B0 is its per-frame Update
@@ -304,21 +305,25 @@ void sub_002237F0(void)
  * decoder for the next frame and sets +0x145 at end of file. GetState
  * (sub_001F0570) then reports 3 = finished.
  *
- * The title's XMV decoder never consumes its read buffers yet (black movie
- * that never ends), so mark every movie finished before Update runs: the game
- * moves on exactly as if the movie had ended. Set GZ_PLAY_MOVIES=1 to let the
- * real decoder run (for working on it). */
+ * GZ_MOVIES picks how they run:
+ *   1       the title's own XMV player (picture and soundtrack), with the
+ *           vblank clock it paces by supplied below (gz_vblank_tick);
+ *   ffmpeg  host playback through ffmpeg (src/gz_movie.c), when found;
+ *   0       skipped: each movie is marked finished after a few Updates and
+ *           the game moves on as if it had ended.
+ * GZ_PLAY_MOVIES=1 also selects the title's player (the old switch). */
 extern GZ_TLS uint32_t g_ecx;
 extern void sub_001F05B0_gen(void);
 
-static int gz_movies_skipped;   /* read by the quick-fight boot */
+static int gz_movies_skipped;   /* movies over (played or skipped); read by the quick-fight boot */
 
 static int gz_play_movies(void)
 {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("GZ_PLAY_MOVIES");
-        on = e && *e == '1';
+        const char *e = getenv("GZ_PLAY_MOVIES"), *m = getenv("GZ_MOVIES");
+        on = (e && *e == '1') || (m && m[0] == '1' && !m[1]);
+        if (on) fprintf(stderr, "[MOVIE] movies play through the game's own XMV player\n");
     }
     return on;
 }
@@ -378,6 +383,48 @@ static void gz_movie_mute_tick(void)
     }
 }
 
+/* The title's own XMV player (GZ_MOVIES=1).
+ *
+ * XMVDecoder_GetNextFrame (sub_002B0500) paces video by the display: it asks
+ * D3DDevice_GetDisplayFieldStatus (sub_0021FD30) for the vblank count, which
+ * the D3D library's GPU interrupt routine advances on the console
+ * (D3DDevice + 0x1DE8, the device pointer at 0x0022E278). This host raises no
+ * vblank interrupts (the toolkit's RECOMP_VBLANK is off), so the count stayed
+ * at 1, no frame ever fell due and the player sat on its first three reads:
+ * a black movie that never ended. While a movie runs, the count follows the
+ * host clock at 60 Hz instead, from Open (where the decoder records its
+ * start) through every Update. */
+static void gz_vblank_tick(void)
+{
+    static DWORD t0;
+    static uint32_t base;
+    uint32_t dev = GZ_MEM32(0x0022E278u);
+    if (!dev) return;
+    if (!t0) { t0 = GetTickCount(); base = GZ_MEM32(dev + 0x1DE8u); }
+    GZ_MEM32(dev + 0x1DE8u) = base + (uint32_t)((uint64_t)(GetTickCount() - t0) * 60u / 1000u);
+}
+
+/* GZ_XMV_TRACE=1: once a second, what GetNextFrame answered (0 no frame due,
+ * 1 new frame, 2 end of file, 3 failed) and the clock it was compared to. */
+static void gz_xmv_trace(uint32_t movie, uint32_t r)
+{
+    static int on = -1;
+    static unsigned n[5], calls;
+    static DWORD t0;
+    if (on < 0) { const char *e = getenv("GZ_XMV_TRACE"); on = e && *e == '1'; }
+    if (!on) return;
+    n[r < 4 ? r : 4]++; calls++;
+    if (!t0) t0 = GetTickCount();
+    if (GetTickCount() - t0 >= 1000) {
+        uint32_t dev = GZ_MEM32(0x0022E278u), dec = GZ_MEM32(movie + 0x14Cu);
+        fprintf(stderr, "[XMV] %u updates: no frame %u, new frame %u, end %u, failed %u, other %u"
+                " | vblank %u, movie start %u\n",
+                calls, n[0], n[1], n[2], n[3], n[4],
+                dev ? GZ_MEM32(dev + 0x1DE8u) : 0, dec ? GZ_MEM32(dec + 0xB8u) : 0);
+        memset(n, 0, sizeof n); calls = 0; t0 = GetTickCount();
+    }
+}
+
 /* Open(this, const char *file, ...): thiscall, ret 20. */
 void sub_001F0650(void)
 {
@@ -387,6 +434,7 @@ void sub_001F0650(void)
         g_apu_mute_pcm_streams = 1;
         gz_movie_unmute_at = 0;
     }
+    if (gz_play_movies()) gz_vblank_tick();
     sub_001F0650_gen();
     if (name && gz_movie_enabled())
         gz_movie_open(movie, (const char *)((uintptr_t)name + g_xbox_mem_offset));
@@ -436,6 +484,20 @@ void sub_001F05B0(void)
                 if (g_apu_mute_pcm_streams) gz_movie_unmute_at = GetTickCount() + 1000u;
             }
         }
+    }
+    if (gz_play_movies()) {
+        uint32_t e = g_esp, movie = g_ecx;
+        int fin = *(volatile uint8_t *)((uintptr_t)(movie + 0x145u) + g_xbox_mem_offset);
+        if (!fin) gz_vblank_tick();
+        sub_001F05B0_gen();
+        if (!fin) {
+            gz_xmv_trace(movie, GZ_MEM32(e - 0xCu));
+            if (*(volatile uint8_t *)((uintptr_t)(movie + 0x145u) + g_xbox_mem_offset)) {
+                gz_movies_skipped++;
+                fprintf(stderr, "[MOVIE] movie object 0x%08X finished\n", movie);
+            }
+        }
+        return;
     }
     sub_001F05B0_gen();
 }
